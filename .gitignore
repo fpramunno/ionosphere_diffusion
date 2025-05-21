@@ -6,3 +6,6 @@ outputs/
 model_cond_generation/
 model_cond_generation_batch32/
 wandb/
+# WandB and logs
+wandb/
+*.log
