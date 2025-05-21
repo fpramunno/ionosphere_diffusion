@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "🚀 Listen on login node",
+      "type": "python",
+      "request": "attach",
+      "listen": {
+        "host": "0.0.0.0",
+        "port": 5678
+      },
+      "justMyCode": false
+    }
+  ]
+}

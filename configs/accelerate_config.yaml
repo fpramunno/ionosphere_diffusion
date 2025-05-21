@@ -1,0 +1,9 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: "no"  # or "fp16", or "no" if not using AMP
+use_cpu: false
+gpu_ids: all
+num_processes: 4        # Adjust to match number of GPUs you want to use (e.g., 4 per node)
+machine_rank: 0         # For multi-node jobs; 0 for single node
+main_training_function: main
+downcast_bf16: no
