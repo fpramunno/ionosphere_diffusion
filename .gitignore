@@ -9,3 +9,7 @@ wandb/
 # WandB and logs
 wandb/
 *.log
+*.out
+*.txt
+*.json
+*.csv
