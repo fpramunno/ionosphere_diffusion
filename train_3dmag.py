@@ -39,7 +39,7 @@ def main():
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('--batch-size', type=int, default=32,
+    p.add_argument('--batch-size', type=int, default=8,
                 help='the batch size')
     p.add_argument('--checkpointing', action='store_true',
                 help='enable gradient checkpointing')
@@ -51,7 +51,7 @@ def main():
                 help='the path of the dataset')
     p.add_argument('--saving-path', type=str, default="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/", 
                 help='the path where to save the model')
-    p.add_argument('--dir-name', type=str, default='cond_generation_batch32',
+    p.add_argument('--dir-name', type=str, default='cond_generation_divisionnorm',
                 help='the directory name to use')  # <---- Added this line
     p.add_argument('--end-step', type=int, default=None,
                 help='the step to end training at')
@@ -473,7 +473,7 @@ def main():
                 plt.show()
                 
             # **wandb Logging (Now Includes Validation Loss)**
-            if use_wandb and accelerator.is_main_process:
+            if use_wandb: #and accelerator.is_main_process:
                 log_dict = {
                     'epoch': epoch,
                     'loss': epoch_train_loss,

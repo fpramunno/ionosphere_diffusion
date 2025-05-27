@@ -26,11 +26,11 @@ class IonoDataset(Dataset):
 
         # Transformations
         self.are_transform = transforms
-        if self.are_transform:
-            self.transforms = Compose([
-                                    Normalize(mean=[-1385.47], std=[7235.46]),  # z-score normalization
-                                    # Normalize(mean=[0.5], std=[0.5])            # maps to [-1, 1]
-                                ])
+        # if self.are_transform:
+        #     self.transforms = Compose([
+        #                             Normalize(mean=[-1385.47], std=[7235.46]),  # z-score normalization
+        #                             # Normalize(mean=[0.5], std=[0.5])            # maps to [-1, 1]
+        #                         ])
 
         # Splitting the dataset
 
@@ -82,10 +82,10 @@ class IonoDataset(Dataset):
         data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
         # Apply transformations if any
         if self.are_transform:
-            # data_tensor = data_tensor / 108154.0 # maximum max value among the whole dataset can be changed
-            data_tensor = self.transforms(data_tensor) 
+            data_tensor = data_tensor / 108154.0 # maximum max value among the whole dataset can be changed
+            # data_tensor = self.transforms(data_tensor) 
 
-        condition_tensor = torch.tensor([data[1], data[2], data[3]], dtype=torch.float32)
+        condition_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
 
 
         return data_tensor, condition_tensor

@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=performance
-#SBATCH --job-name="training_iono_batch32"
-#SBATCH --error=err_training_iono_batch32.err
-#SBATCH --out=out_training_iono_batch32.log
+#SBATCH --job-name="training_iono_divisionnorm"
+#SBATCH --error=err_training_iono_divisionnorm.err
+#SBATCH --out=out_training_iono_divisionnorm.log
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
 
