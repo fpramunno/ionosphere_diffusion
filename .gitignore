@@ -13,3 +13,5 @@ wandb/
 *.txt
 *.json
 *.csv
+*.pth
+*.npy
