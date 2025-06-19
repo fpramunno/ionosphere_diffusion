@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/mnt/nas05/data01/francesco/progetto_simone/ionosphere/train_3dmag.py", line 563, in <module>
+    main()
+  File "/mnt/nas05/data01/francesco/progetto_simone/ionosphere/train_3dmag.py", line 24, in main
+    import matplotlib.pyplot as plt
+ModuleNotFoundError: No module named 'matplotlib'

@@ -38,13 +38,13 @@ inner_model = K.config.make_model(config)
 inner_model_ema = deepcopy(inner_model)
 model_ema = K.config.make_denoiser_wrapper(config)(inner_model_ema)
 
-ckpt = torch.load("/mnt/nas05/data01/francesco/progetto_simone/ionosphere/model_cond_generation_divisionnorm/model_00894710.pth")
+ckpt = torch.load("/mnt/nas05/data01/francesco/progetto_simone/ionosphere/model_cond_generation_divisionnorm/model_06526120.pth")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_ema.inner_model.load_state_dict(ckpt['model_ema'])
 model_ema.to(device)
 
-samples = generate_samples(model_ema, 50, device, cond_label=cond_label.unsqueeze(0).to(device), sampler="dpmpp_2m_sde")
+samples = generate_samples(model_ema, 100, device, cond_label=cond_label.unsqueeze(0).to(device), sampler="dpmpp_2m_sde")
 
 # Save the oeiginal sample
 np.save("/mnt/nas05/data01/francesco/progetto_simone/ionosphere/np_generated_data/original.npy", inpt[0].cpu().numpy())

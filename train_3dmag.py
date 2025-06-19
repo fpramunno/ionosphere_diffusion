@@ -35,11 +35,11 @@ def main():
 
     from util import generate_samples
     import torch
-    from src.data.dataset import get_data_objects
+    from src.data.dataset import get_data_objects, get_sequence_data_objects
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('--batch-size', type=int, default=8,
+    p.add_argument('--batch-size', type=int, default=32,
                 help='the batch size')
     p.add_argument('--checkpointing', action='store_true',
                 help='enable gradient checkpointing')
@@ -51,7 +51,7 @@ def main():
                 help='the path of the dataset')
     p.add_argument('--saving-path', type=str, default="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/", 
                 help='the path where to save the model')
-    p.add_argument('--dir-name', type=str, default='cond_generation_divisionnorm',
+    p.add_argument('--dir-name', type=str, default='cond_forecasting',
                 help='the directory name to use')  # <---- Added this line
     p.add_argument('--end-step', type=int, default=None,
                 help='the step to end training at')
@@ -209,22 +209,42 @@ def main():
 
     # Load the dataset
 
-    train_dataset, train_sampler, train_dl = get_data_objects(
-        path=args.data_path,
+    # train_dataset, train_sampler, train_dl = get_data_objects(
+    #     path=args.data_path,
+    #     batch_size=args.batch_size,
+    #     distributed=False,
+    #     num_data_workers=args.num_workers,
+    #     split='train',
+    #     seed=42
+    # )
+
+    # val_dataset, val_sampler, val_dl = get_data_objects(
+    #     path=args.data_path,
+    #     batch_size=args.batch_size,
+    #     distributed=False,
+    #     num_data_workers=args.num_workers,
+    #     split='valid',
+    #     seed=42
+    # )
+
+    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
+        csv_path="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv",
         batch_size=args.batch_size,
         distributed=False,
         num_data_workers=args.num_workers,
         split='train',
-        seed=42
+        seed=42,
+        sequence_length=120
     )
 
-    val_dataset, val_sampler, val_dl = get_data_objects(
-        path=args.data_path,
+    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
+        csv_path="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv",
         batch_size=args.batch_size,
         distributed=False,
         num_data_workers=args.num_workers,
         split='valid',
-        seed=42
+        seed=42,
+        sequence_length=120
     )
 
     print('Train loader and Valid loader are up!')
@@ -348,15 +368,38 @@ def main():
                     print(f"Memory before processing: Allocated: {mem_before:.2f} GB, Reserved: {reserved_before:.2f} GB")
 
                     inpt = batch[0].contiguous().float().to(device, non_blocking=True)
+                    inpt = inpt.squeeze(2)  # shape: (8, 120, 24, 360)
+                    cond_img = inpt[:, :60, :, :]    # first 60 time steps
+                    target_img = inpt[:, 60:, :, :]  # last 60 time steps
                     cond_label = batch[1].to(device, non_blocking=True)
 
+                    cond_label_inp = cond_label[:, :61, :]  # (bs, 61, 4)
+                    cond_label_as_inpt = []
+                    for i in range(cond_label_inp.shape[-1]):
+                        # Expand cond_label_inp[:, :, i] to (bs, 61, 1, 1), then broadcast to (bs, 61, 24, 360)
+                        expanded = cond_label_inp[:, :, i].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 360)
+                        cond_label_as_inpt.append(expanded)
+                    # Stack along new channel dimension to get (bs, 61, 4, 24, 360)
+                    cond_label_as_inpt = torch.cat(cond_label_as_inpt, dim=1)
+
+                    cond_label_trg = cond_label[:, 61:, :]
+                    cond_label_trg_as_inpt = []
+                    for i in range(cond_label_trg.shape[-1]):
+                        expanded_trg = cond_label_trg[:, :, i].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 360)
+                        cond_label_trg_as_inpt.append(expanded_trg)
+                    # Stack along new channel dimension to get (bs, 60, 4, 24, 360)
+                    cond_label_trg_as_inpt = torch.cat(cond_label_trg_as_inpt, dim=1)
+
+                    img_lab_inpt = torch.cat([cond_label_as_inpt, cond_img], dim=1)
+                    img_lab_trg = torch.cat([cond_label_trg_as_inpt, target_img], dim=1)
+
                     extra_args = {}
-                    noise = torch.randn_like(inpt).to(device)
+                    noise = torch.randn_like(img_lab_trg).to(device)
                     with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
-                        sigma = sample_density([inpt.shape[0]], device=device)
+                        sigma = sample_density([img_lab_trg.shape[0]], device=device)
 
                     with K.models.checkpointing(args.checkpointing):
-                        losses = model.loss(inpt, None, noise, sigma, mapping_cond=cond_label, **extra_args)
+                        losses = model.loss(img_lab_trg, img_lab_inpt, noise, sigma, mapping_cond=None, **extra_args)
 
                     # Evita NCCL timeout: non fare gather durante il training!
                     loss = losses.mean().item()
@@ -425,15 +468,38 @@ def main():
             with torch.no_grad():
                 for batch in tqdm(val_dl, desc="Validation", disable=not accelerator.is_main_process):
                     inpt = batch[0].contiguous().float().to(device, non_blocking=True)
+                    inpt = inpt.squeeze(2)  # shape: (8, 120, 24, 360)
+                    cond_img = inpt[:, :60, :, :]    # first 60 time steps
+                    target_img = inpt[:, 60:, :, :]  # last 60 time steps
                     cond_label = batch[1].to(device, non_blocking=True)
 
+                    cond_label_inp = cond_label[:, :61, :]  # (bs, 61, 4)
+                    cond_label_as_inpt = []
+                    for i in range(cond_label_inp.shape[-1]):
+                        # Expand cond_label_inp[:, :, i] to (bs, 61, 1, 1), then broadcast to (bs, 61, 24, 360)
+                        expanded = cond_label_inp[:, :, i].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 360)
+                        cond_label_as_inpt.append(expanded)
+                    # Stack along new channel dimension to get (bs, 61, 4, 24, 360)
+                    cond_label_as_inpt = torch.cat(cond_label_as_inpt, dim=1)
+
+                    cond_label_trg = cond_label[:, 61:, :]
+                    cond_label_trg_as_inpt = []
+                    for i in range(cond_label_trg.shape[-1]):
+                        expanded_trg = cond_label_trg[:, :, i].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 24, 360)
+                        cond_label_trg_as_inpt.append(expanded_trg)
+                    # Stack along new channel dimension to get (bs, 60, 4, 24, 360)
+                    cond_label_trg_as_inpt = torch.cat(cond_label_trg_as_inpt, dim=1)
+
+                    img_lab_inpt = torch.cat([cond_label_as_inpt, cond_img], dim=1)
+                    img_lab_trg = torch.cat([cond_label_trg_as_inpt, target_img], dim=1)
+
                     extra_args = {}
-                    noise = torch.randn_like(inpt).to(device)
+                    noise = torch.randn_like(img_lab_trg).to(device)
                     with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
-                        sigma = sample_density([inpt.shape[0]], device=device)
+                        sigma = sample_density([img_lab_trg.shape[0]], device=device)
 
                     with K.models.checkpointing(args.checkpointing):
-                        losses = model.loss(inpt, None, noise, sigma, mapping_cond=cond_label, **extra_args)
+                        losses = model.loss(img_lab_trg, img_lab_inpt, noise, sigma, mapping_cond=None, **extra_args)
 
                     # Make sure we only gather scalar loss (not batch tensor)
                     loss_value = losses.mean().detach()
@@ -456,36 +522,37 @@ def main():
             if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
                 
                 # Test sampling 
-                samples = generate_samples(model_ema, 1, device, cond_label=cond_label[0].unsqueeze(0), sampler="dpmpp_2m_sde")
+                samples = generate_samples(model_ema, 1, device, cond_label=None, sampler="dpmpp_2m_sde", cond_img=img_lab_inpt[0].reshape(1, 304, 24, 360))
                 
                 # Remove batch dim
-                target_tensor = samples[0][0].cpu().numpy() # shape: (5, 3, 256, 256)
+                # target_tensor = samples[0][0].cpu().numpy() # shape: (5, 3, 256, 256)
                 
-                fig, (ax1) = plt.subplots(1, 1)
-                # Plot the original image in the first subplot
-                ax1.imshow(target_tensor, origin='lower')
-                ax1.set_title('Predicted Image')
-                # Add a big title in the middle of all subplots
-                fig.suptitle('Cond_1: {}, Cond_2: {}, Cond_3: {}'.format(cond_label[0][0].item(), cond_label[0][1].item(), cond_label[0][2].item()))
-                # Adjust the spacing between subplots
-                plt.tight_layout()
-                # Show the plot
-                plt.show()
+                # fig, (ax1) = plt.subplots(1, 1)
+                # # Plot the original image in the first subplot
+                # ax1.imshow(target_tensor, origin='lower')
+                # ax1.set_title('Predicted Image')
+                # # Add a big title in the middle of all subplots
+                # fig.suptitle('Cond_1: {}, Cond_2: {}, Cond_3: {}'.format(cond_label[0][0].item(), cond_label[0][1].item(), cond_label[0][2].item()))
+                # # Adjust the spacing between subplots
+                # plt.tight_layout()
+                # # Show the plot
+                # plt.show()
                 
             # **wandb Logging (Now Includes Validation Loss)**
-            if use_wandb: #and accelerator.is_main_process:
+            if use_wandb:
                 log_dict = {
                     'epoch': epoch,
                     'loss': epoch_train_loss,
                     'val_loss': val_loss,
                     'lr': sched.get_last_lr()[0],
                     'ema_decay': ema_decay,
-                    'Sampled images': wandb.Image(plt)
+                    # 'Sampled images': wandb.Image(plt)
                 }
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
                 
-                plt.close()
+                wandb.log(log_dict)
+                # plt.close()
             save()
             epoch += 1  # Move to the next epoch
 
