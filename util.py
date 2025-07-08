@@ -29,7 +29,7 @@ flip = transforms.RandomVerticalFlip(p=1.0)
 
 
 
-def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m", step=50, cond_img=None):
+def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m_sde", step=50, cond_img=None):
     """
     Generate samples using k-diffusion samplers.
 
@@ -44,7 +44,7 @@ def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m",
     """
     model.eval()  # Set model to evaluation mode
     with torch.no_grad():
-        x = torch.randn(num_samples, 296, 24, 360, device=device)  # Start with noise
+        x = torch.randn(num_samples, 3, 6, 64, 64, device=device)  # Start with noise
         extra_args = {
                         "mapping_cond": None,
                         "cond": cond_img

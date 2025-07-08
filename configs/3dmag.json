@@ -1,12 +1,12 @@
 {
     "model": {
 			"type": "vit",
-			"in_channels": 600,                
-			"input_size": [256, 256],           
+			"in_channels": 6,                
+			"input_size": [64, 64],           
 			"patch_size": [8, 8],            
 			"mapping_out": 256,                 
-			"out_channels": 296,           
-			"t_out": 5,			
+			"out_channels": 6,           
+			"t_out": 3,			
 			"depths": [2, 4, 4],                
 			"channels": [128, 256, 512],        
 			"self_attn_depths": [false, false, false],  

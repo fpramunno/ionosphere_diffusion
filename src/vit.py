@@ -407,6 +407,7 @@ class ViT(nn.Module):
         patch_size: Union[int, Sequence[int]] = 1,
         unpatch_size: Union[int, Sequence[int], None] = None,
         window_size: Union[int, Sequence[int], None] = None,
+        lat_long_mode: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
@@ -423,6 +424,9 @@ class ViT(nn.Module):
         self.patch_size = patch_size[-1] if isinstance(patch_size, Sequence) else patch_size
         self.in_channels = in_channels
         self.out_channels = out_channels
+
+        
+        self.lat_long_mode = lat_long_mode
 
         self.cond_channels = cond_channels
         self.t_out = t_out
@@ -463,12 +467,7 @@ class ViT(nn.Module):
             nn.SiLU(),
             nn.Linear(mod_features, mod_features),
         )
-        self.mapping_cond = nn.Sequential(
-            SineEncoding(mod_features),
-            nn.Linear(mod_features, mod_features, bias=False),
-            nn.SiLU(),
-            nn.Linear(mod_features, mod_features),
-        )
+        self.mapping_cond = nn.Linear(mod_features, mod_features, bias=False)
 
         self.spatial = spatial
         self.window_size = tuple(window_size) if isinstance(window_size, Sequence) else ((window_size,) * spatial if window_size else None)
@@ -498,17 +497,30 @@ class ViT(nn.Module):
         mapping_cond: Optional[Tensor] = None,
         cond: Optional[Tensor] = None,
         return_variance: bool = False,
+        coord: Optional[Tensor] = None,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         c_noise = sigma.log() / 4
         timestep_embed = self.timestep_embed(c_noise.unsqueeze(-1))
         mapping_cond_embed = torch.zeros_like(timestep_embed) if mapping_cond is None else self.mapping_cond(mapping_cond)
-        mapping_out = self.mapping(timestep_embed + mapping_cond_embed.mean(dim=1).unsqueeze(1))
+        mapping_out = self.mapping(timestep_embed + mapping_cond_embed)
 
+        # print(input.shape)
         if cond is not None:
             input = torch.cat([input, cond], dim=1)
-        
+
+        # time_position = None
+        # if self.lat_long_mode == 'input_channel':
+        #     time_position = coord[:,0,:,0,0]  # e.g. -9, -3, -1, 0, 1, 3, 9
+        #     # normalize time coordinate by max horizon 
+        #     time_coord = coord[:,:1,...] / 9
+        #     # normalize latitude and longitude coordinates by 90
+        #     lat_long_coord = coord[:,1:3,...] / 90
+        #     # concatenate coordinates with the input
+        #     input = torch.cat((x, time_coord, lat_long_coord), dim=1)
+
         input = self.patch(input)
         input = self.in_proj(input)
+
         shape = input.shape[-self.spatial - 1: -1]
 
         coo, mask = self.coo_and_mask(shape, spatial=self.spatial, window_size=self.window_size, dtype=input.dtype, device=input.device)
@@ -517,16 +529,13 @@ class ViT(nn.Module):
         x = x + self.positional_embedding(coo)
 
         for block in self.blocks:
-            x = block(x, mapping_out.squeeze(1), coo=coo, mask=mask, skip=skip)
-        
+            x = block(x, mapping_out, coo=coo, mask=mask, skip=skip)
         x = torch.unflatten(x, sizes=shape, dim=-2)
+        
+        
         x = self.out_proj(x)
         x = self.unpatch(x)
-
-        return x
-        
-        
-        # return x
+        return x[:, 4:, :, :, :]
 
     def param_groups(self, base_lr=2e-4):
         wd_params, no_wd_params = [], []

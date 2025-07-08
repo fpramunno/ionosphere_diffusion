@@ -7,6 +7,8 @@ import threading
 import time
 import urllib
 import warnings
+import contextlib
+import random
 
 from PIL import Image
 import safetensors
@@ -46,6 +48,54 @@ def append_dims(x, target_dims):
     if dims_to_append < 0:
         raise ValueError(f'input has {x.ndim} dims but target_dims is {target_dims}, which is less')
     return x[(...,) + (None,) * dims_to_append]
+
+def subsample(x, reso):
+    """ Subsample a numpy array (or cpu tensor) to a given resolution 
+    using antialiasing Gaussian filter. """
+    ndim = len(reso)
+    output_shape = x.shape[:-ndim] + tuple(reso)
+    if any(output_shape[d] > x.shape[d] for d in range(-ndim, 0)):
+        return x
+    if output_shape == x.shape:
+        return x
+    if isinstance(x, np.ndarray):
+        return resize(x, output_shape, anti_aliasing=True)
+    elif isinstance(x, torch.Tensor):
+        x = x.numpy()
+        x = resize(x, output_shape, anti_aliasing=True)
+        return torch.tensor(x)
+
+@contextlib.contextmanager
+def set_seed(seed, backend='numpy'):
+    if seed is not None:
+        if backend == 'random':
+            saved_state = random.getstate()
+            random.seed(seed)
+            try:
+                yield
+            finally:
+                random.setstate(saved_state)
+        elif backend == 'numpy':
+            saved_state = np.random.get_state()
+            # Set the new seed
+            np.random.seed(seed)
+            try:
+                yield
+            finally:
+                np.random.set_state(saved_state)
+        elif backend == 'torch':
+            saved_state = torch.random.get_rng_state()
+            # Set the new seed
+            torch.manual_seed(seed)
+            try:
+                yield
+            finally:
+                torch.random.set_rng_state(saved_state)
+        else:
+            raise ValueError(f"Unknown backend: {backend}. Must be 'torch' or 'numpy'")
+    else:
+        # If seed is None, do nothing special
+        yield
 
 
 def n_params(module):
