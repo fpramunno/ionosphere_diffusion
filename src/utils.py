@@ -177,7 +177,7 @@ class InverseLR(optim.lr_scheduler._LRScheduler):
             raise ValueError('Invalid value for warmup')
         self.warmup = warmup
         self.min_lr = min_lr
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if not self._get_lr_called_within_step:
@@ -218,7 +218,7 @@ class ExponentialLR(optim.lr_scheduler._LRScheduler):
             raise ValueError('Invalid value for warmup')
         self.warmup = warmup
         self.min_lr = min_lr
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if not self._get_lr_called_within_step:
@@ -250,7 +250,7 @@ class ConstantLRWithWarmup(optim.lr_scheduler._LRScheduler):
         if not 0. <= warmup < 1:
             raise ValueError('Invalid value for warmup')
         self.warmup = warmup
-        super().__init__(optimizer, last_epoch, verbose)
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if not self._get_lr_called_within_step:

@@ -5,12 +5,12 @@ Created on Sat Apr  5 15:47:31 2025
 @author: pio-r
 """
 
-# import debugpy
+import debugpy
 
-# debugpy.connect(("v000675", 5678))  # VS Code listens on login node
-# print("✅ Connected to VS Code debugger!")
-# debugpy.wait_for_client()
-# print("🎯 Debugger attached!")
+debugpy.connect(("v000675", 5678))  # VS Code listens on login node
+print("✅ Connected to VS Code debugger!")
+debugpy.wait_for_client()
+print("🎯 Debugger attached!")
 
 def main():
 
@@ -51,7 +51,7 @@ def main():
                 help='the path of the dataset')
     p.add_argument('--saving-path', type=str, default="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/", 
                 help='the path where to save the model')
-    p.add_argument('--dir-name', type=str, default='cond_forecasting',
+    p.add_argument('--dir-name', type=str, default='cond_forecasting_normalized_test',
                 help='the directory name to use')  # <---- Added this line
     p.add_argument('--end-step', type=int, default=None,
                 help='the step to end training at')
@@ -88,6 +88,8 @@ def main():
                 help='the multiprocessing start method')
     p.add_argument('--use_wandb', type=bool, default=True,
                 help='Use wandb')
+    p.add_argument('--max-epochs', type=int, default=None,
+                help='maximum number of epochs to train for')
 
     p.add_argument('--wandb-entity', type=str,
                 help='the wandb entity name')
@@ -155,13 +157,24 @@ def main():
 
 
     # WANDB LOGGING
-    use_wandb = args.use_wandb # accelerator.is_main_process and args.wandb_project
+    use_wandb = False #args.use_wandb # accelerator.is_main_process and args.wandb_project
     if accelerator.is_main_process and use_wandb:
         import wandb
         log_config = vars(args)
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params(inner_model)
         wandb.init(project="ionosphere", entity="francescopio", config=log_config, save_code=True)
+    
+    # MODEL SUMMARY
+    if accelerator.is_main_process:
+        total_params = sum(p.numel() for p in inner_model.parameters())
+        trainable_params = sum(p.numel() for p in inner_model.parameters() if p.requires_grad)
+        print(f'=== MODEL SUMMARY ===')
+        print(f'Total parameters: {total_params:,}')
+        print(f'Trainable parameters: {trainable_params:,}')
+        print(f'Non-trainable parameters: {total_params - trainable_params:,}')
+        print(f'Model size (MB): {total_params * 4 / (1024**2):.2f}')
+        print(f'=====================')
 
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
@@ -229,6 +242,7 @@ def main():
 
     train_dataset, train_sampler, train_dl = get_sequence_data_objects(
         csv_path="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv",
+        transform_cond_csv="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
         batch_size=args.batch_size,
         distributed=False,
         num_data_workers=args.num_workers,
@@ -239,6 +253,7 @@ def main():
 
     val_dataset, val_sampler, val_dl = get_sequence_data_objects(
         csv_path="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv",
+        transform_cond_csv="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
         batch_size=args.batch_size,
         distributed=False,
         num_data_workers=args.num_workers,
@@ -252,7 +267,7 @@ def main():
     # Prepare the model, optimizer, and dataloaders with the accelerator
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
 
-    use_wandb = args.use_wandb
+    use_wandb = False #args.use_wandb
 
     if use_wandb and accelerator.is_main_process:
         wandb.watch(inner_model)
@@ -345,7 +360,7 @@ def main():
     losses_since_last_print = []
     model = model.to(device)
     try:
-        while True:
+        while args.max_epochs is None or epoch < args.max_epochs:
             # Training Loop
             epoch_train_loss = 0  # Track total training loss
             num_train_batches = len(train_dl)  # Number of batches
@@ -538,14 +553,22 @@ def main():
                 # # Show the plot
                 # plt.show()
                 
-            # **wandb Logging (Now Includes Validation Loss)**
+            # **wandb Logging (Now Includes Validation Loss and Max-Min Difference)**
             if use_wandb:
+                # Calculate max-min difference after reverting transformation
+                # Revert the transformation: multiply by 108154.0
+                target_reverted = target_img * 108154.0
+                max_val = target_reverted.max().item()
+                min_val = target_reverted.min().item()
+                max_min_diff = max_val - min_val
+                
                 log_dict = {
                     'epoch': epoch,
                     'loss': epoch_train_loss,
                     'val_loss': val_loss,
                     'lr': sched.get_last_lr()[0],
                     'ema_decay': ema_decay,
+                    'max_min_difference': max_min_diff,
                     # 'Sampled images': wandb.Image(plt)
                 }
                 if args.gns:
@@ -553,8 +576,16 @@ def main():
                 
                 wandb.log(log_dict)
                 # plt.close()
-            save()
+            # Save every 5 epochs or at the end
+            if epoch % 5 == 0 or (args.max_epochs is not None and epoch >= args.max_epochs - 1):
+                save()
             epoch += 1  # Move to the next epoch
+            
+            # Check if we've reached max epochs
+            if args.max_epochs is not None and epoch >= args.max_epochs:
+                if accelerator.is_main_process:
+                    tqdm.write(f'Reached maximum epochs ({args.max_epochs}). Training complete!')
+                break
 
     except KeyboardInterrupt:
         pass

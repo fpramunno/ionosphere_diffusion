@@ -15,3 +15,7 @@ wandb/
 *.csv
 *.pth
 *.npy
+logs/
+*.gif
+results_cond_forecasting_cfg/
+results_cond_forecasting_cfg_oneframe/

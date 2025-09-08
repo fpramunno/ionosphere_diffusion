@@ -194,6 +194,7 @@ class IonoSequenceDataset(Dataset):
     def __init__(
         self,
         csv_path,
+        transform_cond_csv,
         resolution=(24, 360),
         train_val_test=[0.8, 0.10, 0.10],
         split="train",
@@ -202,6 +203,7 @@ class IonoSequenceDataset(Dataset):
         seed=42
     ):
         self.csv_path = csv_path
+        self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
         self.transforms = transforms
         self.seed = seed
@@ -212,6 +214,12 @@ class IonoSequenceDataset(Dataset):
 
         # Read CSV and extract filenames and timestamps
         df = pd.read_csv(self.csv_path)
+
+        df_cond = pd.read_csv(self.transform_cond_csv)
+        df_cond["float4"] = df_cond["float4"] * -1 # do this becauuse it is a velocity and it was stored in the opposite
+        # Store min and max for each float column for normalization
+        self.cond_min = df_cond[["float1", "float2", "float3", "float4"]].min().values.astype(np.float32)
+        self.cond_max = df_cond[["float1", "float2", "float3", "float4"]].max().values.astype(np.float32)
         df['timestamp'] = df['filename'].apply(extract_timestamp)
         df = df.dropna(subset=['timestamp'])
         df = df.sort_values('timestamp').reset_index(drop=True)
@@ -237,15 +245,6 @@ class IonoSequenceDataset(Dataset):
             else:
                 i += 1  # try next window
 
-        # Also build sequences by simply grouping every self.sequence_length images, regardless of temporal consistency
-        # self.grouped_sequences = []
-        # for i in range(0, n - self.sequence_length + 1, self.sequence_length):
-        #     seq_files = self.all_files[i:i+self.sequence_length]
-        #     self.grouped_sequences.append(seq_files)
-
-        # Split sequences by timestamp: first 8 months train, next 2 val, last 2 test
-        # Assumes timestamps are sorted and cover a single year
-
         # Helper to get month from first file in each sequence
         def get_month(seq):
             idx = self.all_files.index(seq[0])
@@ -269,6 +268,37 @@ class IonoSequenceDataset(Dataset):
 
     def __len__(self):
         return len(self.sequences)
+    
+    def revert_condition_normalization(self, cond_normalized):
+        """
+        Revert normalized conditions from [-1, 1] back to original scale
+        
+        Args:
+            cond_normalized: Tensor or array of shape (..., 4) with values in [-1, 1]
+            
+        Returns:
+            Tensor or array of original condition values
+            
+        Note:
+            - Each column was normalized independently using per-column min/max
+            - Column 3 (index 3) represents -float4 (velocity was negated)
+            - Formula: (norm + 1) / 2 * (max - min) + min
+        """
+        # Convert tensor to numpy if needed
+        is_tensor = torch.is_tensor(cond_normalized)
+        if is_tensor:
+            cond_norm = cond_normalized.numpy()
+        else:
+            cond_norm = cond_normalized
+            
+        # Revert normalization: (norm + 1) / 2 * (max - min) + min
+        cond_original = (cond_norm + 1) / 2 * (self.cond_max - self.cond_min) + self.cond_min
+        
+        # Convert back to tensor if input was tensor
+        if is_tensor:
+            cond_original = torch.from_numpy(cond_original).float()
+            
+        return cond_original
 
     def __getitem__(self, idx):
         seq_files = self.sequences[idx]
@@ -280,7 +310,10 @@ class IonoSequenceDataset(Dataset):
             data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
             if self.transforms:
                 data_tensor = data_tensor / 108154.0
-            cond_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
+            # Normalize cond_tensor between -1 and 1
+            cond_raw = np.array([data[1], data[2], data[3], -data[4]], dtype=np.float32)
+            cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
+            cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
             data_tensors.append(data_tensor)
             cond_tensors.append(cond_tensor)
             time.append(extract_timestamp(file_path))
@@ -299,11 +332,13 @@ def get_sequence_data_objects(
     world_size=None,
     split="train",
     csv_path=None,
+    transform_cond_csv=None,
     transforms=True,
     seed=42,
 ):
     dataset = IonoSequenceDataset(
         csv_path=csv_path,
+        transform_cond_csv=transform_cond_csv,
         transforms=transforms,
         split=split,
         seed=seed,

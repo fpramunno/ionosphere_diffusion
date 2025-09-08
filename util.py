@@ -29,7 +29,7 @@ flip = transforms.RandomVerticalFlip(p=1.0)
 
 
 
-def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m", step=50, cond_img=None):
+def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m", step=50, cond_img=None, num_pred_frames=1):
     """
     Generate samples using k-diffusion samplers.
 
@@ -44,9 +44,9 @@ def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m",
     """
     model.eval()  # Set model to evaluation mode
     with torch.no_grad():
-        x = torch.randn(num_samples, 296, 24, 360, device=device)  # Start with noise
+        x = torch.randn(num_samples, num_pred_frames, 24, 360, device=device)  # Start with noise
         extra_args = {
-                        "mapping_cond": None,
+                        "mapping_cond": cond_label,
                         "cond": cond_img
                     }
         sigmas = sampling.get_sigmas_karras(n=step, sigma_min=1e-2, sigma_max=80, rho=7.0, device=device)
@@ -489,6 +489,7 @@ def is_within_circle(time, hpc_x, hpc_y, degree=70):
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 import sunpy.coordinates.frames as frames
@@ -630,3 +631,257 @@ def plot_intersection_contour(white_contours, black_contours, roi_gt_peak):
     
     plt.tight_layout()
     plt.show()
+
+
+def plot_polar_ionosphere_single(data, title="Ionosphere Data", cmap='plasma', figsize=(8, 8)):
+    """
+    Plot a single ionosphere data array in polar coordinates.
+    
+    Args:
+        data (np.ndarray): 2D array with shape (24, 360) - ionosphere data
+        title (str): Title for the plot
+        cmap (str): Colormap to use
+        figsize (tuple): Figure size
+    
+    Returns:
+        fig, ax: Matplotlib figure and axis objects
+    """
+    # Define coordinates
+    mag_lat = np.linspace(-90, -66, data.shape[0])  # 24 latitude points from -90 to -66
+    mag_lon = np.linspace(0, 360, data.shape[1], endpoint=False)  # 360 longitude points
+    
+    # Create meshgrid from lat/lon
+    lon_grid, lat_grid = np.meshgrid(mag_lon, mag_lat)
+    
+    # Convert to polar coordinates
+    r = 90 - np.abs(lat_grid.flatten())
+    theta = np.deg2rad(lon_grid.flatten())
+    
+    # Interpolate onto regular polar grid
+    r_i = np.linspace(r.min(), r.max(), 200)
+    theta_i = np.linspace(0, 2 * np.pi, 360)
+    r_grid, theta_grid = np.meshgrid(r_i, theta_i)
+    
+    # Interpolation for data
+    points = np.column_stack((r, theta))
+    grid_values = griddata(points, data.flatten(), (r_grid, theta_grid), method='linear')
+    
+    # Create polar plot
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw=dict(polar=True))
+    
+    # Plot data
+    c = ax.pcolormesh(theta_grid, r_grid, grid_values, shading='auto', cmap=cmap)
+    ax.set_theta_zero_location("S")
+    ax.set_theta_direction(-1)
+    
+    # Add colorbar
+    fig.colorbar(c, ax=ax, label='Value')
+    ax.set_title(title)
+    
+    return fig, ax
+
+
+def plot_polar_ionosphere_comparison(data_original, data_pred, data_std=None, 
+                                   titles=None, cmap='plasma', figsize=(16, 8),
+                                   revert_normalization=True, normalization_factor=108154.0):
+    """
+    Plot ionosphere data comparison in polar coordinates (original vs predicted vs std).
+    
+    Args:
+        data_original: Original data array (numpy array or torch tensor)
+        data_pred: Predicted data array (numpy array or torch tensor) 
+        data_std: Standard deviation array (numpy array or torch tensor), optional
+        titles: List of titles for each subplot, defaults to ["Original", "Predicted", "Std Dev"]
+        cmap: Colormap to use
+        figsize: Figure size
+        revert_normalization: Whether to revert normalization by multiplying by normalization_factor
+        normalization_factor: Factor to multiply by if reverting normalization (default: 108154.0)
+    
+    Returns:
+        fig, axs: Matplotlib figure and axes objects
+    """
+    # Convert tensors to numpy if needed
+    if hasattr(data_original, 'numpy'):
+        data_original = data_original.numpy()
+    if hasattr(data_pred, 'numpy'):
+        data_pred = data_pred.numpy()
+    if data_std is not None and hasattr(data_std, 'numpy'):
+        data_std = data_std.numpy()
+    
+    # Revert normalization if requested
+    if revert_normalization:
+        data_original = data_original * normalization_factor
+        data_pred = data_pred * normalization_factor
+        if data_std is not None:
+            data_std = data_std * normalization_factor
+    
+    # Handle single channel data (squeeze if needed)
+    if data_original.ndim > 2:
+        data_original = data_original.squeeze()
+    if data_pred.ndim > 2:
+        data_pred = data_pred.squeeze()
+    if data_std is not None and data_std.ndim > 2:
+        data_std = data_std.squeeze()
+    
+    # Set default titles
+    if titles is None:
+        titles = ["Original Data", "Predicted Data"]
+        if data_std is not None:
+            titles.append("Standard Deviation")
+    
+    # Define coordinates
+    mag_lat = np.linspace(-90, -66, data_original.shape[0])  # 24 latitude points
+    mag_lon = np.linspace(0, 360, data_original.shape[1], endpoint=False)  # 360 longitude points
+    
+    # Create meshgrid from lat/lon
+    lon_grid, lat_grid = np.meshgrid(mag_lon, mag_lat)
+    
+    # Convert to polar coordinates
+    r = 90 - np.abs(lat_grid.flatten())
+    theta = np.deg2rad(lon_grid.flatten())
+    
+    # Interpolate onto regular polar grid
+    r_i = np.linspace(r.min(), r.max(), 200)
+    theta_i = np.linspace(0, 2 * np.pi, 360)
+    r_grid, theta_grid = np.meshgrid(r_i, theta_i)
+    
+    # Common interpolation points
+    points = np.column_stack((r, theta))
+    
+    # Interpolation for each dataset
+    grid_values_orig = griddata(points, data_original.flatten(), (r_grid, theta_grid), method='linear')
+    grid_values_pred = griddata(points, data_pred.flatten(), (r_grid, theta_grid), method='linear')
+    
+    # Determine number of subplots
+    n_plots = 3 if data_std is not None else 2
+    
+    # Create subplots
+    fig, axs = plt.subplots(1, n_plots, figsize=figsize, subplot_kw=dict(polar=True))
+    if n_plots == 1:
+        axs = [axs]
+    
+    # Plot original data
+    c1 = axs[0].pcolormesh(theta_grid, r_grid, grid_values_orig, shading='auto', cmap=cmap)
+    axs[0].set_theta_zero_location("S")
+    axs[0].set_theta_direction(-1)
+    fig.colorbar(c1, ax=axs[0], label='Value')
+    axs[0].set_title(titles[0])
+    
+    # Plot predicted data
+    c2 = axs[1].pcolormesh(theta_grid, r_grid, grid_values_pred, shading='auto', cmap=cmap)
+    axs[1].set_theta_zero_location("S")
+    axs[1].set_theta_direction(-1)
+    fig.colorbar(c2, ax=axs[1], label='Value')
+    axs[1].set_title(titles[1])
+    
+    # Plot standard deviation if provided
+    if data_std is not None:
+        grid_values_std = griddata(points, data_std.flatten(), (r_grid, theta_grid), method='linear')
+        c3 = axs[2].pcolormesh(theta_grid, r_grid, grid_values_std, shading='auto', cmap=cmap)
+        axs[2].set_theta_zero_location("S")
+        axs[2].set_theta_direction(-1)
+        fig.colorbar(c3, ax=axs[2], label='Value')
+        axs[2].set_title(titles[2])
+    
+    plt.tight_layout()
+    return fig, axs
+
+
+def plot_polar_ionosphere_batch(data_batch, titles=None, cmap='plasma', figsize=None,
+                               revert_normalization=True, normalization_factor=108154.0,
+                               max_plots=6):
+    """
+    Plot multiple ionosphere data samples in polar coordinates from a batch.
+    
+    Args:
+        data_batch: Batch of data arrays (shape: [batch, height, width] or [batch, channel, height, width])
+        titles: List of titles for each subplot
+        cmap: Colormap to use
+        figsize: Figure size (auto-calculated if None)
+        revert_normalization: Whether to revert normalization
+        normalization_factor: Factor to multiply by if reverting normalization
+        max_plots: Maximum number of plots to show
+    
+    Returns:
+        fig, axs: Matplotlib figure and axes objects
+    """
+    # Convert tensor to numpy if needed
+    if hasattr(data_batch, 'numpy'):
+        data_batch = data_batch.numpy()
+    
+    # Handle different input shapes
+    if data_batch.ndim == 4:  # [batch, channel, height, width]
+        data_batch = data_batch.squeeze(1)  # Remove channel dimension
+    elif data_batch.ndim == 3:  # [batch, height, width] 
+        pass
+    else:
+        raise ValueError(f"Expected 3D or 4D input, got shape {data_batch.shape}")
+    
+    # Limit number of plots
+    n_samples = min(data_batch.shape[0], max_plots)
+    data_batch = data_batch[:n_samples]
+    
+    # Calculate figure size if not provided
+    if figsize is None:
+        cols = min(3, n_samples)
+        rows = (n_samples + cols - 1) // cols
+        figsize = (6 * cols, 6 * rows)
+    
+    # Set default titles
+    if titles is None:
+        titles = [f"Sample {i+1}" for i in range(n_samples)]
+    
+    # Revert normalization if requested
+    if revert_normalization:
+        data_batch = data_batch * normalization_factor
+    
+    # Define coordinates (same for all samples)
+    mag_lat = np.linspace(-90, -66, data_batch.shape[1])  # 24 latitude points
+    mag_lon = np.linspace(0, 360, data_batch.shape[2], endpoint=False)  # 360 longitude points
+    
+    # Create meshgrid from lat/lon
+    lon_grid, lat_grid = np.meshgrid(mag_lon, mag_lat)
+    
+    # Convert to polar coordinates
+    r = 90 - np.abs(lat_grid.flatten())
+    theta = np.deg2rad(lon_grid.flatten())
+    
+    # Interpolate onto regular polar grid
+    r_i = np.linspace(r.min(), r.max(), 200)
+    theta_i = np.linspace(0, 2 * np.pi, 360)
+    r_grid, theta_grid = np.meshgrid(r_i, theta_i)
+    
+    # Common interpolation points
+    points = np.column_stack((r, theta))
+    
+    # Calculate subplot layout
+    cols = min(3, n_samples)
+    rows = (n_samples + cols - 1) // cols
+    
+    # Create subplots
+    fig, axs = plt.subplots(rows, cols, figsize=figsize, subplot_kw=dict(polar=True))
+    if n_samples == 1:
+        axs = [axs]
+    elif rows == 1:
+        axs = axs if isinstance(axs, (list, np.ndarray)) else [axs]
+    else:
+        axs = axs.flatten()
+    
+    # Plot each sample
+    for i in range(n_samples):
+        # Interpolation for current sample
+        grid_values = griddata(points, data_batch[i].flatten(), (r_grid, theta_grid), method='linear')
+        
+        # Plot
+        c = axs[i].pcolormesh(theta_grid, r_grid, grid_values, shading='auto', cmap=cmap)
+        axs[i].set_theta_zero_location("S")
+        axs[i].set_theta_direction(-1)
+        fig.colorbar(c, ax=axs[i], label='Value')
+        axs[i].set_title(titles[i])
+    
+    # Hide unused subplots
+    for i in range(n_samples, len(axs)):
+        axs[i].set_visible(False)
+    
+    plt.tight_layout()
+    return fig, axs

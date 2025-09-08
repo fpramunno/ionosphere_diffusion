@@ -407,6 +407,7 @@ class ViT(nn.Module):
         patch_size: Union[int, Sequence[int]] = 1,
         unpatch_size: Union[int, Sequence[int], None] = None,
         window_size: Union[int, Sequence[int], None] = None,
+        channel_mapping_cond: int = 15,
         **kwargs,
     ):
         super().__init__()
@@ -464,8 +465,9 @@ class ViT(nn.Module):
             nn.Linear(mod_features, mod_features),
         )
         self.mapping_cond = nn.Sequential(
-            SineEncoding(mod_features),
-            nn.Linear(mod_features, mod_features, bias=False),
+            nn.Linear(channel_mapping_cond * 4, mod_features),  # Flatten spatial dimensions and project to mod_features BEFORE 16 NOW 30
+            nn.SiLU(),
+            nn.Linear(mod_features, mod_features),
             nn.SiLU(),
             nn.Linear(mod_features, mod_features),
         )
@@ -501,7 +503,7 @@ class ViT(nn.Module):
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         c_noise = sigma.log() / 4
         timestep_embed = self.timestep_embed(c_noise.unsqueeze(-1))
-        mapping_cond_embed = torch.zeros_like(timestep_embed) if mapping_cond is None else self.mapping_cond(mapping_cond)
+        mapping_cond_embed = torch.zeros_like(timestep_embed) if mapping_cond is None else self.mapping_cond(mapping_cond.flatten(-2)).unsqueeze(1)
         mapping_out = self.mapping(timestep_embed + mapping_cond_embed.mean(dim=1).unsqueeze(1))
 
         if cond is not None:

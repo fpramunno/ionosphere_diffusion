@@ -4,11 +4,10 @@
 #SBATCH --nodes=1
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=performance
-#SBATCH --job-name="training_iono_forecasting"
-#SBATCH --error=err_training_iono_forecasting.log
-#SBATCH --out=out_training_iono_forecasting.log
+#SBATCH --job-name="generate_1frame_test"
+#SBATCH --error=err_generate_1frame_test.log
+#SBATCH --out=out_generate_1frame_test.log
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 
-python3 train_3dmag.py
-
+python3 /mnt/nas05/data01/francesco/progetto_simone/ionosphere/generation_script.py
