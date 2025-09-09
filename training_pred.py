@@ -96,6 +96,9 @@ def main():
                 help='path to the main CSV file with metrics')
     p.add_argument('--transform-cond-csv', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
                 help='path to the transform condition CSV file')
+    p.add_argument('--normalization-type', type=str, default="absolute_max", 
+                choices=["absolute_max", "mean_sigma_tanh"],
+                help='type of normalization to use: absolute_max (original) or mean_sigma_tanh (new)')
 
     p.add_argument('--wandb-entity', type=str,
                 help='the wandb entity name')
@@ -253,7 +256,8 @@ def main():
         num_data_workers=args.num_workers,
         split='train',
         seed=42,
-        sequence_length=args.sequence_length
+        sequence_length=args.sequence_length,
+        normalization_type=args.normalization_type
     )
 
     val_dataset, val_sampler, val_dl = get_sequence_data_objects(
@@ -264,10 +268,12 @@ def main():
         num_data_workers=args.num_workers,
         split='valid',
         seed=42,
-        sequence_length=args.sequence_length
+        sequence_length=args.sequence_length,
+        normalization_type=args.normalization_type
     )
 
-    print('Train loader and Valid loader are up!')
+    print(f'Train loader and Valid loader are up!')
+    print(f'Using normalization method: {args.normalization_type}')
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)

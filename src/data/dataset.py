@@ -10,6 +10,55 @@ from typing import Iterator
 from datetime import datetime
 from collections.abc import Sized
 
+class MeanSigmaTanhNormalizer:
+    """
+    Normalizer that applies mean-sigma normalization followed by tanh.
+    
+    Forward: tanh((x - mean) / std)
+    Reverse: atanh(y) * std + mean
+    """
+    def __init__(self, mean=None, std=None):
+        self.mean = mean
+        self.std = std
+        
+    def fit(self, data):
+        """Fit the normalizer to the data by computing mean and std."""
+        if isinstance(data, torch.Tensor):
+            self.mean = data.mean().item()
+            self.std = data.std().item()
+        else:
+            self.mean = float(np.mean(data))
+            self.std = float(np.std(data))
+        
+        # Avoid division by zero
+        if self.std == 0:
+            self.std = 1.0
+            
+    def forward(self, x):
+        """Apply normalization: tanh((x - mean) / std)"""
+        if self.mean is None or self.std is None:
+            raise ValueError("Normalizer must be fitted first!")
+        
+        # Standardize then apply tanh
+        normalized = (x - self.mean) / self.std
+        return torch.tanh(normalized)
+    
+    def reverse(self, y):
+        """Reverse normalization: atanh(y) * std + mean"""
+        if self.mean is None or self.std is None:
+            raise ValueError("Normalizer must be fitted first!")
+        
+        # Clamp y to valid range for atanh to avoid numerical issues
+        y_clamped = torch.clamp(y, -0.999999, 0.999999)
+        
+        # Apply inverse tanh then denormalize
+        denormalized = torch.atanh(y_clamped) * self.std + self.mean
+        return denormalized
+    
+    def get_stats(self):
+        """Get the fitted mean and std statistics."""
+        return {"mean": self.mean, "std": self.std}
+
 class IonoDataset(Dataset): # type: ignore
     def __init__(
         self,
@@ -18,6 +67,7 @@ class IonoDataset(Dataset): # type: ignore
         train_val_test=[0.8, 0.10, 0.10],
         split="train",
         transforms=True,
+        normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
         seed=42
     ):
 
@@ -27,6 +77,16 @@ class IonoDataset(Dataset): # type: ignore
 
         # Transformations
         self.are_transform = transforms
+        self.normalization_type = normalization_type
+        
+        # Initialize normalizer based on type
+        if self.normalization_type == "mean_sigma_tanh":
+            self.normalizer = MeanSigmaTanhNormalizer()
+            # We'll fit the normalizer after loading all data
+            self._fit_normalizer()
+        else:
+            self.normalizer = None
+            
         # if self.are_transform:
         #     self.transforms = Compose([
         #                             Normalize(mean=[-1385.47], std=[7235.46]),  # z-score normalization
@@ -72,6 +132,38 @@ class IonoDataset(Dataset): # type: ignore
 
         return file_paths
 
+    def _fit_normalizer(self):
+        """Fit the normalizer by computing statistics on a sample of the data."""
+        if self.normalizer is None:
+            return
+            
+        # Load a sample of data to compute statistics
+        sample_data = []
+        max_samples = min(100, len(self.files_paths))  # Use max 100 files for fitting
+        
+        print(f"Fitting normalizer on {max_samples} samples...")
+        for i in range(0, len(self.files_paths), max(1, len(self.files_paths) // max_samples)):
+            if len(sample_data) >= max_samples:
+                break
+            try:
+                file_path = self.files_paths[i]
+                data = np.load(file_path, allow_pickle=True)
+                sample_data.append(data[0])
+            except Exception as e:
+                print(f"Warning: Could not load {file_path}: {e}")
+                continue
+        
+        if sample_data:
+            # Stack all sample data
+            all_data = np.stack(sample_data, axis=0)
+            
+            # Fit the normalizer
+            self.normalizer.fit(all_data)
+            stats = self.normalizer.get_stats()
+            print(f"Normalizer fitted: mean={stats['mean']:.2f}, std={stats['std']:.2f}")
+        else:
+            print("Warning: No data could be loaded for fitting normalizer!")
+
     def __len__(self):
         return len(self.files_paths)
 
@@ -83,13 +175,28 @@ class IonoDataset(Dataset): # type: ignore
         data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
         # Apply transformations if any
         if self.are_transform:
-            data_tensor = data_tensor / 108154.0 # maximum max value among the whole dataset can be changed
+            if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+                # Use mean-sigma + tanh normalization
+                data_tensor = self.normalizer.forward(data_tensor)
+            else:
+                # Use original absolute max normalization
+                data_tensor = data_tensor / 108154.0 # maximum max value among the whole dataset can be changed
             # data_tensor = self.transforms(data_tensor) 
 
         condition_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
 
-
         return data_tensor, condition_tensor
+    
+    def reverse_normalization(self, normalized_tensor):
+        """Reverse the normalization applied to the data."""
+        if not self.are_transform:
+            return normalized_tensor
+            
+        if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+            return self.normalizer.reverse(normalized_tensor)
+        else:
+            # Reverse absolute max normalization
+            return normalized_tensor * 108154.0
 
 class RandomSamplerSeed(Sampler[int]):
     """Overwrite the RandomSampler to allow for a seed for each epoch.
@@ -147,6 +254,7 @@ def get_data_objects(
     split="train",
     path=None,
     transforms=True,
+    normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
     seed=42,
 ):
 
@@ -155,7 +263,8 @@ def get_data_objects(
         transforms=transforms,
         split=split,
         seed=seed,
-        train_val_test=train_val_test
+        train_val_test=train_val_test,
+        normalization_type=normalization_type
     )
     
     # sampler
@@ -200,17 +309,26 @@ class IonoSequenceDataset(Dataset):
         split="train",
         sequence_length=5,
         transforms=True,
+        normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
         seed=42
     ):
         self.csv_path = csv_path
         self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
         self.transforms = transforms
+        self.normalization_type = normalization_type
         self.seed = seed
         self.split = split
         self.train_perc = train_val_test[0]
         self.valid_perc = train_val_test[1]
         self.test_perc = train_val_test[2]
+        
+        # Initialize normalizer based on type
+        if self.normalization_type == "mean_sigma_tanh":
+            self.normalizer = MeanSigmaTanhNormalizer()
+            # We'll fit the normalizer after loading sequence info
+        else:
+            self.normalizer = None
 
         # Read CSV and extract filenames and timestamps
         df = pd.read_csv(self.csv_path)
@@ -265,6 +383,44 @@ class IonoSequenceDataset(Dataset):
             'test': test_seqs,
         }[self.split]
         self.sequences = split_seqs
+        
+        # Fit the normalizer if using mean_sigma_tanh
+        if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+            self._fit_normalizer_sequence()
+
+    def _fit_normalizer_sequence(self):
+        """Fit the normalizer by computing statistics on a sample of the sequence data."""
+        if self.normalizer is None:
+            return
+            
+        # Load a sample of data to compute statistics
+        sample_data = []
+        max_samples = min(10, len(self.sequences))  # Use max 10 sequences for fitting
+        
+        print(f"Fitting sequence normalizer on {max_samples} sequences...")
+        for seq_idx in range(0, len(self.sequences), max(1, len(self.sequences) // max_samples)):
+            if len(sample_data) >= max_samples * 5:  # 5 files per sequence max
+                break
+            try:
+                seq_files = self.sequences[seq_idx]
+                # Sample a few files from each sequence
+                for i, file_path in enumerate(seq_files[:5]):  # Take first 5 files
+                    data = np.load(file_path, allow_pickle=True)
+                    sample_data.append(data[0])
+            except Exception as e:
+                print(f"Warning: Could not load sequence {seq_idx}: {e}")
+                continue
+        
+        if sample_data:
+            # Stack all sample data
+            all_data = np.stack(sample_data, axis=0)
+            
+            # Fit the normalizer
+            self.normalizer.fit(all_data)
+            stats = self.normalizer.get_stats()
+            print(f"Sequence normalizer fitted: mean={stats['mean']:.2f}, std={stats['std']:.2f}")
+        else:
+            print("Warning: No sequence data could be loaded for fitting normalizer!")
 
     def __len__(self):
         return len(self.sequences)
@@ -309,7 +465,12 @@ class IonoSequenceDataset(Dataset):
             data = np.load(file_path, allow_pickle=True)
             data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
             if self.transforms:
-                data_tensor = data_tensor / 108154.0
+                if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+                    # Use mean-sigma + tanh normalization
+                    data_tensor = self.normalizer.forward(data_tensor)
+                else:
+                    # Use original absolute max normalization
+                    data_tensor = data_tensor / 108154.0
             # Normalize cond_tensor between -1 and 1
             cond_raw = np.array([data[1], data[2], data[3], -data[4]], dtype=np.float32)
             cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
@@ -320,6 +481,17 @@ class IonoSequenceDataset(Dataset):
         data_seq = torch.stack(data_tensors, dim=0)
         cond_seq = torch.stack(cond_tensors, dim=0)
         return data_seq, cond_seq #, time
+
+    def reverse_data_normalization(self, normalized_tensor):
+        """Reverse the normalization applied to the data."""
+        if not self.transforms:
+            return normalized_tensor
+            
+        if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+            return self.normalizer.reverse(normalized_tensor)
+        else:
+            # Reverse absolute max normalization
+            return normalized_tensor * 108154.0
 
 
 def get_sequence_data_objects(
@@ -334,6 +506,7 @@ def get_sequence_data_objects(
     csv_path=None,
     transform_cond_csv=None,
     transforms=True,
+    normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
     seed=42,
 ):
     dataset = IonoSequenceDataset(
@@ -343,7 +516,8 @@ def get_sequence_data_objects(
         split=split,
         seed=seed,
         train_val_test=train_val_test,
-        sequence_length=sequence_length
+        sequence_length=sequence_length,
+        normalization_type=normalization_type
     )
     if distributed:
         sampler = DistributedSampler(
