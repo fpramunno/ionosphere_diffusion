@@ -336,7 +336,7 @@ def main():
 
     def save():
         accelerator.wait_for_everyone()
-        filename = os.path.join(args.saving_path, dir_path_mdl, f"{args.name}_{step:08}.pth") 
+        filename = os.path.join(args.saving_path, dir_path_mdl, f"{args.name}_epoch_{epoch:04}.pth") 
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
         inner_model = unwrap(model.inner_model)

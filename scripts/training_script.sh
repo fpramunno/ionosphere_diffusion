@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=performance
-#SBATCH --job-name="training_iono_forecasting_oneframe"
+#SBATCH --job-name="training_iono_forecasting_15frame"
 #SBATCH --error=./logs/err/err_training_iono_forecasting_15frame.log
 #SBATCH --out=./logs/out/out_training_iono_forecasting_15frame.log
 #SBATCH --cpus-per-task=4
