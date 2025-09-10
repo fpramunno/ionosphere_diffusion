@@ -4,23 +4,23 @@
 #SBATCH --nodes=1
 #SBATCH --time=7-00:00:00
 #SBATCH --partition=performance
-#SBATCH --job-name="training_iono_forecasting_15frame_tanh"
-#SBATCH --error=./logs/err/err_training_iono_forecasting_15frame_tanh.log
-#SBATCH --out=./logs/out/out_training_iono_forecasting_15frame_tanh.log
+#SBATCH --job-name="training_iono_forecasting_15frame_absolute_max_xlarge"
+#SBATCH --error=./logs/err/err_training_iono_forecasting_15frame_absolute_max_xlarge.log
+#SBATCH --out=./logs/out/out_training_iono_forecasting_15frame_absolute_max_xlarge.log
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 
 # Default values - you can modify these or pass them as command line arguments
-SEQUENCE_LENGTH=30
-PREDICT_STEPS=15
-CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_15.json"
+SEQUENCE_LENGTH=20
+PREDICT_STEPS=5
+CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_5_xlarge.json"
 CSV_PATH="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv"
 TRANSFORM_COND_CSV="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv"
-BATCH_SIZE=64
-DIR_NAME="cond_forecasting_cfg_15predictedstep_v1_tanh"
+BATCH_SIZE=4
+DIR_NAME="cond_forecasting_cfg_15predictedstep_v1_absolute_max_xlarge"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-WANDB_RUN_NAME="iono_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_tanh"
-NORM_TYPE="mean_sigma_tanh"  # "absolute_max" or "mean_sigma_tanh"
+WANDB_RUN_NAME="iono_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_big"
+NORM_TYPE="absolute_max"  # "absolute_max" or "mean_sigma_tanh"
 
 python3 training_pred.py \
     --config $CONFIG_PATH \

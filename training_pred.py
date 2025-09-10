@@ -195,12 +195,54 @@ def main():
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in inner_model.parameters())
         trainable_params = sum(p.numel() for p in inner_model.parameters() if p.requires_grad)
-        print(f'=== MODEL SUMMARY ===')
+        
+        print(f'{"="*80}')
+        print(f'🤖 MODEL ARCHITECTURE SUMMARY')
+        print(f'{"="*80}')
+        
+        # Layer-by-layer breakdown
+        print(f'📋 LAYER-BY-LAYER BREAKDOWN:')
+        print(f'{"Layer Name":<40} {"Shape":<20} {"Parameters":<15} {"Trainable":<10}')
+        print(f'{"-"*80}')
+        
+        layer_count = 0
+        for name, param in inner_model.named_parameters():
+            layer_count += 1
+            shape_str = "x".join(map(str, param.shape))
+            param_count = param.numel()
+            trainable = "Yes" if param.requires_grad else "No"
+            
+            # Truncate long layer names
+            display_name = name if len(name) <= 39 else name[:36] + "..."
+            
+            print(f'{display_name:<40} {shape_str:<20} {param_count:<15,} {trainable:<10}')
+        
+        print(f'{"-"*80}')
+        
+        # Summary by module type
+        print(f'\n📊 SUMMARY BY MODULE TYPE:')
+        module_stats = {}
+        for name, module in inner_model.named_modules():
+            if len(list(module.parameters(recurse=False))) > 0:  # Only modules with direct parameters
+                module_type = type(module).__name__
+                if module_type not in module_stats:
+                    module_stats[module_type] = {'count': 0, 'params': 0}
+                module_stats[module_type]['count'] += 1
+                module_stats[module_type]['params'] += sum(p.numel() for p in module.parameters(recurse=False))
+        
+        print(f'{"Module Type":<25} {"Count":<8} {"Parameters":<15} {"% of Total":<12}')
+        print(f'{"-"*65}')
+        for module_type, stats in sorted(module_stats.items(), key=lambda x: x[1]['params'], reverse=True):
+            percentage = 100.0 * stats['params'] / total_params
+            print(f'{module_type:<25} {stats["count"]:<8} {stats["params"]:<15,} {percentage:<12.1f}%')
+        
+        print(f'\n💾 OVERALL SUMMARY:')
+        print(f'Total layers with parameters: {layer_count}')
         print(f'Total parameters: {total_params:,}')
         print(f'Trainable parameters: {trainable_params:,}')
         print(f'Non-trainable parameters: {total_params - trainable_params:,}')
         print(f'Model size (MB): {total_params * 4 / (1024**2):.2f}')
-        print(f'=====================')
+        print(f'{"="*80}')
 
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
