@@ -4,16 +4,16 @@
 #SBATCH --nodes=1
 #SBATCH --time=1-00:00:00
 #SBATCH --partition=performance
-#SBATCH --job-name="generation_multi_window_15frame"
-#SBATCH --error=./logs/err/err_generation_multi_window_15frame.log
-#SBATCH --out=./logs/out/out_generation_multi_window_15frame.log
+#SBATCH --job-name="generation_multi_window_1frame"
+#SBATCH --error=./logs/err/err_generation_multi_window_1frame.log
+#SBATCH --out=./logs/out/out_generation_multi_window_1frame.log
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 
 # Default values - you can modify these or pass them as command line arguments
-MODEL_CKPT="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/models_results/models_cond_forecasting_cfg_15predictedstep_v1/model_epoch_0255.pth"
-CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_15.json"
-OUTPUT_DIR="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/generated_data/generation_results_15frame"
+MODEL_CKPT="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/models_results/models_cond_forecasting_cfg_1predictedstep_v1/model_epoch_0499.pth"
+CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono.json"
+OUTPUT_DIR="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/generated_data/generation_results_1frame"
 CSV_PATH="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv"
 TRANSFORM_COND_CSV="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv"
 NUM_GENERATIONS=5
