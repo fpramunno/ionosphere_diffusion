@@ -299,7 +299,8 @@ def main():
         split='train',
         seed=42,
         sequence_length=args.sequence_length,
-        normalization_type=args.normalization_type
+        normalization_type=args.normalization_type,
+        use_l1_conditions=True,
     )
 
     val_dataset, val_sampler, val_dl = get_sequence_data_objects(
@@ -311,7 +312,8 @@ def main():
         split='valid',
         seed=42,
         sequence_length=args.sequence_length,
-        normalization_type=args.normalization_type
+        normalization_type=args.normalization_type,
+        use_l1_conditions=True,
     )
 
     print(f'Train loader and Valid loader are up!')
@@ -441,7 +443,7 @@ def main():
                     target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
                     cond_label = batch[1].to(device, non_blocking=True)
 
-                    cond_label_inp = cond_label[:, :args.conditioning_length, :]  # :16
+                    cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
 
                     extra_args = {}
                     noise = torch.randn_like(target_img).to(device)
@@ -523,7 +525,7 @@ def main():
                     target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
                     cond_label = batch[1].to(device, non_blocking=True)
 
-                    cond_label_inp = cond_label[:, :args.conditioning_length, :]  # :16
+                    cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
 
 
                     extra_args = {}
@@ -555,7 +557,7 @@ def main():
             if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
                 
                 # Test sampling 
-                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length, :].reshape(1, args.conditioning_length, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, 24, 360), num_pred_frames=args.predict_steps).cpu()
+                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, 24, 360), num_pred_frames=args.predict_steps).cpu()
                 
                 import matplotlib.pyplot as plt
                 import imageio
@@ -573,8 +575,8 @@ def main():
                 target_sample_first = target_sample[0]  # shape: [24, 360] - first target frame
                 
                 # Revert transformation to original scale for better visualization
-                generated_sample_orig = generated_sample_np * 108154.0
-                target_sample_orig = target_sample_first * 108154.0
+                generated_sample_orig = generated_sample_np * 55000.0
+                target_sample_orig = target_sample_first * 55000.0
 
                 # Create visualizations based on prediction steps
                 if args.predict_steps == 1:
@@ -595,8 +597,8 @@ def main():
                     )
                 else:
                     # Multi-step prediction - show sequence evolution
-                    generated_all_orig = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
-                    target_all_orig = target_sample * 108154.0  # [predict_steps, 24, 360]
+                    generated_all_orig = generated_sample.cpu().numpy() * 55000.0  # [predict_steps, 24, 360]
+                    target_all_orig = target_sample * 55000.0  # [predict_steps, 24, 360]
                     
                     # Create batch visualization of all predicted steps
                     titles_gen = [f"Generated Step {i+1}/{args.predict_steps}" for i in range(args.predict_steps)]
@@ -644,7 +646,7 @@ def main():
 
                 # Create frames for target sequence
                 for t in range(full_sequence.shape[0]):
-                    img = full_sequence[t].cpu().numpy() * 108154.0  # Original scale
+                    img = full_sequence[t].cpu().numpy() * 55000.0  # Original scale
                     fig, ax = plt.subplots(figsize=figsize)
                     im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
                     
@@ -680,7 +682,7 @@ def main():
 
                 # Create frames for generated sequence
                 for t in range(generated_full_sequence.shape[0]):
-                    img = generated_full_sequence[t].cpu().numpy() * 108154.0  # Original scale
+                    img = generated_full_sequence[t].cpu().numpy() * 55000.0  # Original scale
                     fig, ax = plt.subplots(figsize=figsize)
                     im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
                     
@@ -711,7 +713,7 @@ def main():
                     
                     # Calculate metrics for all prediction steps
                     generated_all_orig = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
-                    target_all_orig = target_sample * 108154.0  # [predict_steps, 24, 360]
+                    target_all_orig = target_sample * 55000.0  # [predict_steps, 24, 360]
                     
                     # Overall metrics across all prediction steps
                     mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
@@ -753,14 +755,14 @@ def main():
             if use_wandb:
                 # Calculate max-min difference after reverting transformation
                 # Use current batch target_img for consistent max-min calculation
-                target_img_reverted = target_img * 108154.0  # [batch_size, predict_steps, 24, 360]
+                target_img_reverted = target_img * 55000.0  # [batch_size, predict_steps, 24, 360]
                 
                 if args.predict_steps == 1:
                     # Single frame prediction - use the single frame
                     target_reverted_flat = target_img_reverted.flatten()
                     max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted = generated_sample[0].cpu().numpy() * 108154.0  # [24, 360]
+                    pred_reverted = generated_sample[0].cpu().numpy() * 55000.0  # [24, 360]
                     pred_reverted_flat = pred_reverted.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
                 else:
@@ -770,7 +772,7 @@ def main():
                     target_reverted_flat = target_reverted_seq.flatten()
                     max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted_seq = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
+                    pred_reverted_seq = generated_sample.cpu().numpy() * 55000.0  # [predict_steps, 24, 360]
                     pred_reverted_seq = pred_reverted_seq.reshape(-1, 24, 360)  # [predict_steps, 24, 360]
                     pred_reverted_flat = pred_reverted_seq.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
