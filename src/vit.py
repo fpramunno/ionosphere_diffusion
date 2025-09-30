@@ -426,6 +426,7 @@ class ViT(nn.Module):
         self.out_channels = out_channels
 
         self.cond_channels = cond_channels
+        self.channel_mapping_cond = channel_mapping_cond
         self.t_out = t_out
         self.has_variance = out_channels > in_channels
 
@@ -465,7 +466,7 @@ class ViT(nn.Module):
             nn.Linear(mod_features, mod_features),
         )
         self.mapping_cond = nn.Sequential(
-            nn.Linear(channel_mapping_cond * 4, mod_features),  # Flatten spatial dimensions and project to mod_features BEFORE 16 NOW 30
+            nn.Linear(self.channel_mapping_cond * 4, mod_features),  # Flatten spatial dimensions and project to mod_features BEFORE 16 NOW 30
             nn.SiLU(),
             nn.Linear(mod_features, mod_features),
             nn.SiLU(),

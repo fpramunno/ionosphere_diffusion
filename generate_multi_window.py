@@ -93,7 +93,7 @@ def load_model(config_path, model_ckpt_path, device):
     return model_ema, prediction_window, config
 
 
-def setup_dataset(args):
+def setup_dataset(args, prediction_window):
     """Setup the dataset and dataloader."""
     print(f"Setting up dataset...")
     print(f"  CSV path: {args.csv_path}")
@@ -102,7 +102,7 @@ def setup_dataset(args):
     print(f"  Conditioning frames: {args.conditioning_frames}")
     
     # Calculate total sequence length (conditioning + prediction frames)
-    total_sequence_length = args.conditioning_frames + 15 
+    total_sequence_length = args.conditioning_frames + prediction_window #15 
     
     dataset, sampler, dataloader = get_sequence_data_objects(
         csv_path=args.csv_path,
@@ -225,7 +225,7 @@ def main():
     print(f"Model prediction window: {prediction_window}")
     
     # Setup dataset
-    dataset, dataloader = setup_dataset(args)
+    dataset, dataloader = setup_dataset(args, prediction_window)
     
     print(f"Dataset size: {len(dataset)}")
     print(f"Starting generation...")
