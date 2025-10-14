@@ -1,9 +1,10 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import os
+import numpy as np
 
 print("Script started!", flush=True)
 
@@ -43,6 +44,10 @@ print('Sorting solar wind data by time...', flush=True)
 solar_wind_df = solar_wind_df.sort_values('time').reset_index(drop=True)
 print('Creating time array...', flush=True)
 solar_wind_times = solar_wind_df['time'].values
+
+# Constants for L1-Earth propagation
+L1_EARTH_DISTANCE_KM = 1.5e6  # ~1.5 million km (typical L1 distance)
+print(f'L1-Earth distance: {L1_EARTH_DISTANCE_KM/1e6:.2f} million km', flush=True)
 print('Data preparation completed', flush=True)
 
 def extract_datetime_from_filename(filename):
@@ -53,52 +58,106 @@ def extract_datetime_from_filename(filename):
         return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
     return None
 
+def calculate_earth_arrival_time(l1_time, velocity_km_s):
+    """
+    Calculate when L1 solar wind data arrives at Earth.
+
+    Args:
+        l1_time: L1 measurement time
+        velocity_km_s: Solar wind velocity in km/s (will be made positive)
+
+    Returns:
+        Earth arrival time
+    """
+    # Use absolute value of velocity (it's negative in GSM coordinates)
+    velocity = abs(velocity_km_s)
+
+    # Skip invalid velocities
+    if velocity <= 0 or velocity == 99999 or np.isnan(velocity):
+        return None
+
+    # Calculate travel time from L1 to Earth
+    travel_time_seconds = L1_EARTH_DISTANCE_KM / velocity
+
+    return l1_time + timedelta(seconds=travel_time_seconds)
+
 def process_row(row_data):
-    """Process a single row to find matching solar wind data"""
+    """
+    Process a single map file to find matching L1 solar wind data.
+
+    Strategy:
+    1. Get map time (Earth observation time)
+    2. For each L1 measurement, calculate when it arrives at Earth
+    3. Find L1 measurement whose Earth arrival time is closest to map time
+    """
     idx, row = row_data
     filename = row['filename']
     file_datetime = extract_datetime_from_filename(filename)
-    
+
     if file_datetime is None:
         return None
-    
-    # Convert to pandas timestamp for comparison
-    target_time = pd.Timestamp(file_datetime)
-    
-    # Find closest time using searchsorted for O(log n) complexity
-    # Convert target_time to numpy datetime64 to match solar_wind_times array type
-    target_time_np = target_time.to_numpy()
-    insert_idx = solar_wind_times.searchsorted(target_time_np)
-    
-    # Check nearby indices to find the closest match
-    candidates = []
-    for i in [insert_idx - 1, insert_idx]:
-        if 0 <= i < len(solar_wind_times):
-            # Convert both to pandas timestamps for comparison
-            solar_time = pd.Timestamp(solar_wind_times[i])
-            time_diff = abs(solar_time - target_time)
-            candidates.append((i, time_diff))
-    
-    if not candidates:
-        return None
-    
-    # Find the closest match within 5 minutes
-    closest_idx, min_diff = min(candidates, key=lambda x: x[1])
-    if min_diff.total_seconds() / 60 <= 5:  # Within 5 minutes
-        solar_wind_data = solar_wind_df.iloc[closest_idx]
+
+    # This is the map time at Earth (ionosphere observation)
+    map_time = pd.Timestamp(file_datetime)
+
+    # Search window: L1 data from ~30 min to ~2 hours before map time
+    # (typical propagation time is 1 hour, but can vary based on velocity)
+    search_start = map_time - timedelta(hours=2)
+    search_end = map_time - timedelta(minutes=30)
+
+    # Find indices in this time range
+    search_start_np = search_start.to_numpy()
+    search_end_np = search_end.to_numpy()
+
+    start_idx = solar_wind_times.searchsorted(search_start_np)
+    end_idx = solar_wind_times.searchsorted(search_end_np)
+
+    # Find best match by calculating Earth arrival time for each L1 measurement
+    best_match_idx = None
+    best_time_diff = None
+
+    for i in range(start_idx, min(end_idx + 1, len(solar_wind_df))):
+        l1_data = solar_wind_df.iloc[i]
+        l1_time = pd.Timestamp(solar_wind_times[i])
+        velocity = l1_data['proton_vx_gsm']
+
+        # Calculate when this L1 measurement arrives at Earth
+        earth_arrival_time = calculate_earth_arrival_time(l1_time, velocity)
+
+        if earth_arrival_time is None:
+            continue
+
+        # Calculate time difference from map time
+        time_diff_seconds = abs((earth_arrival_time - map_time).total_seconds())
+
+        # Keep track of best match
+        if best_match_idx is None or time_diff_seconds < best_time_diff:
+            best_match_idx = i
+            best_time_diff = time_diff_seconds
+
+    # Accept match if within 5 minutes
+    if best_match_idx is not None and best_time_diff <= 300:  # 5 minutes
+        l1_data = solar_wind_df.iloc[best_match_idx]
+        l1_time = pd.Timestamp(solar_wind_times[best_match_idx])
+        velocity = abs(l1_data['proton_vx_gsm'])
+        delay_minutes = (L1_EARTH_DISTANCE_KM / velocity) / 60
+
         return {
             'filename': filename,
             'float1': row['float1'],
             'float2': row['float2'],
             'float3': row['float3'],
             'float4': row['float4'],
-            'proton_vx_gsm': solar_wind_data['proton_vx_gsm'],
-            'bx_gsm': solar_wind_data['bx_gsm'],
-            'by_gsm': solar_wind_data['by_gsm'],
-            'bz_gsm': solar_wind_data['bz_gsm'],
-            'time': solar_wind_data['time']
+            'proton_vx_gsm': l1_data['proton_vx_gsm'],
+            'bx_gsm': l1_data['bx_gsm'],
+            'by_gsm': l1_data['by_gsm'],
+            'bz_gsm': l1_data['bz_gsm'],
+            'l1_time': l1_time,
+            'map_time': map_time,
+            'propagation_delay_minutes': delay_minutes,
+            'time_diff_seconds': best_time_diff
         }
-    
+
     return None
 
 print('Merging data...', flush=True)
@@ -134,12 +193,20 @@ for batch_start in range(0, total_rows, batch_size):
 merged_df = pd.DataFrame(merged_data)
 
 # Save the merged data
-output_path = "/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/merged_params_solar_wind.csv"
+output_path = "/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/merged_params_solar_wind_v2.csv"
 merged_df.to_csv(output_path, index=False)
 
 print(f"Merged DataFrame created with {len(merged_df)} rows")
 print(f"Original params data: {len(params_df)} rows")
 print(f"Successfully matched: {len(merged_df)} rows")
 print(f"Saved to: {output_path}")
+
+if len(merged_df) > 0:
+    print("\nPropagation delay statistics:")
+    print(f"  Mean delay: {merged_df['propagation_delay_minutes'].mean():.2f} minutes")
+    print(f"  Min delay: {merged_df['propagation_delay_minutes'].min():.2f} minutes")
+    print(f"  Max delay: {merged_df['propagation_delay_minutes'].max():.2f} minutes")
+    print(f"  Mean matching error: {merged_df['time_diff_seconds'].mean():.2f} seconds")
+
 print("\nFirst few rows:")
 print(merged_df.head())

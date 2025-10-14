@@ -8,7 +8,7 @@ from pathlib import Path
 from torchvision.transforms import Compose, Normalize
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from typing import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections.abc import Sized
 
 class MeanSigmaTanhNormalizer:
@@ -305,6 +305,7 @@ class IonoSequenceDataset(Dataset):
         transforms=True,
         normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
         use_l1_conditions=False,  # New parameter to switch between modes
+        min_center_distance=15,  # Minimum distance between sequence centers (frames)
         seed=42
     ):
         self.csv_path = csv_path
@@ -313,6 +314,7 @@ class IonoSequenceDataset(Dataset):
         self.transforms = transforms
         self.normalization_type = normalization_type
         self.use_l1_conditions = use_l1_conditions
+        self.min_center_distance = min_center_distance
         self.seed = seed
         self.split = split
         self.train_perc = train_val_test[0]
@@ -356,39 +358,32 @@ class IonoSequenceDataset(Dataset):
         self.all_files = df['filename'].tolist()
         self.all_timestamps = df['timestamp'].tolist()
 
-        # Build only temporally consistent, non-overlapping sequences (2 min apart)
-        self.sequences = []
+        # Build overlapping sequences with minimum center distance
+        # Fill missing frames with zeros instead of rejecting sequences
+        self.sequences = []  # Store center indices
         n = len(self.all_files)
         i = 0
         while i + self.sequence_length <= n:
-            seq_files = self.all_files[i:i+self.sequence_length]
-            seq_times = self.all_timestamps[i:i+self.sequence_length]
-            is_consistent = True
-            for j in range(1, self.sequence_length):
-                delta = (seq_times[j] - seq_times[j-1]).total_seconds()
-                if delta != 120:  # 2 minutes = 120 seconds
-                    is_consistent = False
-                    break
-            if is_consistent:
-                self.sequences.append(seq_files)
-                i += self.sequence_length  # non-overlapping
+            center_idx = i + self.sequence_length // 2
+
+            # Check if we have minimum distance from last sequence's center
+            if not self.sequences or (center_idx - self.sequences[-1] >= self.min_center_distance):
+                self.sequences.append(center_idx)
+                i += self.min_center_distance  # Move by minimum distance
             else:
-                i += 1  # try next window
+                i += 1  # Try next window
 
-        # Helper to get month from first file in each sequence
-        def get_month(seq):
-            idx = self.all_files.index(seq[0])
-            return self.all_timestamps[idx].month
-
+        # Split sequences by month (based on center timestamp)
         train_seqs, val_seqs, test_seqs = [], [], []
-        for seq in self.sequences:
-            month = get_month(seq)
+        for center_idx in self.sequences:
+            month = self.all_timestamps[center_idx].month
             if 1 <= month <= 8:
-                train_seqs.append(seq)
+                train_seqs.append(center_idx)
             elif 9 <= month <= 10:
-                val_seqs.append(seq)
+                val_seqs.append(center_idx)
             elif 11 <= month <= 12:
-                test_seqs.append(seq)
+                test_seqs.append(center_idx)
+
         split_seqs = {
             'train': train_seqs,
             'valid': val_seqs,
@@ -404,29 +399,34 @@ class IonoSequenceDataset(Dataset):
         """Fit the normalizer by computing statistics on a sample of the sequence data."""
         if self.normalizer is None:
             return
-            
+
         # Load a sample of data to compute statistics
         sample_data = []
         max_samples = min(10, len(self.sequences))  # Use max 10 sequences for fitting
-        
+
         print(f"Fitting sequence normalizer on {max_samples} sequences...")
         for seq_idx in range(0, len(self.sequences), max(1, len(self.sequences) // max_samples)):
             if len(sample_data) >= max_samples * 5:  # 5 files per sequence max
                 break
             try:
-                seq_files = self.sequences[seq_idx]
+                center_idx = self.sequences[seq_idx]
+                start_idx = center_idx - self.sequence_length // 2
+
                 # Sample a few files from each sequence
-                for i, file_path in enumerate(seq_files[:5]):  # Take first 5 files
-                    data = np.load(file_path, allow_pickle=True)
-                    sample_data.append(data[0])
+                for i in range(min(5, self.sequence_length)):  # Take first 5 files
+                    file_idx = start_idx + i
+                    if 0 <= file_idx < len(self.all_files):
+                        file_path = self.all_files[file_idx]
+                        data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True)
+                        sample_data.append(data[0])
             except Exception as e:
                 print(f"Warning: Could not load sequence {seq_idx}: {e}")
                 continue
-        
+
         if sample_data:
             # Stack all sample data
             all_data = np.stack(sample_data, axis=0)
-            
+
             # Fit the normalizer
             self.normalizer.fit(all_data)
             stats = self.normalizer.get_stats()
@@ -469,70 +469,87 @@ class IonoSequenceDataset(Dataset):
         return cond_original
 
     def __getitem__(self, idx):
-        seq_files = self.sequences[idx]
+        """
+        Get a sequence by building it from the center index.
+        Missing frames (due to temporal gaps) are filled with zeros.
+        """
+        center_idx = self.sequences[idx]
+        start_idx = center_idx - self.sequence_length // 2
+        end_idx = start_idx + self.sequence_length
+
         data_tensors = []
         cond_tensors = []
-        time = []
-        
+
         # Get the CSV dataframe for condition lookup if using L1 conditions
         if self.use_l1_conditions:
             df = pd.read_csv(self.csv_path)
-        
-        for file_path in seq_files:
-            # Load only the map data (first element) from npy file
-            data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/'+file_path, allow_pickle=True)
-            data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
-            
-            if self.transforms:
-                if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
-                    # Use mean-sigma + tanh normalization
-                    data_tensor = self.normalizer.forward(data_tensor)
+
+        # Calculate expected timestamps for the sequence (2-min cadence)
+        center_time = self.all_timestamps[center_idx]
+        expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
+
+        for frame_offset in range(self.sequence_length):
+            file_idx = start_idx + frame_offset
+            expected_time = expected_start_time + timedelta(minutes=2 * frame_offset)
+
+            # Check if this frame exists and matches the expected timestamp
+            frame_exists = False
+            if 0 <= file_idx < len(self.all_files):
+                actual_time = self.all_timestamps[file_idx]
+                # Allow small tolerance (1 second) for timestamp matching
+                if abs((actual_time - expected_time).total_seconds()) <= 1:
+                    frame_exists = True
+
+            if frame_exists:
+                # Load the actual frame
+                file_path = self.all_files[file_idx]
+                data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True)
+                data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
+
+                if self.transforms:
+                    if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+                        data_tensor = self.normalizer.forward(data_tensor)
+                    else:
+                        data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
+
+                if self.use_l1_conditions:
+                    filename = os.path.basename(file_path)
+                    file_row = df[df['filename'] == filename]
+
+                    if len(file_row) == 0:
+                        raise ValueError(f"Filename {filename} not found in CSV")
+
+                    cond_raw = np.array([
+                        file_row['bx_gsm'].iloc[0],
+                        file_row['by_gsm'].iloc[0],
+                        file_row['bz_gsm'].iloc[0],
+                        file_row['proton_vx_gsm'].iloc[0],
+                    ], dtype=np.float32)
                 else:
-                    # Use original absolute max normalization
-                    data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
-            
-            if self.use_l1_conditions:
-                # Get L1 conditions from CSV based on filename
-                filename = os.path.basename(file_path)
-                file_row = df[df['filename'] == filename]
-                
-                if len(file_row) == 0:
-                    raise ValueError(f"Filename {filename} not found in CSV")
-                
-                # Use L1 conditions from merged CSV
-                cond_raw = np.array([
-                    file_row['bx_gsm'].iloc[0], 
-                    file_row['by_gsm'].iloc[0],
-                    file_row['bz_gsm'].iloc[0],
-                    file_row['proton_vx_gsm'].iloc[0],
-                ], dtype=np.float32)
-                
+                    cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
+
+                # Negate velocity
+                cond_raw[3] = -cond_raw[3]
+
+                # Normalize conditions
+                cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
+
+                # Handle missing values
+                missing_mask = (cond_raw == -99999)
+                cond_norm[missing_mask] = 0.0
+
+                cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
             else:
-                # Use original projected bow shock conditions from npy file
-                cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
-            
-            # Negate velocity (proton_vx_gsm is at index 3 for L1, index 3 for original)
-            if self.use_l1_conditions:
-                cond_raw[3] = -cond_raw[3]  # proton_vx_gsm at index 3
-            else:
-                cond_raw[3] = -cond_raw[3]  # float4 at index 3
-            
-            # Normalize first, then handle missing values
-            cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
-            
-            # Replace missing values AFTER normalization with a special "no info" value
-            missing_mask = (cond_raw == -99999)
-            cond_norm[missing_mask] = 0.0  # 0 in normalized space means "neutral/no information"
-            
-            cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
-            
+                # Frame is missing - fill with zeros
+                data_tensor = torch.zeros(1, 24, 360, dtype=torch.float32)
+                cond_tensor = torch.zeros(4, dtype=torch.float32)
+
             data_tensors.append(data_tensor)
             cond_tensors.append(cond_tensor)
-            time.append(extract_timestamp(file_path))
-            
+
         data_seq = torch.stack(data_tensors, dim=0)
         cond_seq = torch.stack(cond_tensors, dim=0)
-        return data_seq, cond_seq #, time
+        return data_seq, cond_seq
 
     def reverse_data_normalization(self, normalized_tensor):
         """Reverse the normalization applied to the data."""
@@ -560,6 +577,7 @@ def get_sequence_data_objects(
     transforms=True,
     normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
     use_l1_conditions=False,  # New parameter
+    min_center_distance=15,  # Minimum distance between sequence centers
     seed=42,
 ):
     dataset = IonoSequenceDataset(
@@ -571,7 +589,8 @@ def get_sequence_data_objects(
         train_val_test=train_val_test,
         sequence_length=sequence_length,
         normalization_type=normalization_type,
-        use_l1_conditions=use_l1_conditions
+        use_l1_conditions=use_l1_conditions,
+        min_center_distance=min_center_distance
     )
     if distributed:
         sampler = DistributedSampler(
