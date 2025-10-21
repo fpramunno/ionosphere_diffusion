@@ -240,7 +240,8 @@ def make_model(config):
             qk_norm=config['qk_norm'],
             rope=config['rope'],
             patch_size=config['patch_size'],
-            window_size=config['window_size'],)
+            window_size=config['window_size'],
+            channel_mapping_cond=config['channel_mapping_cond'],)
     else:
         raise ValueError(f'unsupported model type {config["type"]}')
     return model

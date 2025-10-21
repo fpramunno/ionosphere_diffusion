@@ -30,6 +30,7 @@ def main():
     import torch._dynamo
     from torch import optim
     from tqdm.auto import tqdm
+    from IPython import embed 
 
     import src as K
 
@@ -96,6 +97,11 @@ def main():
                 help='path to the main CSV file with metrics')
     p.add_argument('--transform-cond-csv', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
                 help='path to the transform condition CSV file')
+    p.add_argument('--normalization-type', type=str, default="absolute_max",
+                choices=["absolute_max", "mean_sigma_tanh"],
+                help='type of normalization to use: absolute_max (original) or mean_sigma_tanh (new)')
+    p.add_argument('--min-center-distance', type=int, default=5,
+                help='minimum distance between sequence centers (in frames) to avoid overlap')
 
     p.add_argument('--wandb-entity', type=str,
                 help='the wandb entity name')
@@ -110,8 +116,25 @@ def main():
     p.add_argument('--use-wandb', action='store_true', help='Enable wandb logging')
     p.add_argument('--no-wandb', dest='use_wandb', action='store_false', help='Disable wandb logging')
     p.set_defaults(use_wandb=True)  # or False, depending on your preference
+    p.add_argument('--debug', action='store_true',
+                help='enable debug mode: disables wandb, sets batch_size=4, num_workers=2, evaluate_every=1')
 
     args = p.parse_args()
+
+    # Apply debug mode settings
+    if args.debug:
+        print("🐛 DEBUG MODE ENABLED")
+        print("  - Disabling wandb")
+        print("  - Setting batch_size=4")
+        print("  - Setting num_workers=2")
+        print("  - Setting evaluate_every=1")
+        print("  - Setting max_epochs=5 (if not already set)")
+        args.use_wandb = False
+        args.batch_size = 4
+        args.num_workers = 2
+        args.evaluate_every = 1
+        if args.max_epochs is None:
+            args.max_epochs = 5
 
     # Calculate conditioning length from total sequence length and prediction steps
     args.conditioning_length = args.sequence_length - args.predict_steps
@@ -192,12 +215,88 @@ def main():
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in inner_model.parameters())
         trainable_params = sum(p.numel() for p in inner_model.parameters() if p.requires_grad)
-        print(f'=== MODEL SUMMARY ===')
+        
+        print(f'{"="*80}')
+        print(f'🤖 MODEL ARCHITECTURE SUMMARY')
+        print(f'{"="*80}')
+        
+        # Layer-by-layer breakdown
+        print(f'📋 LAYER-BY-LAYER BREAKDOWN:')
+        print(f'{"Layer Name":<40} {"Shape":<20} {"Parameters":<15} {"Trainable":<10}')
+        print(f'{"-"*80}')
+        
+        layer_count = 0
+        for name, param in inner_model.named_parameters():
+            layer_count += 1
+            shape_str = "x".join(map(str, param.shape))
+            param_count = param.numel()
+            trainable = "Yes" if param.requires_grad else "No"
+            
+            # Truncate long layer names
+            display_name = name if len(name) <= 39 else name[:36] + "..."
+            
+            print(f'{display_name:<40} {shape_str:<20} {param_count:<15,} {trainable:<10}')
+        
+        print(f'{"-"*80}')
+        
+        # Summary by module type
+        print(f'\n📊 SUMMARY BY MODULE TYPE:')
+        module_stats = {}
+        for name, module in inner_model.named_modules():
+            if len(list(module.parameters(recurse=False))) > 0:  # Only modules with direct parameters
+                module_type = type(module).__name__
+                if module_type not in module_stats:
+                    module_stats[module_type] = {'count': 0, 'params': 0}
+                module_stats[module_type]['count'] += 1
+                module_stats[module_type]['params'] += sum(p.numel() for p in module.parameters(recurse=False))
+        
+        print(f'{"Module Type":<25} {"Count":<8} {"Parameters":<15} {"% of Total":<12}')
+        print(f'{"-"*65}')
+        for module_type, stats in sorted(module_stats.items(), key=lambda x: x[1]['params'], reverse=True):
+            percentage = 100.0 * stats['params'] / total_params
+            print(f'{module_type:<25} {stats["count"]:<8} {stats["params"]:<15,} {percentage:<12.1f}%')
+        
+        print(f'\n💾 OVERALL SUMMARY:')
+        print(f'Total layers with parameters: {layer_count}')
         print(f'Total parameters: {total_params:,}')
         print(f'Trainable parameters: {trainable_params:,}')
         print(f'Non-trainable parameters: {total_params - trainable_params:,}')
         print(f'Model size (MB): {total_params * 4 / (1024**2):.2f}')
-        print(f'=====================')
+        print(f'{"="*80}')
+
+    
+    # Load the dataset
+
+    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
+        csv_path=args.csv_path,
+        transform_cond_csv=args.transform_cond_csv,
+        batch_size=args.batch_size,
+        distributed=False,
+        num_data_workers=args.num_workers,
+        split='train',
+        seed=42,
+        sequence_length=args.sequence_length,
+        normalization_type=args.normalization_type,
+        use_l1_conditions=True,
+        min_center_distance=args.min_center_distance,
+    )
+
+    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
+        csv_path=args.csv_path,
+        transform_cond_csv=args.transform_cond_csv,
+        batch_size=args.batch_size,
+        distributed=False,
+        num_data_workers=args.num_workers,
+        split='valid',
+        seed=42,
+        sequence_length=args.sequence_length,
+        normalization_type=args.normalization_type,
+        use_l1_conditions=True,
+        min_center_distance=args.min_center_distance,
+    )
+
+    print(f'Train loader and Valid loader are up! Lengths: {len(train_dl)}, {len(val_dl)}')
+    print(f'Using normalization method: {args.normalization_type}')
 
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
@@ -235,6 +334,55 @@ def main():
                                     warmup=sched_config['warmup'])
     elif sched_config['type'] == 'constant':
         sched = K.utils.ConstantLRWithWarmup(opt, warmup=sched_config['warmup'])
+    elif sched_config['type'] == 'cosine':
+        # Calculate total steps
+        if args.max_epochs is None:
+            raise ValueError("max_epochs must be specified when using cosine scheduler")
+
+        epoch_size = len(train_dl)  # steps per epoch
+        warmup_epochs = sched_config.get('warmup_epochs', 0)
+        warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
+        total_steps = (args.max_epochs * epoch_size) // args.grad_accum_steps
+        eta_min_factor = sched_config.get('eta_min_factor', 100)  # LR will decay to lr/100
+
+        if warmup_steps > 0:
+            # Cosine with linear warmup
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                opt,
+                start_factor=0.01,  # Start at 1% of base LR
+                end_factor=1.0,     # Reach 100% of base LR
+                total_iters=warmup_steps
+            )
+            decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                eta_min=lr / eta_min_factor,  # Min LR = lr/100
+                T_max=total_steps - warmup_steps
+            )
+            sched = torch.optim.lr_scheduler.SequentialLR(
+                opt,
+                schedulers=[warmup, decay],
+                milestones=[warmup_steps]
+            )
+
+            if accelerator.is_main_process:
+                print(f"📊 Cosine LR Schedule:")
+                print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs})")
+                print(f"   Total steps: {total_steps} (epochs: {args.max_epochs})")
+                print(f"   Base LR: {lr:.2e}")
+                print(f"   Min LR: {lr/eta_min_factor:.2e}")
+        else:
+            # Cosine without warmup
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                eta_min=lr / eta_min_factor,
+                T_max=total_steps
+            )
+
+            if accelerator.is_main_process:
+                print(f"📊 Cosine LR Schedule (no warmup):")
+                print(f"   Total steps: {total_steps}")
+                print(f"   Base LR: {lr:.2e}")
+                print(f"   Min LR: {lr/eta_min_factor:.2e}")
     else:
         raise ValueError('Invalid schedule type')
 
@@ -243,31 +391,6 @@ def main():
                                 max_value=ema_sched_config['max_value'])
     ema_stats = {}
 
-    # Load the dataset
-
-    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
-        csv_path=args.csv_path,
-        transform_cond_csv=args.transform_cond_csv,
-        batch_size=args.batch_size,
-        distributed=False,
-        num_data_workers=args.num_workers,
-        split='train',
-        seed=42,
-        sequence_length=args.sequence_length
-    )
-
-    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
-        csv_path=args.csv_path,
-        transform_cond_csv=args.transform_cond_csv,
-        batch_size=args.batch_size,
-        distributed=False,
-        num_data_workers=args.num_workers,
-        split='valid',
-        seed=42,
-        sequence_length=args.sequence_length
-    )
-
-    print('Train loader and Valid loader are up!')
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
@@ -387,13 +510,15 @@ def main():
                     reserved_before = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
                     # print(f"Memory before processing: Allocated: {mem_before:.2f} GB, Reserved: {reserved_before:.2f} GB")
 
+                    # embed()
+
                     inpt = batch[0].contiguous().float().to(device, non_blocking=True)
                     inpt = inpt.squeeze(2)  # shape: (batch_size, sequence_length, 24, 360)
                     cond_img = inpt[:, :args.conditioning_length, :, :]    # first conditioning_length time steps
                     target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
                     cond_label = batch[1].to(device, non_blocking=True)
 
-                    cond_label_inp = cond_label[:, :args.conditioning_length, :]  # :16
+                    cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
 
                     extra_args = {}
                     noise = torch.randn_like(target_img).to(device)
@@ -455,6 +580,18 @@ def main():
                         else:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
 
+                        # Log GPU memory to wandb every 25 steps
+                        if use_wandb and device.type == 'cuda':
+                            torch.cuda.synchronize()
+                            wandb.log({
+                                'gpu/memory_allocated_gb': torch.cuda.memory_allocated(device) / (1024 ** 3),
+                                'gpu/memory_reserved_gb': torch.cuda.memory_reserved(device) / (1024 ** 3),
+                                'gpu/max_memory_allocated_gb': torch.cuda.max_memory_allocated(device) / (1024 ** 3),
+                                'step': step,
+                                'train/loss_step': loss_disp,
+                                'train/avg_loss': avg_loss,
+                            })
+
                 step += 1
 
                 if step == args.end_step:
@@ -475,7 +612,7 @@ def main():
                     target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
                     cond_label = batch[1].to(device, non_blocking=True)
 
-                    cond_label_inp = cond_label[:, :args.conditioning_length, :]  # :16
+                    cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
 
 
                     extra_args = {}
@@ -507,7 +644,7 @@ def main():
             if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
                 
                 # Test sampling 
-                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length, :].reshape(1, args.conditioning_length, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, 24, 360), num_pred_frames=args.predict_steps).cpu()
+                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, 24, 360), num_pred_frames=args.predict_steps).cpu()
                 
                 import matplotlib.pyplot as plt
                 import imageio
@@ -525,8 +662,8 @@ def main():
                 target_sample_first = target_sample[0]  # shape: [24, 360] - first target frame
                 
                 # Revert transformation to original scale for better visualization
-                generated_sample_orig = generated_sample_np * 108154.0
-                target_sample_orig = target_sample_first * 108154.0
+                generated_sample_orig = generated_sample_np * 55000.0
+                target_sample_orig = target_sample_first * 55000.0
 
                 # Create visualizations based on prediction steps
                 if args.predict_steps == 1:
@@ -547,8 +684,8 @@ def main():
                     )
                 else:
                     # Multi-step prediction - show sequence evolution
-                    generated_all_orig = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
-                    target_all_orig = target_sample * 108154.0  # [predict_steps, 24, 360]
+                    generated_all_orig = generated_sample.cpu().numpy() * 55000.0  # [predict_steps, 24, 360]
+                    target_all_orig = target_sample * 55000.0  # [predict_steps, 24, 360]
                     
                     # Create batch visualization of all predicted steps
                     titles_gen = [f"Generated Step {i+1}/{args.predict_steps}" for i in range(args.predict_steps)]
@@ -596,7 +733,7 @@ def main():
 
                 # Create frames for target sequence
                 for t in range(full_sequence.shape[0]):
-                    img = full_sequence[t].cpu().numpy() * 108154.0  # Original scale
+                    img = full_sequence[t].cpu().numpy() * 55000.0  # Original scale
                     fig, ax = plt.subplots(figsize=figsize)
                     im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
                     
@@ -632,7 +769,7 @@ def main():
 
                 # Create frames for generated sequence
                 for t in range(generated_full_sequence.shape[0]):
-                    img = generated_full_sequence[t].cpu().numpy() * 108154.0  # Original scale
+                    img = generated_full_sequence[t].cpu().numpy() * 55000.0  # Original scale
                     fig, ax = plt.subplots(figsize=figsize)
                     im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
                     
@@ -663,7 +800,7 @@ def main():
                     
                     # Calculate metrics for all prediction steps
                     generated_all_orig = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
-                    target_all_orig = target_sample * 108154.0  # [predict_steps, 24, 360]
+                    target_all_orig = target_sample * 55000.0  # [predict_steps, 24, 360]
                     
                     # Overall metrics across all prediction steps
                     mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
@@ -705,14 +842,14 @@ def main():
             if use_wandb:
                 # Calculate max-min difference after reverting transformation
                 # Use current batch target_img for consistent max-min calculation
-                target_img_reverted = target_img * 108154.0  # [batch_size, predict_steps, 24, 360]
+                target_img_reverted = target_img * 55000.0  # [batch_size, predict_steps, 24, 360]
                 
                 if args.predict_steps == 1:
                     # Single frame prediction - use the single frame
                     target_reverted_flat = target_img_reverted.flatten()
                     max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted = generated_sample[0].cpu().numpy() * 108154.0  # [24, 360]
+                    pred_reverted = generated_sample[0].cpu().numpy() * 55000.0  # [24, 360]
                     pred_reverted_flat = pred_reverted.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
                 else:
@@ -722,10 +859,21 @@ def main():
                     target_reverted_flat = target_reverted_seq.flatten()
                     max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted_seq = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
+                    pred_reverted_seq = generated_sample.cpu().numpy() * 55000.0  # [predict_steps, 24, 360]
                     pred_reverted_seq = pred_reverted_seq.reshape(-1, 24, 360)  # [predict_steps, 24, 360]
                     pred_reverted_flat = pred_reverted_seq.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+
+                # Get GPU memory stats for epoch summary
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                    gpu_mem_allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                    gpu_mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                    gpu_mem_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                else:
+                    gpu_mem_allocated = 0.0
+                    gpu_mem_reserved = 0.0
+                    gpu_mem_peak = 0.0
 
                 log_dict = {
                     'epoch': epoch,
@@ -735,11 +883,18 @@ def main():
                     'ema_decay': ema_decay,
                     'max_min_difference_sequence': max_min_diff_gt,
                     'max_min_difference_sequence_pred': max_min_diff_pred,
+                    'gpu/epoch_memory_allocated_gb': gpu_mem_allocated,
+                    'gpu/epoch_memory_reserved_gb': gpu_mem_reserved,
+                    'gpu/epoch_peak_memory_gb': gpu_mem_peak,
                 }
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
-                
+
                 wandb.log(log_dict)
+
+                # Reset peak memory stats for next epoch
+                if device.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats(device)
                 # plt.close()
             # Save every 5 epochs or at the end
             if epoch % 5 == 0 or (args.max_epochs is not None and epoch >= args.max_epochs - 1):

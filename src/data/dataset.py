@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -7,8 +8,58 @@ from pathlib import Path
 from torchvision.transforms import Compose, Normalize
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from typing import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections.abc import Sized
+from IPython import embed 
+
+class MeanSigmaTanhNormalizer:
+    """
+    Normalizer that applies mean-sigma normalization followed by tanh.
+    
+    Forward: tanh((x - mean) / std)
+    Reverse: atanh(y) * std + mean
+    """
+    def __init__(self, mean=None, std=None):
+        self.mean = mean
+        self.std = std
+        
+    def fit(self, data):
+        """Fit the normalizer to the data by computing mean and std."""
+        if isinstance(data, torch.Tensor):
+            self.mean = data.mean().item()
+            self.std = data.std().item()
+        else:
+            self.mean = float(np.mean(data))
+            self.std = float(np.std(data))
+        
+        # Avoid division by zero
+        if self.std == 0:
+            self.std = 1.0
+            
+    def forward(self, x):
+        """Apply normalization: tanh((x - mean) / std)"""
+        if self.mean is None or self.std is None:
+            raise ValueError("Normalizer must be fitted first!")
+        
+        # Standardize then apply tanh
+        normalized = (x - self.mean) / self.std
+        return torch.tanh(normalized)
+    
+    def reverse(self, y):
+        """Reverse normalization: atanh(y) * std + mean"""
+        if self.mean is None or self.std is None:
+            raise ValueError("Normalizer must be fitted first!")
+        
+        # Clamp y to valid range for atanh to avoid numerical issues
+        y_clamped = torch.clamp(y, -0.999999, 0.999999)
+        
+        # Apply inverse tanh then denormalize
+        denormalized = torch.atanh(y_clamped) * self.std + self.mean
+        return denormalized
+    
+    def get_stats(self):
+        """Get the fitted mean and std statistics."""
+        return {"mean": self.mean, "std": self.std}
 
 class IonoDataset(Dataset): # type: ignore
     def __init__(
@@ -18,6 +69,7 @@ class IonoDataset(Dataset): # type: ignore
         train_val_test=[0.8, 0.10, 0.10],
         split="train",
         transforms=True,
+        normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
         seed=42
     ):
 
@@ -27,11 +79,15 @@ class IonoDataset(Dataset): # type: ignore
 
         # Transformations
         self.are_transform = transforms
-        # if self.are_transform:
-        #     self.transforms = Compose([
-        #                             Normalize(mean=[-1385.47], std=[7235.46]),  # z-score normalization
-        #                             # Normalize(mean=[0.5], std=[0.5])            # maps to [-1, 1]
-        #                         ])
+        self.normalization_type = normalization_type
+        
+        # Initialize normalizer based on type
+        if self.normalization_type == "mean_sigma_tanh":
+            self.normalizer = MeanSigmaTanhNormalizer()
+            # We'll fit the normalizer after loading all data
+            self._fit_normalizer()
+        else:
+            self.normalizer = None
 
         # Splitting the dataset
 
@@ -72,6 +128,38 @@ class IonoDataset(Dataset): # type: ignore
 
         return file_paths
 
+    def _fit_normalizer(self):
+        """Fit the normalizer by computing statistics on a sample of the data."""
+        if self.normalizer is None:
+            return
+            
+        # Load a sample of data to compute statistics
+        sample_data = []
+        max_samples = min(100, len(self.files_paths))  # Use max 100 files for fitting
+        
+        print(f"Fitting normalizer on {max_samples} samples...")
+        for i in range(0, len(self.files_paths), max(1, len(self.files_paths) // max_samples)):
+            if len(sample_data) >= max_samples:
+                break
+            try:
+                file_path = self.files_paths[i]
+                data = np.load(file_path, allow_pickle=True)
+                sample_data.append(data[0])
+            except Exception as e:
+                print(f"Warning: Could not load {file_path}: {e}")
+                continue
+        
+        if sample_data:
+            # Stack all sample data
+            all_data = np.stack(sample_data, axis=0)
+            
+            # Fit the normalizer
+            self.normalizer.fit(all_data)
+            stats = self.normalizer.get_stats()
+            print(f"Normalizer fitted: mean={stats['mean']:.2f}, std={stats['std']:.2f}")
+        else:
+            print("Warning: No data could be loaded for fitting normalizer!")
+
     def __len__(self):
         return len(self.files_paths)
 
@@ -83,13 +171,28 @@ class IonoDataset(Dataset): # type: ignore
         data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
         # Apply transformations if any
         if self.are_transform:
-            data_tensor = data_tensor / 108154.0 # maximum max value among the whole dataset can be changed
-            # data_tensor = self.transforms(data_tensor) 
+            if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+                # Use mean-sigma + tanh normalization
+                data_tensor = self.normalizer.forward(data_tensor)
+            else:
+                # Use original absolute max normalization
+                data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
+                data_tensor = 2* (data_tensor - 80000) / (80000 - (-80000)) -1  # normalize to [-1, 1]
 
         condition_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
 
-
         return data_tensor, condition_tensor
+    
+    def reverse_normalization(self, normalized_tensor):
+        """Reverse the normalization applied to the data."""
+        if not self.are_transform:
+            return normalized_tensor
+            
+        if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+            return self.normalizer.reverse(normalized_tensor)
+        else:
+            # Reverse absolute max normalization
+            return 2 * ((normalized_tensor - 80000) / (80000 - 80000)) - 1 #normalized_tensor * 55000.0
 
 class RandomSamplerSeed(Sampler[int]):
     """Overwrite the RandomSampler to allow for a seed for each epoch.
@@ -147,6 +250,7 @@ def get_data_objects(
     split="train",
     path=None,
     transforms=True,
+    normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
     seed=42,
 ):
 
@@ -155,7 +259,8 @@ def get_data_objects(
         transforms=transforms,
         split=split,
         seed=seed,
-        train_val_test=train_val_test
+        train_val_test=train_val_test,
+        normalization_type=normalization_type
     )
     
     # sampler
@@ -194,77 +299,142 @@ class IonoSequenceDataset(Dataset):
     def __init__(
         self,
         csv_path,
-        transform_cond_csv,
+        transform_cond_csv=None,
         resolution=(24, 360),
         train_val_test=[0.8, 0.10, 0.10],
         split="train",
         sequence_length=5,
         transforms=True,
+        normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
+        use_l1_conditions=False,  # New parameter to switch between modes
+        min_center_distance=15,  # Minimum distance between sequence centers (frames)
         seed=42
     ):
         self.csv_path = csv_path
         self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
         self.transforms = transforms
+        self.normalization_type = normalization_type
+        self.use_l1_conditions = use_l1_conditions
+        self.min_center_distance = min_center_distance
         self.seed = seed
         self.split = split
         self.train_perc = train_val_test[0]
         self.valid_perc = train_val_test[1]
         self.test_perc = train_val_test[2]
+        
+        # Initialize normalizer based on type
+        if self.normalization_type == "mean_sigma_tanh":
+            self.normalizer = MeanSigmaTanhNormalizer()
+            # We'll fit the normalizer after loading sequence info
+        else:
+            self.normalizer = None
 
         # Read CSV and extract filenames and timestamps
         df = pd.read_csv(self.csv_path)
 
-        df_cond = pd.read_csv(self.transform_cond_csv)
-        df_cond["float4"] = df_cond["float4"] * -1 # do this becauuse it is a velocity and it was stored in the opposite
-        # Store min and max for each float column for normalization
-        self.cond_min = df_cond[["float1", "float2", "float3", "float4"]].min().values.astype(np.float32)
-        self.cond_max = df_cond[["float1", "float2", "float3", "float4"]].max().values.astype(np.float32)
+        if self.use_l1_conditions:
+            # Using L1 conditions from merged CSV
+            if 'proton_vx_gsm' not in df.columns:
+                raise ValueError("CSV file must contain L1 columns when use_l1_conditions=True")
+            
+            # Store min and max for L1 columns for normalization (exclude missing values)
+            l1_cols = ['bx_gsm', 'by_gsm', 'bz_gsm', 'proton_vx_gsm']
+            df_clean = df[l1_cols].replace(-99999, np.nan)  # Replace missing values with NaN
+            self.cond_min = df_clean.min().values.astype(np.float32)  # min ignores NaN
+            self.cond_max = df_clean.max().values.astype(np.float32)  # max ignores NaN
+        else:
+            # Using original projected bow shock conditions from separate CSV
+            if self.transform_cond_csv is None:
+                raise ValueError("transform_cond_csv must be provided when use_l1_conditions=False")
+            
+            df_cond = pd.read_csv(self.transform_cond_csv)
+            df_cond["float4"] = df_cond["float4"] * -1 # do this becauuse it is a velocity and it was stored in the opposite
+            # Store min and max for each float column for normalization (exclude missing values)
+            df_cond_clean = df_cond[["float1", "float2", "float3", "float4"]].replace(-99999, np.nan)
+            self.cond_min = df_cond_clean.min().values.astype(np.float32)  # min ignores NaN
+            self.cond_max = df_cond_clean.max().values.astype(np.float32)  # max ignores NaN
         df['timestamp'] = df['filename'].apply(extract_timestamp)
         df = df.dropna(subset=['timestamp'])
         df = df.sort_values('timestamp').reset_index(drop=True)
         self.all_files = df['filename'].tolist()
         self.all_timestamps = df['timestamp'].tolist()
 
-        # Build only temporally consistent, non-overlapping sequences (2 min apart)
-        self.sequences = []
+        # Build overlapping sequences with minimum center distance
+        # Fill missing frames with zeros instead of rejecting sequences
+        self.sequences = []  # Store center indices
         n = len(self.all_files)
         i = 0
         while i + self.sequence_length <= n:
-            seq_files = self.all_files[i:i+self.sequence_length]
-            seq_times = self.all_timestamps[i:i+self.sequence_length]
-            is_consistent = True
-            for j in range(1, self.sequence_length):
-                delta = (seq_times[j] - seq_times[j-1]).total_seconds()
-                if delta != 120:  # 2 minutes = 120 seconds
-                    is_consistent = False
-                    break
-            if is_consistent:
-                self.sequences.append(seq_files)
-                i += self.sequence_length  # non-overlapping
+            center_idx = i + self.sequence_length // 2
+
+            # Check if we have minimum distance from last sequence's center
+            if not self.sequences or (center_idx - self.sequences[-1] >= self.min_center_distance):
+                self.sequences.append(center_idx)
+                i += self.min_center_distance  # Move by minimum distance
             else:
-                i += 1  # try next window
+                i += 1  # Try next window
 
-        # Helper to get month from first file in each sequence
-        def get_month(seq):
-            idx = self.all_files.index(seq[0])
-            return self.all_timestamps[idx].month
-
+        # Split sequences by month (based on center timestamp)
         train_seqs, val_seqs, test_seqs = [], [], []
-        for seq in self.sequences:
-            month = get_month(seq)
+        for center_idx in self.sequences:
+            month = self.all_timestamps[center_idx].month
             if 1 <= month <= 8:
-                train_seqs.append(seq)
+                train_seqs.append(center_idx)
             elif 9 <= month <= 10:
-                val_seqs.append(seq)
+                val_seqs.append(center_idx)
             elif 11 <= month <= 12:
-                test_seqs.append(seq)
+                test_seqs.append(center_idx)
+
         split_seqs = {
             'train': train_seqs,
             'valid': val_seqs,
             'test': test_seqs,
         }[self.split]
         self.sequences = split_seqs
+        
+        # Fit the normalizer if using mean_sigma_tanh
+        if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+            self._fit_normalizer_sequence()
+
+    def _fit_normalizer_sequence(self):
+        """Fit the normalizer by computing statistics on a sample of the sequence data."""
+        if self.normalizer is None:
+            return
+
+        # Load a sample of data to compute statistics
+        sample_data = []
+        max_samples = min(10, len(self.sequences))  # Use max 10 sequences for fitting
+
+        print(f"Fitting sequence normalizer on {max_samples} sequences...")
+        for seq_idx in range(0, len(self.sequences), max(1, len(self.sequences) // max_samples)):
+            if len(sample_data) >= max_samples * 5:  # 5 files per sequence max
+                break
+            try:
+                center_idx = self.sequences[seq_idx]
+                start_idx = center_idx - self.sequence_length // 2
+
+                # Sample a few files from each sequence
+                for i in range(min(5, self.sequence_length)):  # Take first 5 files
+                    file_idx = start_idx + i
+                    if 0 <= file_idx < len(self.all_files):
+                        file_path = self.all_files[file_idx]
+                        data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True)
+                        sample_data.append(data[0])
+            except Exception as e:
+                print(f"Warning: Could not load sequence {seq_idx}: {e}")
+                continue
+
+        if sample_data:
+            # Stack all sample data
+            all_data = np.stack(sample_data, axis=0)
+
+            # Fit the normalizer
+            self.normalizer.fit(all_data)
+            stats = self.normalizer.get_stats()
+            print(f"Sequence normalizer fitted: mean={stats['mean']:.2f}, std={stats['std']:.2f}")
+        else:
+            print("Warning: No sequence data could be loaded for fitting normalizer!")
 
     def __len__(self):
         return len(self.sequences)
@@ -301,25 +471,97 @@ class IonoSequenceDataset(Dataset):
         return cond_original
 
     def __getitem__(self, idx):
-        seq_files = self.sequences[idx]
+        """
+        Get a sequence by building it from the center index.
+        Missing frames (due to temporal gaps) are filled with zeros.
+        """
+        center_idx = self.sequences[idx]
+        start_idx = center_idx - self.sequence_length // 2
+        end_idx = start_idx + self.sequence_length
+
         data_tensors = []
         cond_tensors = []
-        time = []
-        for file_path in seq_files:
-            data = np.load(file_path, allow_pickle=True)
-            data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
-            if self.transforms:
-                data_tensor = data_tensor / 108154.0
-            # Normalize cond_tensor between -1 and 1
-            cond_raw = np.array([data[1], data[2], data[3], -data[4]], dtype=np.float32)
-            cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
-            cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
+
+        # Get the CSV dataframe for condition lookup if using L1 conditions
+        if self.use_l1_conditions:
+            df = pd.read_csv(self.csv_path)
+
+        # Calculate expected timestamps for the sequence (2-min cadence)
+        center_time = self.all_timestamps[center_idx]
+        expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
+
+        for frame_offset in range(self.sequence_length):
+            file_idx = start_idx + frame_offset
+            expected_time = expected_start_time + timedelta(minutes=2 * frame_offset)
+
+            # Check if this frame exists and matches the expected timestamp
+            frame_exists = False
+            if 0 <= file_idx < len(self.all_files):
+                actual_time = self.all_timestamps[file_idx]
+                # Allow small tolerance (1 second) for timestamp matching
+                if abs((actual_time - expected_time).total_seconds()) <= 1:
+                    frame_exists = True
+
+            if frame_exists:
+                # Load the actual frame
+                file_path = self.all_files[file_idx]
+                data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True)
+                data_tensor = torch.from_numpy(data[0]).float().unsqueeze(0)
+
+                if self.transforms:
+                    if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+                        data_tensor = self.normalizer.forward(data_tensor)
+                    else:
+                        # data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
+                        
+                        data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
+                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1 # normalize to [-1, 1]
+
+                if self.use_l1_conditions:
+                    filename = os.path.basename(file_path)
+                    file_row = df[df['filename'] == filename]
+
+                    if len(file_row) == 0:
+                        raise ValueError(f"Filename {filename} not found in CSV")
+
+                    cond_raw = np.array([
+                        file_row['bx_gsm'].iloc[0],
+                        file_row['by_gsm'].iloc[0],
+                        file_row['bz_gsm'].iloc[0],
+                        file_row['proton_vx_gsm'].iloc[0],
+                    ], dtype=np.float32)
+                else:
+                    cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
+                
+                # Negate velocity
+                # cond_raw[3] = -cond_raw[3]
+
+                # Normalize conditions
+                cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
+
+                cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
+            else:
+                # Frame is missing - fill data with zeros, conditions with 2.0 (outside normalized range)
+                data_tensor = torch.zeros(1, 24, 360, dtype=torch.float32)
+                cond_tensor = torch.full((4,), 2.0, dtype=torch.float32)
+
             data_tensors.append(data_tensor)
             cond_tensors.append(cond_tensor)
-            time.append(extract_timestamp(file_path))
+
         data_seq = torch.stack(data_tensors, dim=0)
         cond_seq = torch.stack(cond_tensors, dim=0)
-        return data_seq, cond_seq #, time
+        return data_seq, cond_seq
+
+    def reverse_data_normalization(self, normalized_tensor):
+        """Reverse the normalization applied to the data."""
+        if not self.transforms:
+            return normalized_tensor
+            
+        if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
+            return self.normalizer.reverse(normalized_tensor)
+        else:
+            # Reverse absolute max normalization
+            return normalized_tensor * 55000.0
 
 
 def get_sequence_data_objects(
@@ -334,6 +576,9 @@ def get_sequence_data_objects(
     csv_path=None,
     transform_cond_csv=None,
     transforms=True,
+    normalization_type="absolute_max",  # "absolute_max" or "mean_sigma_tanh"
+    use_l1_conditions=False,  # New parameter
+    min_center_distance=15,  # Minimum distance between sequence centers
     seed=42,
 ):
     dataset = IonoSequenceDataset(
@@ -343,7 +588,10 @@ def get_sequence_data_objects(
         split=split,
         seed=seed,
         train_val_test=train_val_test,
-        sequence_length=sequence_length
+        sequence_length=sequence_length,
+        normalization_type=normalization_type,
+        use_l1_conditions=use_l1_conditions,
+        min_center_distance=min_center_distance
     )
     if distributed:
         sampler = DistributedSampler(
