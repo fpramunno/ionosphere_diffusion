@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 from typing import Iterator
 from datetime import datetime, timedelta
 from collections.abc import Sized
+from IPython import embed 
 
 class MeanSigmaTanhNormalizer:
     """
@@ -175,7 +176,8 @@ class IonoDataset(Dataset): # type: ignore
                 data_tensor = self.normalizer.forward(data_tensor)
             else:
                 # Use original absolute max normalization
-                data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000 # maximum max value among the whole dataset can be changed
+                data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
+                data_tensor = 2* (data_tensor - 80000) / (80000 - (-80000)) -1  # normalize to [-1, 1]
 
         condition_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
 
@@ -190,7 +192,7 @@ class IonoDataset(Dataset): # type: ignore
             return self.normalizer.reverse(normalized_tensor)
         else:
             # Reverse absolute max normalization
-            return normalized_tensor * 55000.0
+            return 2 * ((normalized_tensor - 80000) / (80000 - 80000)) - 1 #normalized_tensor * 55000.0
 
 class RandomSamplerSeed(Sampler[int]):
     """Overwrite the RandomSampler to allow for a seed for each epoch.
@@ -337,7 +339,7 @@ class IonoSequenceDataset(Dataset):
                 raise ValueError("CSV file must contain L1 columns when use_l1_conditions=True")
             
             # Store min and max for L1 columns for normalization (exclude missing values)
-            l1_cols = ['proton_vx_gsm', 'bx_gsm', 'by_gsm', 'bz_gsm']
+            l1_cols = ['bx_gsm', 'by_gsm', 'bz_gsm', 'proton_vx_gsm']
             df_clean = df[l1_cols].replace(-99999, np.nan)  # Replace missing values with NaN
             self.cond_min = df_clean.min().values.astype(np.float32)  # min ignores NaN
             self.cond_max = df_clean.max().values.astype(np.float32)  # max ignores NaN
@@ -510,7 +512,10 @@ class IonoSequenceDataset(Dataset):
                     if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
                         data_tensor = self.normalizer.forward(data_tensor)
                     else:
-                        data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
+                        # data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
+                        
+                        data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
+                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1 # normalize to [-1, 1]
 
                 if self.use_l1_conditions:
                     filename = os.path.basename(file_path)
@@ -527,22 +532,18 @@ class IonoSequenceDataset(Dataset):
                     ], dtype=np.float32)
                 else:
                     cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
-
+                
                 # Negate velocity
-                cond_raw[3] = -cond_raw[3]
+                # cond_raw[3] = -cond_raw[3]
 
                 # Normalize conditions
                 cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
 
-                # Handle missing values
-                missing_mask = (cond_raw == -99999)
-                cond_norm[missing_mask] = 0.0
-
                 cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
             else:
-                # Frame is missing - fill with zeros
+                # Frame is missing - fill data with zeros, conditions with 2.0 (outside normalized range)
                 data_tensor = torch.zeros(1, 24, 360, dtype=torch.float32)
-                cond_tensor = torch.zeros(4, dtype=torch.float32)
+                cond_tensor = torch.full((4,), 2.0, dtype=torch.float32)
 
             data_tensors.append(data_tensor)
             cond_tensors.append(cond_tensor)

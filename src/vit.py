@@ -150,6 +150,16 @@ def apply_rope(q: Tensor, k: Tensor, theta: Tensor) -> Tuple[Tensor, Tensor]:
         The rotated query and key tokens, with shape :math:`(*, C)`.
     """
 
+    # torch.polar and torch.view_as_complex don't support bfloat16
+    # Cast to float32 for the entire operation, then cast back
+    orig_dtype = q.dtype
+    use_fp32 = orig_dtype == torch.bfloat16
+
+    if use_fp32:
+        q = q.float()
+        k = k.float()
+        theta = theta.float()
+
     rotation = torch.polar(torch.ones_like(theta), theta)
 
     q = torch.view_as_complex(torch.unflatten(q, -1, (-1, 2)))
@@ -157,6 +167,11 @@ def apply_rope(q: Tensor, k: Tensor, theta: Tensor) -> Tuple[Tensor, Tensor]:
 
     q = torch.flatten(torch.view_as_real(rotation * q), -2)
     k = torch.flatten(torch.view_as_real(rotation * k), -2)
+
+    # Cast back to original dtype if needed
+    if use_fp32:
+        q = q.to(orig_dtype)
+        k = k.to(orig_dtype)
 
     return q, k
 
@@ -468,6 +483,7 @@ class ViT(nn.Module):
         self.mapping_cond = nn.Sequential(
             nn.Linear(self.channel_mapping_cond * 4, mod_features),  # Flatten spatial dimensions and project to mod_features BEFORE 16 NOW 30
             nn.SiLU(),
+            nn.LayerNorm(mod_features),
             nn.Linear(mod_features, mod_features),
             nn.SiLU(),
             nn.Linear(mod_features, mod_features),
@@ -528,9 +544,6 @@ class ViT(nn.Module):
 
         return x
         
-        
-        # return x
-
     def param_groups(self, base_lr=2e-4):
         wd_params, no_wd_params = [], []
         for name, param in self.named_parameters():

@@ -30,6 +30,7 @@ def main():
     import torch._dynamo
     from torch import optim
     from tqdm.auto import tqdm
+    from IPython import embed 
 
     import src as K
 
@@ -96,9 +97,11 @@ def main():
                 help='path to the main CSV file with metrics')
     p.add_argument('--transform-cond-csv', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
                 help='path to the transform condition CSV file')
-    p.add_argument('--normalization-type', type=str, default="absolute_max", 
+    p.add_argument('--normalization-type', type=str, default="absolute_max",
                 choices=["absolute_max", "mean_sigma_tanh"],
                 help='type of normalization to use: absolute_max (original) or mean_sigma_tanh (new)')
+    p.add_argument('--min-center-distance', type=int, default=5,
+                help='minimum distance between sequence centers (in frames) to avoid overlap')
 
     p.add_argument('--wandb-entity', type=str,
                 help='the wandb entity name')
@@ -113,8 +116,25 @@ def main():
     p.add_argument('--use-wandb', action='store_true', help='Enable wandb logging')
     p.add_argument('--no-wandb', dest='use_wandb', action='store_false', help='Disable wandb logging')
     p.set_defaults(use_wandb=True)  # or False, depending on your preference
+    p.add_argument('--debug', action='store_true',
+                help='enable debug mode: disables wandb, sets batch_size=4, num_workers=2, evaluate_every=1')
 
     args = p.parse_args()
+
+    # Apply debug mode settings
+    if args.debug:
+        print("🐛 DEBUG MODE ENABLED")
+        print("  - Disabling wandb")
+        print("  - Setting batch_size=4")
+        print("  - Setting num_workers=2")
+        print("  - Setting evaluate_every=1")
+        print("  - Setting max_epochs=5 (if not already set)")
+        args.use_wandb = False
+        args.batch_size = 4
+        args.num_workers = 2
+        args.evaluate_every = 1
+        if args.max_epochs is None:
+            args.max_epochs = 5
 
     # Calculate conditioning length from total sequence length and prediction steps
     args.conditioning_length = args.sequence_length - args.predict_steps
@@ -244,6 +264,40 @@ def main():
         print(f'Model size (MB): {total_params * 4 / (1024**2):.2f}')
         print(f'{"="*80}')
 
+    
+    # Load the dataset
+
+    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
+        csv_path=args.csv_path,
+        transform_cond_csv=args.transform_cond_csv,
+        batch_size=args.batch_size,
+        distributed=False,
+        num_data_workers=args.num_workers,
+        split='train',
+        seed=42,
+        sequence_length=args.sequence_length,
+        normalization_type=args.normalization_type,
+        use_l1_conditions=True,
+        min_center_distance=args.min_center_distance,
+    )
+
+    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
+        csv_path=args.csv_path,
+        transform_cond_csv=args.transform_cond_csv,
+        batch_size=args.batch_size,
+        distributed=False,
+        num_data_workers=args.num_workers,
+        split='valid',
+        seed=42,
+        sequence_length=args.sequence_length,
+        normalization_type=args.normalization_type,
+        use_l1_conditions=True,
+        min_center_distance=args.min_center_distance,
+    )
+
+    print(f'Train loader and Valid loader are up! Lengths: {len(train_dl)}, {len(val_dl)}')
+    print(f'Using normalization method: {args.normalization_type}')
+
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
     if opt_config['type'] == 'adamw':
@@ -280,6 +334,55 @@ def main():
                                     warmup=sched_config['warmup'])
     elif sched_config['type'] == 'constant':
         sched = K.utils.ConstantLRWithWarmup(opt, warmup=sched_config['warmup'])
+    elif sched_config['type'] == 'cosine':
+        # Calculate total steps
+        if args.max_epochs is None:
+            raise ValueError("max_epochs must be specified when using cosine scheduler")
+
+        epoch_size = len(train_dl)  # steps per epoch
+        warmup_epochs = sched_config.get('warmup_epochs', 0)
+        warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
+        total_steps = (args.max_epochs * epoch_size) // args.grad_accum_steps
+        eta_min_factor = sched_config.get('eta_min_factor', 100)  # LR will decay to lr/100
+
+        if warmup_steps > 0:
+            # Cosine with linear warmup
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                opt,
+                start_factor=0.01,  # Start at 1% of base LR
+                end_factor=1.0,     # Reach 100% of base LR
+                total_iters=warmup_steps
+            )
+            decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                eta_min=lr / eta_min_factor,  # Min LR = lr/100
+                T_max=total_steps - warmup_steps
+            )
+            sched = torch.optim.lr_scheduler.SequentialLR(
+                opt,
+                schedulers=[warmup, decay],
+                milestones=[warmup_steps]
+            )
+
+            if accelerator.is_main_process:
+                print(f"📊 Cosine LR Schedule:")
+                print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs})")
+                print(f"   Total steps: {total_steps} (epochs: {args.max_epochs})")
+                print(f"   Base LR: {lr:.2e}")
+                print(f"   Min LR: {lr/eta_min_factor:.2e}")
+        else:
+            # Cosine without warmup
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt,
+                eta_min=lr / eta_min_factor,
+                T_max=total_steps
+            )
+
+            if accelerator.is_main_process:
+                print(f"📊 Cosine LR Schedule (no warmup):")
+                print(f"   Total steps: {total_steps}")
+                print(f"   Base LR: {lr:.2e}")
+                print(f"   Min LR: {lr/eta_min_factor:.2e}")
     else:
         raise ValueError('Invalid schedule type')
 
@@ -288,36 +391,6 @@ def main():
                                 max_value=ema_sched_config['max_value'])
     ema_stats = {}
 
-    # Load the dataset
-
-    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
-        csv_path=args.csv_path,
-        transform_cond_csv=args.transform_cond_csv,
-        batch_size=args.batch_size,
-        distributed=False,
-        num_data_workers=args.num_workers,
-        split='train',
-        seed=42,
-        sequence_length=args.sequence_length,
-        normalization_type=args.normalization_type,
-        use_l1_conditions=True,
-    )
-
-    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
-        csv_path=args.csv_path,
-        transform_cond_csv=args.transform_cond_csv,
-        batch_size=args.batch_size,
-        distributed=False,
-        num_data_workers=args.num_workers,
-        split='valid',
-        seed=42,
-        sequence_length=args.sequence_length,
-        normalization_type=args.normalization_type,
-        use_l1_conditions=True,
-    )
-
-    print(f'Train loader and Valid loader are up!')
-    print(f'Using normalization method: {args.normalization_type}')
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
@@ -437,6 +510,8 @@ def main():
                     reserved_before = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
                     # print(f"Memory before processing: Allocated: {mem_before:.2f} GB, Reserved: {reserved_before:.2f} GB")
 
+                    # embed()
+
                     inpt = batch[0].contiguous().float().to(device, non_blocking=True)
                     inpt = inpt.squeeze(2)  # shape: (batch_size, sequence_length, 24, 360)
                     cond_img = inpt[:, :args.conditioning_length, :, :]    # first conditioning_length time steps
@@ -504,6 +579,18 @@ def main():
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
                         else:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
+
+                        # Log GPU memory to wandb every 25 steps
+                        if use_wandb and device.type == 'cuda':
+                            torch.cuda.synchronize()
+                            wandb.log({
+                                'gpu/memory_allocated_gb': torch.cuda.memory_allocated(device) / (1024 ** 3),
+                                'gpu/memory_reserved_gb': torch.cuda.memory_reserved(device) / (1024 ** 3),
+                                'gpu/max_memory_allocated_gb': torch.cuda.max_memory_allocated(device) / (1024 ** 3),
+                                'step': step,
+                                'train/loss_step': loss_disp,
+                                'train/avg_loss': avg_loss,
+                            })
 
                 step += 1
 
@@ -777,6 +864,17 @@ def main():
                     pred_reverted_flat = pred_reverted_seq.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
 
+                # Get GPU memory stats for epoch summary
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                    gpu_mem_allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                    gpu_mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                    gpu_mem_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                else:
+                    gpu_mem_allocated = 0.0
+                    gpu_mem_reserved = 0.0
+                    gpu_mem_peak = 0.0
+
                 log_dict = {
                     'epoch': epoch,
                     'loss': epoch_train_loss,
@@ -785,11 +883,18 @@ def main():
                     'ema_decay': ema_decay,
                     'max_min_difference_sequence': max_min_diff_gt,
                     'max_min_difference_sequence_pred': max_min_diff_pred,
+                    'gpu/epoch_memory_allocated_gb': gpu_mem_allocated,
+                    'gpu/epoch_memory_reserved_gb': gpu_mem_reserved,
+                    'gpu/epoch_peak_memory_gb': gpu_mem_peak,
                 }
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
-                
+
                 wandb.log(log_dict)
+
+                # Reset peak memory stats for next epoch
+                if device.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats(device)
                 # plt.close()
             # Save every 5 epochs or at the end
             if epoch % 5 == 0 or (args.max_epochs is not None and epoch >= args.max_epochs - 1):
