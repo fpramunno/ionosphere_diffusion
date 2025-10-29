@@ -38,13 +38,27 @@ def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m",
         num_samples (int): Number of samples to generate.
         device (torch.device): Device to run inference on.
         sampler (str): The sampler to use (default: "dpmpp_2m").
+        cond_label: Conditioning labels with shape (num_samples, total_frames, 4)
+        cond_img: Conditioning images with shape (num_samples, num_cond_frames, H, W)
+        num_pred_frames: Number of frames to predict
 
     Returns:
         Tensor: Generated samples.
     """
     model.eval()  # Set model to evaluation mode
     with torch.no_grad():
-        x = torch.randn(num_samples, num_pred_frames, 24, 360, device=device)  # Start with noise
+        # Infer spatial dimensions from conditioning image
+        if cond_img is not None:
+            spatial_shape = cond_img.shape[-2:]  # Get (H, W) from cond_img
+        else:
+            spatial_shape = (24, 360)  # Default fallback
+
+        x = torch.randn(num_samples, num_pred_frames, *spatial_shape, device=device)  # Start with noise
+
+        # cond_label should contain conditioning for both past and future frames
+        # Shape: (num_samples, num_cond_frames + num_pred_frames, 4)
+        # This is already prepared by the caller with the full temporal sequence
+
         extra_args = {
                         "mapping_cond": cond_label,
                         "cond": cond_img

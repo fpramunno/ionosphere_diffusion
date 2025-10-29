@@ -8,7 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from . import sampling, utils
-
+from IPython import embed
 
 # Helper functions
 
@@ -78,6 +78,7 @@ class Denoiser(nn.Module):
         c_weight = self.weighting(sigma)
         noised_input = input + noise * utils.append_dims(sigma, input.ndim)
         model_output = self.inner_model(noised_input * c_in, sigma, cond=unet_cond, **kwargs)
+        # embed()
         target = (input - c_skip * noised_input) / c_out
         if self.scales == 1:
             return ((model_output - target) ** 2).flatten(1).mean(1) * c_weight
