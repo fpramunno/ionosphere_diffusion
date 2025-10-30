@@ -98,8 +98,13 @@ def main():
     p.add_argument('--transform-cond-csv', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
                 help='path to the transform condition CSV file')
     p.add_argument('--normalization-type', type=str, default="absolute_max",
-                choices=["absolute_max", "mean_sigma_tanh"],
-                help='type of normalization to use: absolute_max (original) or mean_sigma_tanh (new)')
+                choices=["absolute_max", "mean_sigma_tanh", "ionosphere_preprocess"],
+                help='type of normalization to use: absolute_max (original), mean_sigma_tanh, or ionosphere_preprocess (SDO-style)')
+    p.add_argument('--preprocess-scaling', type=str, default=None,
+                choices=[None, "log10", "sqrt", "symlog"],
+                help='scaling method for ionosphere_preprocess: None, log10, sqrt, or symlog')
+    p.add_argument('--preprocess-scale-factor', type=float, default=10000,
+                help='scale factor for symlog preprocessing (only used when --preprocess-scaling=symlog)')
     p.add_argument('--min-center-distance', type=int, default=5,
                 help='minimum distance between sequence centers (in frames) to avoid overlap')
 
@@ -270,8 +275,29 @@ def main():
         print(f'Model size (MB): {total_params * 4 / (1024**2):.2f}')
         print(f'{"="*80}')
 
-    
+
     # Load the dataset
+
+    # Create preprocessing config if using ionosphere_preprocess normalization
+    preprocess_config = None
+    if args.normalization_type == "ionosphere_preprocess":
+        preprocess_config = {
+            "min": -80000,
+            "max": 80000,
+            "scaling": args.preprocess_scaling,
+        }
+        if args.preprocess_scaling == "symlog":
+            preprocess_config["scale_factor"] = args.preprocess_scale_factor
+
+        if accelerator.is_main_process:
+            print(f"\n{'='*80}")
+            print("PREPROCESSING CONFIG (SDO-style)")
+            print(f"{'='*80}")
+            print(f"  Min/Max clipping: [{preprocess_config['min']}, {preprocess_config['max']}]")
+            print(f"  Scaling method: {preprocess_config['scaling']}")
+            if args.preprocess_scaling == "symlog":
+                print(f"  Scale factor: {preprocess_config['scale_factor']}")
+            print(f"{'='*80}\n")
 
     train_dataset, train_sampler, train_dl = get_sequence_data_objects(
         csv_path=args.csv_path,
@@ -283,6 +309,7 @@ def main():
         seed=42,
         sequence_length=args.sequence_length,
         normalization_type=args.normalization_type,
+        preprocess_config=preprocess_config,
         use_l1_conditions=True,
         min_center_distance=args.min_center_distance,
         cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
@@ -300,6 +327,7 @@ def main():
         seed=42,
         sequence_length=args.sequence_length,
         normalization_type=args.normalization_type,
+        preprocess_config=preprocess_config,
         use_l1_conditions=True,
         min_center_distance=args.min_center_distance,
         cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid

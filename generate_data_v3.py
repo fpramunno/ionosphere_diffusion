@@ -28,8 +28,8 @@ train_dataset, train_sampler, train_dl = get_sequence_data_objects(
         normalization_type="absolute_max",
         use_l1_conditions=True,
         min_center_distance=5,
-        cartesian_transform=False,  # Convert to Cartesian circular grid
-        output_size=224,  # Output grid size for Cartesian transform
+        cartesian_transform=True,  # Convert to Cartesian circular grid
+        output_size=64,  # Output grid size for Cartesian transform
         only_complete_sequences=True,  # Filter out sequences with missing frames
     )
 
@@ -45,8 +45,8 @@ val_dataset, val_sampler, val_dl = get_sequence_data_objects(
         normalization_type="absolute_max",
         use_l1_conditions=True,
         min_center_distance=5,
-        cartesian_transform=False,  # Convert to Cartesian circular grid
-        output_size=224,  # Output grid size for Cartesian transform
+        cartesian_transform=True,  # Convert to Cartesian circular grid
+        output_size=64,  # Output grid size for Cartesian transform
         only_complete_sequences=True,  # Filter out sequences with missing frames
     )
 
@@ -111,13 +111,13 @@ p = argparse.ArgumentParser(description=__doc__,
 p.add_argument('--config', type=str, required=True,
             help='the configuration file')
 
-args = p.parse_args(["--config", "/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_15_big_cosine.json"])
+args = p.parse_args(["--config", "/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_15_big_cosine_solar.json"])
 
 config = K.config.load_config(args.config)
 inner_model = K.config.make_model(config)
 model_ema = K.config.make_denoiser_wrapper(config)(inner_model)
 
-ckpt = torch.load("/mnt/nas05/data01/francesco/progetto_simone/ionosphere/models_results/models_cond_forecasting_15frames_overfit/model_epoch_0499.pth")
+ckpt = torch.load("/mnt/nas05/data01/francesco/progetto_simone/ionosphere/models_results/models_cond_forecasting_15frames_overfit_15step_v4_cartesian_coordinates/model_epoch_0000.pth")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_ema.inner_model.load_state_dict(ckpt['model_ema'])
@@ -126,11 +126,13 @@ model_ema.eval()
 
 import os
 
-os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/input_imgs")
-os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/generated_imgs")
-os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/gifs")
-os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/ground_truth")
-os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/conditions")
+os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/input_imgs")
+os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/generated_imgs")
+os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/gifs")
+os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/ground_truth")
+os.mkdir("/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/conditions")
+
+cartesian_transform = True
 
 with torch.no_grad():
     for k, batch in enumerate(tqdm(val_dl, desc="Validation")):
@@ -142,17 +144,23 @@ with torch.no_grad():
 
         cond_label_inp = cond_label[:, :, :]  # :16
 
+        if cartesian_transform:
+            spatial_shape = (64, 64)
+        else:
+            spatial_shape = (24, 360)
+
         # embed()
-        samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, 24, 360), num_pred_frames=15, step=50)
+        # samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, 24, 360), num_pred_frames=15, step=50)
+        samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape), num_pred_frames=15).cpu()
 
         # Save the oeiginal sample
-        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/input_imgs/original_forecasting_{k}.npy", cond_img[0].cpu().numpy())
+        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/input_imgs/original_forecasting_{k}.npy", cond_img[0].cpu().numpy())
         # Save the generated sampl
-        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/generated_imgs/sample_forecasting_{k}.npy", samples.cpu().numpy())
+        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/generated_imgs/sample_forecasting_{k}.npy", samples.cpu().numpy())
         # Save the target sample
-        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/ground_truth/arget_forecasting_{k}.npy", target_img[0].cpu().numpy())
+        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/ground_truth/arget_forecasting_{k}.npy", target_img[0].cpu().numpy())
         # Save the condition
-        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v2/conditions/cond_{k}.npy", cond_label.cpu().numpy())
+        np.save(f"/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/conditions/cond_{k}.npy", cond_label.cpu().numpy())
 
         frames = []
         data_seq = samples[0].unsqueeze(1)  # shape: [20, 1, 24, 360]
@@ -177,4 +185,4 @@ with torch.no_grad():
             plt.close(fig)
 
         # Save as gif
-        imageio.mimsave(f'/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine/gifs/sequence_gen_{k}.gif', frames, duration=1)
+        imageio.mimsave(f'/mnt/nas05/data01/francesco/progetto_simone/results_30predstep_v3_big_cosine_overfit_v4/gifs/sequence_gen_{k}.gif', frames, duration=1)

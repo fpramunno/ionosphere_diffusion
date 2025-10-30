@@ -6,7 +6,7 @@ from torch import nn
 from torchdiffeq import odeint
 import torchsde
 from tqdm.auto import trange, tqdm
-
+from IPython import embed
 from . import utils
 # import utils
 
@@ -582,7 +582,7 @@ def sample_dpmpp_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
 
 
 @torch.no_grad()
-def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=None):
+def sample_dpmpp_2m(model, x, sigmas, unet_cond, extra_args=None, callback=None, disable=None):
     """DPM-Solver++(2M)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -591,7 +591,7 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
     old_denoised = None
 
     for i in trange(len(sigmas) - 1, disable=disable):
-        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        denoised = model(x, sigmas[i] * s_in, unet_cond=unet_cond, **extra_args)
         if callback is not None:
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
         t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
@@ -616,13 +616,14 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
 
 
 @torch.no_grad()
-def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, solver_type='midpoint'):
+def sample_dpmpp_2m_sde(model, x, sigmas, unet_cond, extra_args=None, callback=None, disable=None, eta=1., s_noise=1., noise_sampler=None, solver_type='midpoint'):
     """DPM-Solver++(2M) SDE."""
 
     if solver_type not in {'heun', 'midpoint'}:
         raise ValueError('solver_type must be \'heun\' or \'midpoint\'')
 
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
+    x = torch.cat([unet_cond, x], dim=1)
     noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
@@ -630,8 +631,10 @@ def sample_dpmpp_2m_sde(model, x, sigmas, extra_args=None, callback=None, disabl
     old_denoised = None
     h_last = None
 
+    
     for i in trange(len(sigmas) - 1, disable=disable):
-        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        # embed()
+        denoised = model(x, sigmas[i] * s_in, unet_cond=unet_cond, **extra_args)
         if callback is not None:
             callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
         if sigmas[i + 1] == 0:

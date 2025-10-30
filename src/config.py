@@ -8,6 +8,7 @@ from jsonmerge import merge
 from . import augmentation, layers, models, utils
 
 from . import vit
+from . import modules
 
 # import augmentation, layers, models, utils
 
@@ -242,6 +243,25 @@ def make_model(config):
             patch_size=config['patch_size'],
             window_size=config['window_size'],
             channel_mapping_cond=config['channel_mapping_cond'],)
+    elif config['type'] == 'palette_unet':
+        # Determine true image size from input_size
+        true_img_size = config.get('true_img_size', max(config['input_size']) if 'input_size' in config else 64)
+        model = modules.PaletteModelV2(
+            c_in=config.get('c_in', config.get('in_channels', 1)),
+            c_out=config.get('c_out', config.get('out_channels', 1)),
+            image_size=config.get('image_size', 64),
+            time_dim=config.get('time_dim', 256),
+            device=config.get('device', 'cuda'),
+            latent=config.get('latent', False),
+            true_img_size=true_img_size,
+            num_classes=config.get('num_classes', None),
+            channel_mapping_cond=config.get('channel_mapping_cond', 30),
+            spatial=config.get('spatial', 3),
+            channel_mults=tuple(config.get('channel_mults', [1, 2, 4, 4])),
+            num_res_blocks=config.get('num_res_blocks', 2),
+            attention_resolutions=tuple(config.get('attention_resolutions', [16])),
+            num_bottleneck_blocks=config.get('num_bottleneck_blocks', 3),
+        )
     else:
         raise ValueError(f'unsupported model type {config["type"]}')
     return model

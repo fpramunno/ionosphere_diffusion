@@ -65,22 +65,21 @@ def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m",
                     }
         sigmas = sampling.get_sigmas_karras(n=step, sigma_min=1e-2, sigma_max=80, rho=7.0, device=device)
 
-
         # ✅ Choosing the correct sampler
         if sampler == "euler":
-            samples = sampling.sample_euler(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_euler(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "euler_ancestral":
-            samples = sampling.sample_euler_ancestral(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_euler_ancestral(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "heun":
-            samples = sampling.sample_heun(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_heun(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpm_2":
-            samples = sampling.sample_dpm_2(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpm_2(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpm_2_ancestral":
-            samples = sampling.sample_dpm_2_ancestral(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpm_2_ancestral(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpmpp_2m":
-            samples = sampling.sample_dpmpp_2m(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpmpp_2m(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpmpp_2m_sde":
-            samples = sampling.sample_dpmpp_2m_sde(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpmpp_2m_sde(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         else:
             raise ValueError(f"Unknown sampler: {sampler}")
 

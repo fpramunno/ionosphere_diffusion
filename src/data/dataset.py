@@ -11,7 +11,160 @@ from typing import Iterator
 from datetime import datetime, timedelta
 from collections.abc import Sized
 from IPython import embed
-from scipy.interpolate import griddata 
+from scipy.interpolate import griddata
+
+# Preprocessing config similar to SDO approach
+IONOSPHERE_PREPROCESS = {
+    "electric_potential": {
+        "min": -80000,
+        "max": 80000,
+        "scaling": None,  # Options: None, "log10", "sqrt", "symlog"
+    }
+}
+
+def get_ionosphere_transform(data_tensor, config=None):
+    """
+    Apply preprocessing transform to ionosphere data following SDO approach exactly.
+
+    Pipeline (same as SDO):
+    1. Clamp to [min, max]
+    2. Apply scaling transformation (log10, sqrt, or none)
+    3. Normalize to [0, 1] using (x - mean) / std
+    4. Normalize to [-1, 1] using 2x - 1 (equivalent to Normalize(mean=0.5, std=0.5))
+
+    Args:
+        data_tensor: Input tensor
+        config: Preprocessing config dict with 'min', 'max', 'scaling'
+
+    Returns:
+        Transformed tensor in range [-1, 1]
+    """
+    if config is None:
+        config = IONOSPHERE_PREPROCESS["electric_potential"]
+
+    # Step 1: Clamp to valid range
+    data_clamped = torch.clamp(data_tensor,
+                               min=config["min"],
+                               max=config["max"])
+
+    # Step 2: Apply scaling transformation and compute mean/std for normalization
+    if config["scaling"] == "log10":
+        # Symmetric log10 for data with negative values
+        epsilon = 1.0
+        sign = torch.sign(data_clamped)
+        abs_data = torch.abs(data_clamped)
+        data_transformed = sign * torch.log10(abs_data + epsilon)
+
+        # Compute mean and std for normalization (maps to [0, 1])
+        mean = np.sign(config["min"]) * np.log10(abs(config["min"]) + epsilon)
+        std = np.sign(config["max"]) * np.log10(abs(config["max"]) + epsilon) - mean
+
+    elif config["scaling"] == "sqrt":
+        # Symmetric square root
+        sign = torch.sign(data_clamped)
+        abs_data = torch.abs(data_clamped)
+        data_transformed = sign * torch.sqrt(abs_data)
+
+        # Compute mean and std for normalization
+        mean = np.sign(config["min"]) * np.sqrt(abs(config["min"]))
+        std = np.sign(config["max"]) * np.sqrt(abs(config["max"])) - mean
+
+    elif config["scaling"] == "symlog":
+        # Symmetric log: sign(x) * log(1 + |x|/C) where C is a scale factor
+        scale_factor = config.get("scale_factor", 10000)
+        sign = torch.sign(data_clamped)
+        abs_data = torch.abs(data_clamped)
+        data_transformed = sign * torch.log1p(abs_data / scale_factor)
+
+        # Compute mean and std for normalization
+        mean = np.sign(config["min"]) * np.log1p(abs(config["min"]) / scale_factor)
+        std = np.sign(config["max"]) * np.log1p(abs(config["max"]) / scale_factor) - mean
+
+    else:  # No scaling
+        data_transformed = data_clamped
+        mean = config["min"]
+        std = config["max"] - config["min"]
+
+    # Step 3: First normalization - map to [0, 1]
+    # Equivalent to: Normalize(mean=[mean], std=[std])
+    data_normalized_01 = (data_transformed - mean) / std
+
+    # Step 4: Second normalization - map [0, 1] to [-1, 1]
+    # Equivalent to: Normalize(mean=0.5, std=0.5)
+    # Which is: (x - 0.5) / 0.5 = 2x - 1
+    data_normalized = (data_normalized_01 - 0.5) / 0.5
+
+    return data_normalized
+
+
+def reverse_ionosphere_transform(normalized_tensor, config=None):
+    """
+    Reverse the preprocessing transform to get back original scale.
+
+    Reverses the exact SDO pipeline:
+    1. Reverse second normalization: from [-1, 1] to [0, 1]
+    2. Reverse first normalization: from [0, 1] to transformed range
+    3. Reverse scaling transformation: from transformed to original
+
+    Args:
+        normalized_tensor: Normalized tensor in range [-1, 1]
+        config: Preprocessing config dict
+
+    Returns:
+        Denormalized tensor in original scale
+    """
+    if config is None:
+        config = IONOSPHERE_PREPROCESS["electric_potential"]
+
+    # Step 1: Reverse second normalization - map [-1, 1] to [0, 1]
+    # Reverse of: (x - 0.5) / 0.5
+    data_01 = normalized_tensor * 0.5 + 0.5
+
+    # Compute mean and std based on scaling type (same as forward)
+    if config["scaling"] == "log10":
+        epsilon = 1.0
+        mean = np.sign(config["min"]) * np.log10(abs(config["min"]) + epsilon)
+        std = np.sign(config["max"]) * np.log10(abs(config["max"]) + epsilon) - mean
+
+    elif config["scaling"] == "sqrt":
+        mean = np.sign(config["min"]) * np.sqrt(abs(config["min"]))
+        std = np.sign(config["max"]) * np.sqrt(abs(config["max"])) - mean
+
+    elif config["scaling"] == "symlog":
+        scale_factor = config.get("scale_factor", 10000)
+        mean = np.sign(config["min"]) * np.log1p(abs(config["min"]) / scale_factor)
+        std = np.sign(config["max"]) * np.log1p(abs(config["max"]) / scale_factor) - mean
+
+    else:  # No scaling
+        mean = config["min"]
+        std = config["max"] - config["min"]
+
+    # Step 2: Reverse first normalization - map [0, 1] to transformed range
+    # Reverse of: (x - mean) / std
+    data_transformed = data_01 * std + mean
+
+    # Step 3: Reverse scaling transformation
+    if config["scaling"] == "log10":
+        epsilon = 1.0
+        sign = torch.sign(data_transformed)
+        abs_log = torch.abs(data_transformed)
+        data_original = sign * (torch.pow(10, abs_log) - epsilon)
+
+    elif config["scaling"] == "sqrt":
+        sign = torch.sign(data_transformed)
+        abs_sqrt = torch.abs(data_transformed)
+        data_original = sign * (abs_sqrt ** 2)
+
+    elif config["scaling"] == "symlog":
+        scale_factor = config.get("scale_factor", 10000)
+        sign = torch.sign(data_transformed)
+        abs_log = torch.abs(data_transformed)
+        data_original = sign * scale_factor * (torch.exp(abs_log) - 1)
+
+    else:  # No scaling
+        data_original = data_transformed
+
+    return data_original 
 
 class MeanSigmaTanhNormalizer:
     """
@@ -352,13 +505,14 @@ class IonoSequenceDataset(Dataset):
         split="train",
         sequence_length=5,
         transforms=True,
-        normalization_type="absolute_max",  # "absolute_max", "mean_sigma_tanh", or "per_file_tanh"
+        normalization_type="absolute_max",  # "absolute_max", "mean_sigma_tanh", "per_file_log", or "ionosphere_preprocess"
         use_l1_conditions=False,  # New parameter to switch between modes
         min_center_distance=15,  # Minimum distance between sequence centers (frames)
         cartesian_transform=False,  # Convert to Cartesian circular grid
         output_size=224,  # Output grid size for Cartesian transform
         per_file_stats_path=None,  # Path to per-file normalization stats JSON
         only_complete_sequences=False,  # Only use sequences with no missing frames
+        preprocess_config=None,  # Preprocessing config for ionosphere_preprocess normalization
         seed=42
     ):
         self.csv_path = csv_path
@@ -371,6 +525,7 @@ class IonoSequenceDataset(Dataset):
         self.cartesian_transform = cartesian_transform
         self.output_size = output_size
         self.only_complete_sequences = only_complete_sequences
+        self.preprocess_config = preprocess_config  # Store preprocessing config
         self.seed = seed
         self.split = split
         self.train_perc = train_val_test[0]
@@ -644,7 +799,11 @@ class IonoSequenceDataset(Dataset):
                         # For ~3 std, log(1 + 3) ≈ 1.39
                         max_expected = np.log1p(3)  # ≈ 1.39
                         data_tensor = log_transformed / max_expected
+                    elif self.normalization_type == "ionosphere_preprocess":
+                        # Use new SDO-style preprocessing with configurable scaling
+                        data_tensor = get_ionosphere_transform(data_tensor, config=self.preprocess_config)
                     else:
+                        # Default absolute_max normalization
                         # data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
 
                         data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
@@ -719,6 +878,9 @@ class IonoSequenceDataset(Dataset):
             # Add back the mean
             denormalized = centered + self.global_mean
             return denormalized
+        elif self.normalization_type == "ionosphere_preprocess":
+            # Use new SDO-style reverse preprocessing
+            return reverse_ionosphere_transform(normalized_tensor, config=self.preprocess_config)
         else:
             # Reverse absolute max normalization
             # Original: data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1
@@ -738,13 +900,14 @@ def get_sequence_data_objects(
     csv_path=None,
     transform_cond_csv=None,
     transforms=True,
-    normalization_type="absolute_max",  # "absolute_max", "mean_sigma_tanh", or "per_file_tanh"
+    normalization_type="absolute_max",  # "absolute_max", "mean_sigma_tanh", "per_file_log", or "ionosphere_preprocess"
     use_l1_conditions=False,  # New parameter
     min_center_distance=15,  # Minimum distance between sequence centers
     cartesian_transform=False,  # Convert to Cartesian circular grid
     output_size=224,  # Output grid size for Cartesian transform
     per_file_stats_path=None,  # Path to per-file normalization stats JSON
     only_complete_sequences=False,  # Only use sequences with no missing frames
+    preprocess_config=None,  # Preprocessing config for ionosphere_preprocess normalization
     seed=42,
 ):
     dataset = IonoSequenceDataset(
@@ -761,7 +924,8 @@ def get_sequence_data_objects(
         cartesian_transform=cartesian_transform,
         output_size=output_size,
         per_file_stats_path=per_file_stats_path,
-        only_complete_sequences=only_complete_sequences
+        only_complete_sequences=only_complete_sequences,
+        preprocess_config=preprocess_config
     )
     if distributed:
         sampler = DistributedSampler(

@@ -77,64 +77,29 @@ class Denoiser(nn.Module):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
         c_weight = self.weighting(sigma)
         noised_input = input + noise * utils.append_dims(sigma, input.ndim)
+        noised_input = torch.cat([unet_cond, noised_input], dim=1)
         model_output = self.inner_model(noised_input * c_in, sigma, cond=unet_cond, **kwargs)
         # embed()
+        input = torch.cat([unet_cond, input], dim=1)
         target = (input - c_skip * noised_input) / c_out
         if self.scales == 1:
             return ((model_output - target) ** 2).flatten(1).mean(1) * c_weight
         sq_error = dct(model_output - target) ** 2
         f_weight = freq_weight_nd(sq_error.shape[2:], self.scales, dtype=sq_error.dtype, device=sq_error.device)
         return (sq_error * f_weight).flatten(1).mean(1) * c_weight
-    
-    def loss_palette(self, input, noise, target, sigma, **kwargs):
-        # Compute scaling factors for different parts of the model
-        # `c_skip`, `c_out`, and `c_in` adjust the contributions of input and output
-        c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
-    
-        # Compute the weighting factor for loss balancing
-        # This ensures the model gives proper importance to different noise levels
-        c_weight = self.weighting(sigma)
-    
-        # Apply noise to the target image (instead of input)
-        noised_target = target + noise * utils.append_dims(sigma, target.ndim)
-    
-        # Concatenate the clean input with the noised target along the channel dimension
-        # Assuming input and target have shape (batch, channels, height, width)
-        conditioned_input = torch.cat([noised_target, input], dim=1)
-        
-        # Pass the noisy input through the model
-        # The model tries to predict a denoised version of the image (or noise)
-        model_output = self.inner_model(conditioned_input * c_in, sigma, **kwargs)
-    
-        # Compute the target for the model to predict
-        # Since the model should denoise the target, we use:
-        expected_output = (target - c_skip * noised_target) / c_out
-        
-       # Use simple MSE loss if self.scales == 1
-        if self.scales == 1:
-            return ((model_output - expected_output) ** 2).flatten(1).mean(1) * c_weight
-    
-        # Otherwise, use frequency-based loss
-        sq_error = dct(model_output - expected_output) ** 2
-        f_weight = freq_weight_nd(sq_error.shape[2:], self.scales, dtype=sq_error.dtype, device=sq_error.device)
-    
-        return (sq_error * f_weight).flatten(1).mean(1) * c_weight
 
-    # def forward(self, input, sigma, **kwargs):
-    #     c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
-    #     return self.inner_model(input * c_in, sigma, **kwargs) * c_out + input * c_skip
-
-    def forward(self, input, sigma, **kwargs):
+    def forward(self, input, sigma, unet_cond, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
         
+        # input = torch.cat([unet_cond, input], dim=1)
         # Get model output: (1, 1, 256, 256)
         model_output = self.inner_model(input * c_in, sigma, **kwargs) * c_out
         
-        # Select the first channel of the input for skip connection
-        input_selected = input[:, 0:1, :, :]  # Keep only one channel
+        # # Select the first channel of the input for skip connection
+        # input_selected = input[:, 0:1, :, :]  # Keep only one channel
         
         # Add skip connection using only the selected channel
-        return model_output + input_selected * c_skip
+        return model_output + input * c_skip
 
 
 class DenoiserWithVariance(Denoiser):
