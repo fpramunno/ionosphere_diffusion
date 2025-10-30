@@ -32,6 +32,8 @@ from torch.utils.checkpoint import checkpoint
 from typing import Hashable, Optional, Sequence, Tuple, Union
 from torch.utils.checkpoint import checkpoint
 
+# debug
+from IPython import embed
 
 class MultiheadSelfAttention(nn.Module):
     r"""Creates a multi-head self-attention layer.
@@ -448,7 +450,8 @@ class ViT(nn.Module):
         self.patch = Patchify(patch_size, channel_last=True)
         self.unpatch = Unpatchify(unpatch_size, channel_last=True)
 
-        self.in_proj = nn.Linear(math.prod(patch_size) * (in_channels + cond_channels), hid_channels)
+        # +1 for temporal coordinate channel
+        self.in_proj = nn.Linear(math.prod(patch_size) * (in_channels + cond_channels + 1 + 4), hid_channels) # 1 is for temporal index channel, 4 is for L1 cond channels
         self.out_proj = nn.Linear(hid_channels, math.prod(patch_size) * out_channels)
         self.time_compressor = nn.Linear(10, t_out)
         # self.time_compressor = nn.Conv1d(in_channels=1, out_channels=t_out, kernel_size=1)
@@ -493,13 +496,40 @@ class ViT(nn.Module):
         self.window_size = tuple(window_size) if isinstance(window_size, Sequence) else ((window_size,) * spatial if window_size else None)
 
     @staticmethod
-    @functools.cache
-    def coo_and_mask(shape: Sequence[int], spatial: int, window_size: Sequence[int], dtype: torch.dtype, device: torch.device) -> Tuple[Tensor, Optional[Tensor]]:
+    def coo_and_mask(shape: Sequence[int], time_position: Optional[Tensor], spatial: int,
+                     window_size: Sequence[int], dtype: torch.dtype, device: torch.device) -> Tuple[Tensor, Optional[Tensor]]:
+        # Create coordinate grid for spatial dimensions
+        # shape: (num_frames, H, W) -> coo: (num_tokens, spatial) where spatial=3
         coo = torch.cartesian_prod(*[torch.arange(s, device=device) for s in shape])
         coo = coo.view(-1, spatial)
 
+        # If temporal positions are provided, replace the first dimension (time index) with actual temporal positions
+        if time_position is not None:
+            # time_position: (batch, num_frames) containing temporal positions like [-1.0, ..., 0.93]
+            # coo: (num_tokens, spatial) where coo[:, 0] contains frame indices [0,0,0,...,1,1,1,...,2,2,2,...]
+
+            batch_size = time_position.shape[0]
+            num_tokens = coo.shape[0]
+
+            # Create batch-aware coordinates: (batch, num_tokens, spatial)
+            position = torch.zeros(batch_size, num_tokens, spatial, device=device, dtype=dtype)
+
+            # Copy spatial dimensions (lat, lon) for all batch elements
+            position[:, :, 1:] = coo[:, 1:].to(dtype=dtype)
+
+            # For each batch element, map frame indices to actual temporal positions
+            for b in range(batch_size):
+                # coo[:, 0] contains frame indices [0,0,...,1,1,...,2,2,...]
+                # time_position[b] contains actual temporal coords for each frame
+                position[b, :, 0] = time_position[b, coo[:, 0].long()]
+
+            coo = position
+        else:
+            # Add batch dimension for consistency
+            coo = coo.unsqueeze(0).to(dtype=dtype)
+
         if window_size is None:
-            return coo.to(dtype=dtype), None
+            return coo, None
 
         delta = torch.abs(coo[:, None] - coo[None, :])
         delta = torch.minimum(delta, delta.new_tensor(shape) - delta)
@@ -520,29 +550,83 @@ class ViT(nn.Module):
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         c_noise = sigma.log() / 4
         timestep_embed = self.timestep_embed(c_noise.unsqueeze(-1))
-        mapping_cond_embed = torch.zeros_like(timestep_embed) if mapping_cond is None else self.mapping_cond(mapping_cond.flatten(-2)).unsqueeze(1)
-        mapping_out = self.mapping(timestep_embed + mapping_cond_embed.mean(dim=1).unsqueeze(1))
+        # Squeeze out the extra dimension from SineEncoding: (B, 1, D) -> (B, D)
+        timestep_embed = timestep_embed.squeeze(1)
+
+        # Store the number of prediction frames before concatenation
+        num_pred_frames = input.shape[1]
+        num_cond_frames = cond.shape[1] if cond is not None else 0
+
+        # Process mapping_cond - for now we average for compatibility with ada-zero architecture
+        # Temporal information will flow through positional encoding
+        if mapping_cond is None:
+            mapping_cond_embed = torch.zeros_like(timestep_embed)
+        else:
+            # mapping_cond: (batch, total_frames, 4)
+            mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, emb_features)
+            mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1)
+
+        mapping_out = self.mapping(timestep_embed + mapping_cond_embed)
 
         if cond is not None:
-            input = torch.cat([input, cond], dim=1)
-        
+            # Concatenate in temporal order: [past conditioning, future prediction]
+            input = torch.cat([cond, input], dim=1)
+
+        # Create temporal coordinates for each frame
+        # Conditioning frames: negative indices (past), Prediction frames: positive indices (future)
+        # E.g., 15 cond + 15 pred: [-15, -14, ..., -1, 0, 1, ..., 14]
+        batch_size = input.shape[0]
+        total_frames = input.shape[1]
+
+        temporal_positions = torch.arange(-num_cond_frames, num_pred_frames,
+                                         device=input.device, dtype=input.dtype)
+
+        # Normalize by max horizon (max absolute temporal distance)
+        # This gives range roughly [-1, 1] centered at present (t=0)
+        max_horizon = max(num_cond_frames, num_pred_frames)
+        temporal_positions_normalized = temporal_positions / max_horizon
+
+        # Expand to batch dimension: (batch, num_frames)
+        time_position = temporal_positions_normalized.unsqueeze(0).expand(batch_size, -1)
+
+        # Add temporal coordinate as explicit input channel
+        # Following solar project approach: use (B, C, T, H, W) format
+        time_coord = temporal_positions_normalized.view(1, -1, 1, 1).expand(batch_size, total_frames, input.shape[-2], input.shape[-1])
+
+        l1_cond = mapping_cond.unsqueeze(-1).unsqueeze(-1)  # (batch, total_frames, 4, 1, 1)
+        l1_cond = l1_cond.expand(batch_size, total_frames, 4, input.shape[-2], input.shape[-1])
+
+        # Rearrange to (B, C, T, H, W) format like solar project
+        input = input.unsqueeze(1)  # (B, 1, T, H, W)
+        time_coord = time_coord.unsqueeze(1)  # (B, 1, T, H, W)
+        l1_cond = l1_cond.permute(0, 2, 1, 3, 4)  # (B, T, 4, H, W) -> (B, 4, T, H, W)
+
+        # Concatenate along channel dimension (dim=1)
+        input = torch.cat([input, time_coord, l1_cond], dim=1)  # (B, 6, T, H, W)
+
         input = self.patch(input)
         input = self.in_proj(input)
         shape = input.shape[-self.spatial - 1: -1]
 
-        coo, mask = self.coo_and_mask(shape, spatial=self.spatial, window_size=self.window_size, dtype=input.dtype, device=input.device)
+        coo, mask = self.coo_and_mask(shape, time_position=time_position, spatial=self.spatial,
+                                       window_size=self.window_size, dtype=input.dtype, device=input.device)
 
         x = skip = torch.flatten(input, -self.spatial - 1, -2)
         x = x + self.positional_embedding(coo)
 
         for block in self.blocks:
             x = block(x, mapping_out.squeeze(1), coo=coo, mask=mask, skip=skip)
-        
+
         x = torch.unflatten(x, sizes=shape, dim=-2)
         x = self.out_proj(x)
         x = self.unpatch(x)
 
-        return x
+        # Extract only the prediction frames (last num_pred_frames in temporal sequence)
+        # x is (B, C, total_frames, H, W) where frames are [conditioning, prediction]
+        # We only want the prediction frames: x[:, :, -num_pred_frames:, :, :]
+        x = x[:, :, -num_pred_frames:, :, :]
+
+        return x.squeeze(1)
         
     def param_groups(self, base_lr=2e-4):
         wd_params, no_wd_params = [], []

@@ -38,35 +38,48 @@ def generate_samples(model, num_samples, device, cond_label, sampler="dpmpp_2m",
         num_samples (int): Number of samples to generate.
         device (torch.device): Device to run inference on.
         sampler (str): The sampler to use (default: "dpmpp_2m").
+        cond_label: Conditioning labels with shape (num_samples, total_frames, 4)
+        cond_img: Conditioning images with shape (num_samples, num_cond_frames, H, W)
+        num_pred_frames: Number of frames to predict
 
     Returns:
         Tensor: Generated samples.
     """
     model.eval()  # Set model to evaluation mode
     with torch.no_grad():
-        x = torch.randn(num_samples, num_pred_frames, 24, 360, device=device)  # Start with noise
+        # Infer spatial dimensions from conditioning image
+        if cond_img is not None:
+            spatial_shape = cond_img.shape[-2:]  # Get (H, W) from cond_img
+        else:
+            spatial_shape = (24, 360)  # Default fallback
+
+        x = torch.randn(num_samples, num_pred_frames, *spatial_shape, device=device)  # Start with noise
+
+        # cond_label should contain conditioning for both past and future frames
+        # Shape: (num_samples, num_cond_frames + num_pred_frames, 4)
+        # This is already prepared by the caller with the full temporal sequence
+
         extra_args = {
                         "mapping_cond": cond_label,
                         "cond": cond_img
                     }
         sigmas = sampling.get_sigmas_karras(n=step, sigma_min=1e-2, sigma_max=80, rho=7.0, device=device)
 
-
         # ✅ Choosing the correct sampler
         if sampler == "euler":
-            samples = sampling.sample_euler(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_euler(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "euler_ancestral":
-            samples = sampling.sample_euler_ancestral(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_euler_ancestral(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "heun":
-            samples = sampling.sample_heun(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_heun(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpm_2":
-            samples = sampling.sample_dpm_2(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpm_2(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpm_2_ancestral":
-            samples = sampling.sample_dpm_2_ancestral(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpm_2_ancestral(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpmpp_2m":
-            samples = sampling.sample_dpmpp_2m(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpmpp_2m(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         elif sampler == "dpmpp_2m_sde":
-            samples = sampling.sample_dpmpp_2m_sde(model, x, sigmas, extra_args=extra_args)
+            samples = sampling.sample_dpmpp_2m_sde(model, x, sigmas, unet_cond=cond_img, extra_args=extra_args)
         else:
             raise ValueError(f"Unknown sampler: {sampler}")
 

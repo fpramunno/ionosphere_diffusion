@@ -21,4 +21,6 @@ results_cond_forecasting_cfg/
 results_cond_forecasting_cfg_oneframe/
 sample_gifs/
 models_results/
+solar/
 *.pdf
+RAE/

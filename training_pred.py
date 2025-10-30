@@ -98,8 +98,13 @@ def main():
     p.add_argument('--transform-cond-csv', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
                 help='path to the transform condition CSV file')
     p.add_argument('--normalization-type', type=str, default="absolute_max",
-                choices=["absolute_max", "mean_sigma_tanh"],
-                help='type of normalization to use: absolute_max (original) or mean_sigma_tanh (new)')
+                choices=["absolute_max", "mean_sigma_tanh", "ionosphere_preprocess"],
+                help='type of normalization to use: absolute_max (original), mean_sigma_tanh, or ionosphere_preprocess (SDO-style)')
+    p.add_argument('--preprocess-scaling', type=str, default=None,
+                choices=[None, "log10", "sqrt", "symlog"],
+                help='scaling method for ionosphere_preprocess: None, log10, sqrt, or symlog')
+    p.add_argument('--preprocess-scale-factor', type=float, default=10000,
+                help='scale factor for symlog preprocessing (only used when --preprocess-scaling=symlog)')
     p.add_argument('--min-center-distance', type=int, default=5,
                 help='minimum distance between sequence centers (in frames) to avoid overlap')
 
@@ -118,6 +123,12 @@ def main():
     p.set_defaults(use_wandb=True)  # or False, depending on your preference
     p.add_argument('--debug', action='store_true',
                 help='enable debug mode: disables wandb, sets batch_size=4, num_workers=2, evaluate_every=1')
+    p.add_argument('--cartesian-transform', action='store_true',
+                help='apply Cartesian transform to data')
+    p.add_argument('--overfit-single', action='store_true',
+                help='overfit on a single trajectory for debugging')
+    p.add_argument('--only-complete-sequences', action='store_true',
+                help='only use sequences with no missing frames (no zero-padded frames)')
 
     args = p.parse_args()
 
@@ -264,8 +275,29 @@ def main():
         print(f'Model size (MB): {total_params * 4 / (1024**2):.2f}')
         print(f'{"="*80}')
 
-    
+
     # Load the dataset
+
+    # Create preprocessing config if using ionosphere_preprocess normalization
+    preprocess_config = None
+    if args.normalization_type == "ionosphere_preprocess":
+        preprocess_config = {
+            "min": -80000,
+            "max": 80000,
+            "scaling": args.preprocess_scaling,
+        }
+        if args.preprocess_scaling == "symlog":
+            preprocess_config["scale_factor"] = args.preprocess_scale_factor
+
+        if accelerator.is_main_process:
+            print(f"\n{'='*80}")
+            print("PREPROCESSING CONFIG (SDO-style)")
+            print(f"{'='*80}")
+            print(f"  Min/Max clipping: [{preprocess_config['min']}, {preprocess_config['max']}]")
+            print(f"  Scaling method: {preprocess_config['scaling']}")
+            if args.preprocess_scaling == "symlog":
+                print(f"  Scale factor: {preprocess_config['scale_factor']}")
+            print(f"{'='*80}\n")
 
     train_dataset, train_sampler, train_dl = get_sequence_data_objects(
         csv_path=args.csv_path,
@@ -277,8 +309,12 @@ def main():
         seed=42,
         sequence_length=args.sequence_length,
         normalization_type=args.normalization_type,
+        preprocess_config=preprocess_config,
         use_l1_conditions=True,
         min_center_distance=args.min_center_distance,
+        cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
+        output_size=64,  # Output grid size for Cartesian transform
+        only_complete_sequences=args.only_complete_sequences,  # Filter out sequences with missing frames
     )
 
     val_dataset, val_sampler, val_dl = get_sequence_data_objects(
@@ -291,12 +327,79 @@ def main():
         seed=42,
         sequence_length=args.sequence_length,
         normalization_type=args.normalization_type,
+        preprocess_config=preprocess_config,
         use_l1_conditions=True,
         min_center_distance=args.min_center_distance,
+        cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
+        output_size=64,  # Output grid size for Cartesian transform
+        only_complete_sequences=args.only_complete_sequences,  # Filter out sequences with missing frames
     )
 
     print(f'Train loader and Valid loader are up! Lengths: {len(train_dl)}, {len(val_dl)}')
     print(f'Using normalization method: {args.normalization_type}')
+
+    # Overfitting on a single trajectory
+    if args.overfit_single:
+        if accelerator.is_main_process:
+            print("🎯 OVERFITTING MODE: Using only 1 trajectory")
+
+        # Get one batch from the training set (batch_images, batch_conditions)
+        batch_images, batch_conditions = next(iter(train_dl))
+
+        if accelerator.is_main_process:
+            print(f"   Original batch shapes: images={batch_images.shape}, conditions={batch_conditions.shape}")
+
+        # Extract the FIRST sample from the batch (remove batch dimension)
+        # batch_images: [batch_size, seq_len, C, H, W] -> [seq_len, C, H, W]
+        # batch_conditions: [batch_size, seq_len, num_cond] -> [seq_len, num_cond]
+        single_image = batch_images[0]
+        single_condition = batch_conditions[0]
+
+        if accelerator.is_main_process:
+            print(f"   Single sample shapes: images={single_image.shape}, conditions={single_condition.shape}")
+
+        # Create a dataset that repeats this single sample
+        class SingleSampleDataset(torch.utils.data.Dataset):
+            def __init__(self, image, condition, repeat=1000):
+                self.image = image
+                self.condition = condition
+                self.repeat = repeat
+
+            def __len__(self):
+                return self.repeat
+
+            def __getitem__(self, idx):
+                return self.image, self.condition
+
+        # Repeat the single sample enough times for a reasonable epoch
+        # With batch_size, this gives ~100 batches per epoch for quick overfitting tests
+        repeat_count = 10000 * args.batch_size
+        single_dataset = SingleSampleDataset(single_image, single_condition, repeat=repeat_count)
+
+        if accelerator.is_main_process:
+            print(f"   Dataset size: {repeat_count} samples = {repeat_count // args.batch_size} batches per epoch")
+
+        # Create new dataloader with the single sample
+        # Use original batch_size so the model sees the expected batch dimension
+        train_dl = torch.utils.data.DataLoader(
+            single_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        # Also use the same single sample for validation
+        val_dl = torch.utils.data.DataLoader(
+            single_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        if accelerator.is_main_process:
+            print(f"   New dataloader will produce batches of size {args.batch_size} with the same trajectory repeated")
 
     lr = opt_config['lr'] if args.lr is None else args.lr
     groups = inner_model.param_groups(lr)
@@ -393,7 +496,11 @@ def main():
 
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
-    inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    if not args.overfit_single:
+        inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    else:
+        # For overfitting mode, don't prepare dataloaders (they're already simple)
+        inner_model, inner_model_ema, opt = accelerator.prepare(inner_model, inner_model_ema, opt)
 
     use_wandb = args.use_wandb
 
@@ -433,6 +540,7 @@ def main():
         ema_stats = ckpt.get('ema_stats', ema_stats)
         epoch = ckpt['epoch'] + 1
         step = ckpt['step'] + 1
+        wandb_step = ckpt.get('wandb_step', 0)  # Load wandb_step if resuming
         if args.gns and ckpt.get('gns_stats', None) is not None:
             gns_stats.load_state_dict(ckpt['gns_stats'])
         demo_gen.set_state(ckpt['demo_gen'])
@@ -442,6 +550,7 @@ def main():
     else:
         epoch = 0
         step = 0
+        wandb_step = 0  # Start from 0 for new runs
 
     if args.reset_ema:
         unwrap(model.inner_model).load_state_dict(unwrap(model_ema.inner_model).state_dict())
@@ -473,6 +582,7 @@ def main():
             'ema_sched': ema_sched.state_dict(),
             'epoch': epoch,
             'step': step,
+            'wandb_step': wandb_step,
             'gns_stats': gns_stats.state_dict() if gns_stats is not None else None,
             'ema_stats': ema_stats,
             'demo_gen': demo_gen.get_state(),
@@ -587,12 +697,12 @@ def main():
                                 'gpu/memory_allocated_gb': torch.cuda.memory_allocated(device) / (1024 ** 3),
                                 'gpu/memory_reserved_gb': torch.cuda.memory_reserved(device) / (1024 ** 3),
                                 'gpu/max_memory_allocated_gb': torch.cuda.max_memory_allocated(device) / (1024 ** 3),
-                                'step': step,
                                 'train/loss_step': loss_disp,
                                 'train/avg_loss': avg_loss,
-                            })
+                            }, step=wandb_step)
 
                 step += 1
+                wandb_step += 1
 
                 if step == args.end_step:
                     if accelerator.is_main_process:
@@ -642,71 +752,119 @@ def main():
             # Sampling and Visualization
             
             if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
-                
-                # Test sampling 
-                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, 24, 360), num_pred_frames=args.predict_steps).cpu()
-                
+
+                # Get spatial dimensions based on cartesian_transform flag
+                if args.cartesian_transform:
+                    spatial_shape = (64, 64)
+                else:
+                    spatial_shape = (24, 360)
+
+                # Test sampling
+                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
+
                 import matplotlib.pyplot as plt
                 import imageio
                 import numpy as np
                 import torch
-                from util import plot_polar_ionosphere_single, plot_polar_ionosphere_comparison
                 import io
 
                 # Get the generated sample and target for comparison
-                generated_sample = samples[0]  # shape: [predict_steps, 24, 360]
-                target_sample = target_img[0].cpu().numpy()  # shape: [predict_steps, 24, 360]
-                
-                # For visualization, use the first prediction step (you can modify this to show all steps)
-                generated_sample_np = generated_sample[0].cpu().numpy()  # shape: [24, 360] - first predicted frame
-                target_sample_first = target_sample[0]  # shape: [24, 360] - first target frame
-                
-                # Revert transformation to original scale for better visualization
-                generated_sample_orig = generated_sample_np * 55000.0
-                target_sample_orig = target_sample_first * 55000.0
+                generated_sample = samples[0]  # shape: [predict_steps, H, W]
+                target_sample = target_img[0].cpu().numpy()  # shape: [predict_steps, H, W]
 
-                # Create visualizations based on prediction steps
-                if args.predict_steps == 1:
-                    # Single step prediction - show comparison
-                    fig_comparison, _ = plot_polar_ionosphere_comparison(
-                        data_original=target_sample_orig,
-                        data_pred=generated_sample_orig, 
-                        titles=["Target (Ground Truth)", "Generated Prediction"],
-                        cmap='plasma',
-                        figsize=(16, 8)
-                    )
-                    
-                    fig_single, _ = plot_polar_ionosphere_single(
-                        data=generated_sample_orig,
-                        title=f"Generated Ionosphere Prediction - Epoch {epoch}",
-                        cmap='plasma',
-                        figsize=(10, 10)
-                    )
+                # For visualization, use the first prediction step (you can modify this to show all steps)
+                generated_sample_np = generated_sample[0].cpu().numpy()  # shape: [H, W] - first predicted frame
+                target_sample_first = target_sample[0]  # shape: [H, W] - first target frame
+
+                # Revert transformation to original scale for better visualization
+                generated_sample_orig = generated_sample_np * 80000.0
+                target_sample_orig = target_sample_first * 80000.0
+
+                # Create visualizations based on cartesian_transform and prediction steps
+                if args.cartesian_transform:
+                    # Use regular imshow for Cartesian data (224x224)
+                    if args.predict_steps == 1:
+                        # Single step prediction - show comparison
+                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
+                        im0 = axes[0].imshow(target_sample_orig, cmap='plasma', aspect='auto')
+                        axes[0].set_title("Target (Ground Truth)")
+                        axes[0].axis('off')
+                        plt.colorbar(im0, ax=axes[0], shrink=0.8)
+
+                        im1 = axes[1].imshow(generated_sample_orig, cmap='plasma', aspect='auto')
+                        axes[1].set_title("Generated Prediction")
+                        axes[1].axis('off')
+                        plt.colorbar(im1, ax=axes[1], shrink=0.8)
+
+                        fig_single, ax = plt.subplots(figsize=(10, 10))
+                        im = ax.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
+                        ax.set_title(f"Generated Ionosphere Prediction - Epoch {epoch}")
+                        ax.axis('off')
+                        plt.colorbar(im, ax=ax, shrink=0.8)
+                    else:
+                        # Multi-step prediction
+                        generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 224, 224]
+                        target_all_orig = target_sample * 80000.0  # [predict_steps, 224, 224]
+
+                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
+                        im0 = axes[0].imshow(target_all_orig[0], cmap='plasma', aspect='auto')
+                        axes[0].set_title("Target Step 1")
+                        axes[0].axis('off')
+                        plt.colorbar(im0, ax=axes[0], shrink=0.8)
+
+                        im1 = axes[1].imshow(generated_all_orig[0], cmap='plasma', aspect='auto')
+                        axes[1].set_title("Generated Step 1")
+                        axes[1].axis('off')
+                        plt.colorbar(im1, ax=axes[1], shrink=0.8)
+                        fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}", fontsize=16)
+
+                        # Single plot shows the last predicted frame
+                        fig_single, ax = plt.subplots(figsize=(10, 10))
+                        im = ax.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
+                        ax.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}")
+                        ax.axis('off')
+                        plt.colorbar(im, ax=ax, shrink=0.8)
                 else:
-                    # Multi-step prediction - show sequence evolution
-                    generated_all_orig = generated_sample.cpu().numpy() * 55000.0  # [predict_steps, 24, 360]
-                    target_all_orig = target_sample * 55000.0  # [predict_steps, 24, 360]
-                    
-                    # Create batch visualization of all predicted steps
-                    titles_gen = [f"Generated Step {i+1}/{args.predict_steps}" for i in range(args.predict_steps)]
-                    titles_target = [f"Target Step {i+1}/{args.predict_steps}" for i in range(args.predict_steps)]
-                    
-                    fig_comparison, _ = plot_polar_ionosphere_comparison(
-                        data_original=target_all_orig[0],
-                        data_pred=generated_all_orig[0], 
-                        titles=["Target Step 1", "Generated Step 1"],
-                        cmap='plasma',
-                        figsize=(16, 8)
-                    )
-                    fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}\nTop: Targets, Bottom: Generated", fontsize=16)
-                    
-                    # Single plot shows the last predicted frame
-                    fig_single, _ = plot_polar_ionosphere_single(
-                        data=generated_all_orig[-1],  # Last predicted frame
-                        title=f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}",
-                        cmap='plasma',
-                        figsize=(10, 10)
-                    )
+                    # Use polar plotting for polar data (24x360)
+                    from util import plot_polar_ionosphere_single, plot_polar_ionosphere_comparison
+
+                    if args.predict_steps == 1:
+                        # Single step prediction - show comparison
+                        fig_comparison, _ = plot_polar_ionosphere_comparison(
+                            data_original=target_sample_orig,
+                            data_pred=generated_sample_orig,
+                            titles=["Target (Ground Truth)", "Generated Prediction"],
+                            cmap='plasma',
+                            figsize=(16, 8)
+                        )
+
+                        fig_single, _ = plot_polar_ionosphere_single(
+                            data=generated_sample_orig,
+                            title=f"Generated Ionosphere Prediction - Epoch {epoch}",
+                            cmap='plasma',
+                            figsize=(10, 10)
+                        )
+                    else:
+                        # Multi-step prediction - show sequence evolution
+                        generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 24, 360]
+                        target_all_orig = target_sample * 80000.0  # [predict_steps, 24, 360]
+
+                        fig_comparison, _ = plot_polar_ionosphere_comparison(
+                            data_original=target_all_orig[0],
+                            data_pred=generated_all_orig[0],
+                            titles=["Target Step 1", "Generated Step 1"],
+                            cmap='plasma',
+                            figsize=(16, 8)
+                        )
+                        fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}\nTop: Targets, Bottom: Generated", fontsize=16)
+
+                        # Single plot shows the last predicted frame
+                        fig_single, _ = plot_polar_ionosphere_single(
+                            data=generated_all_orig[-1],  # Last predicted frame
+                            title=f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}",
+                            cmap='plasma',
+                            figsize=(10, 10)
+                        )
                 
                 # Convert matplotlib figures to images for wandb
                 buf = io.BytesIO()
@@ -720,10 +878,10 @@ def main():
                 # Create traditional sequence animation for gif
                 frames = []
                 # For sequence, show the conditioning frames + all generated frames
-                full_sequence = torch.cat([cond_img[0].cpu(), target_img[0].cpu()], dim=0)  # [sequence_length, 24, 360]
-                
+                full_sequence = torch.cat([cond_img[0].cpu(), target_img[0].cpu()], dim=0)  # [sequence_length, H, W]
+
                 # Also create sequence with generated samples
-                generated_full_sequence = torch.cat([cond_img[0].cpu(), generated_sample.cpu()], dim=0)  # [conditioning_length + predict_steps, 24, 360]
+                generated_full_sequence = torch.cat([cond_img[0].cpu(), generated_sample.cpu()], dim=0)  # [conditioning_length + predict_steps, H, W]
                 
                 # Dynamically set figsize
                 img_h, img_w = full_sequence.shape[1], full_sequence.shape[2]
@@ -733,7 +891,7 @@ def main():
 
                 # Create frames for target sequence
                 for t in range(full_sequence.shape[0]):
-                    img = full_sequence[t].cpu().numpy() * 55000.0  # Original scale
+                    img = full_sequence[t].cpu().numpy() * 80000.0  # Original scale
                     fig, ax = plt.subplots(figsize=figsize)
                     im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
                     
@@ -799,8 +957,8 @@ def main():
                     from PIL import Image
                     
                     # Calculate metrics for all prediction steps
-                    generated_all_orig = generated_sample.cpu().numpy() * 108154.0  # [predict_steps, 24, 360]
-                    target_all_orig = target_sample * 55000.0  # [predict_steps, 24, 360]
+                    generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
+                    target_all_orig = target_sample * 80000.0  # [predict_steps, H, W]
                     
                     # Overall metrics across all prediction steps
                     mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
@@ -830,7 +988,7 @@ def main():
                             eval_dict[f'evaluation/mse_step_{step+1}'] = step_mse
                             eval_dict[f'evaluation/mae_step_{step+1}'] = step_mae
                     
-                    wandb.log(eval_dict)
+                    wandb.log(eval_dict, step=wandb_step)
                 
                 # Clean up
                 plt.close(fig_comparison)
@@ -842,25 +1000,25 @@ def main():
             if use_wandb:
                 # Calculate max-min difference after reverting transformation
                 # Use current batch target_img for consistent max-min calculation
-                target_img_reverted = target_img * 55000.0  # [batch_size, predict_steps, 24, 360]
-                
+                target_img_reverted = target_img * 80000.0  # [batch_size, predict_steps, H, W]
+
                 if args.predict_steps == 1:
                     # Single frame prediction - use the single frame
                     target_reverted_flat = target_img_reverted.flatten()
                     max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted = generated_sample[0].cpu().numpy() * 55000.0  # [24, 360]
+                    pred_reverted = generated_sample[0].cpu().numpy() * 80000.0  # [H, W]
                     pred_reverted_flat = pred_reverted.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
                 else:
                     # Multi-step prediction - compute max-min across entire predicted sequence
-                    # Reshape to [batch_size * predict_steps, 24, 360] then flatten
-                    target_reverted_seq = target_img_reverted.reshape(-1, 24, 360)  # [batch_size * predict_steps, 24, 360]
+                    # Reshape to [batch_size * predict_steps, H, W] then flatten
+                    target_reverted_seq = target_img_reverted.reshape(-1, *spatial_shape)  # [batch_size * predict_steps, H, W]
                     target_reverted_flat = target_reverted_seq.flatten()
                     max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted_seq = generated_sample.cpu().numpy() * 55000.0  # [predict_steps, 24, 360]
-                    pred_reverted_seq = pred_reverted_seq.reshape(-1, 24, 360)  # [predict_steps, 24, 360]
+                    pred_reverted_seq = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
+                    pred_reverted_seq = pred_reverted_seq.reshape(-1, *spatial_shape)  # [predict_steps, H, W]
                     pred_reverted_flat = pred_reverted_seq.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
 
@@ -890,7 +1048,7 @@ def main():
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
 
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=wandb_step)
 
                 # Reset peak memory stats for next epoch
                 if device.type == 'cuda':
