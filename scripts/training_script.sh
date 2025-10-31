@@ -14,7 +14,7 @@
 SEQUENCE_LENGTH=30
 PREDICT_STEPS=15
 CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_15_big_cosine_solar.json"
-CSV_PATH="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/l1_earth_associated_with_maps.csv"
+CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
 BATCH_SIZE=1
 DIR_NAME="cond_forecasting_15frames_overfit_15step_v4_cartesian_coordinates"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
