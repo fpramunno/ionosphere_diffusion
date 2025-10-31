@@ -1,0 +1,48 @@
+{
+    "model": {
+        "type": "palette_unet",
+        "c_in": 6,
+        "c_out": 1,
+        "image_size": 64,
+        "time_dim": 256,
+        "device": "cuda",
+        "latent": false,
+        "true_img_size": 64,
+        "num_classes": null,
+        "in_channels": 1,
+        "input_size": [24, 360],
+        "out_channels": 1,
+        "spatial": 3,
+        "channel_mapping_cond": 30,
+        "channel_mults": [4, 4, 8, 12],
+        "num_res_blocks": 2,
+        "attention_resolutions": [],
+        "num_bottleneck_blocks": 3,
+        "has_variance": false,
+        "loss_config": "karras",
+        "loss_weighting": "soft-min-snr",
+        "sigma_data": 0.5,
+        "sigma_min": 0.01,
+        "sigma_max": 100.0,
+        "sigma_sample_density": {
+            "type": "cosine-interpolated"
+        }
+    },
+    "optimizer": {
+        "type": "adamw",
+        "lr": 1e-4,
+        "betas": [0.95, 0.999],
+        "eps": 1e-6,
+        "weight_decay": 1e-3
+    },
+    "lr_sched": {
+        "type": "cosine",
+        "warmup_epochs": 2,
+        "eta_min_factor": 100
+    },
+    "ema_sched": {
+        "type": "inverse",
+        "power": 0.6667,
+        "max_value": 0.9999
+    }
+}
