@@ -10,7 +10,6 @@ wandb/
 wandb/
 *.log
 *.out
-*.txt
 *.json
 *.csv
 *.pth
