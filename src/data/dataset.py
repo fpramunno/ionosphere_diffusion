@@ -652,7 +652,7 @@ class IonoSequenceDataset(Dataset):
                     file_idx = start_idx + i
                     if 0 <= file_idx < len(self.all_files):
                         file_path = self.all_files[file_idx]
-                        data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True)
+                        data = np.load('/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/' + file_path, allow_pickle=True)
                         sample_data.append(data[0])
             except Exception as e:
                 print(f"Warning: Could not load sequence {seq_idx}: {e}")
@@ -773,7 +773,7 @@ class IonoSequenceDataset(Dataset):
             if frame_exists:
                 # Load the actual frame
                 file_path = self.all_files[file_idx]
-                data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True)
+                data = np.load('/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/' + file_path, allow_pickle=True)
 
                 # Apply Cartesian transformation if enabled
                 data_map = data[0].astype(np.float32)

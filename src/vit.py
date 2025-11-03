@@ -23,8 +23,8 @@ from einops import rearrange
 from torch.nn import functional as F
 
 
-import xformers.components.attention.core as xfa
-import xformers.sparse as xfs
+# import xformers.components.attention.core as xfa
+# import xformers.sparse as xfs
     
 from einops.layers.torch import Rearrange
 from torch import Tensor
@@ -78,7 +78,7 @@ class MultiheadSelfAttention(nn.Module):
         self,
         x: Tensor,
         theta: Optional[Tensor] = None,
-        mask: Optional[Union[Tensor, xfs.SparseCSRTensor]] = None,
+        mask: Optional[Union[Tensor]] = None,# xfs.SparseCSRTensor]] = None,
     ) -> Tensor:
         r"""
         Arguments:
@@ -99,23 +99,23 @@ class MultiheadSelfAttention(nn.Module):
             theta = rearrange(theta, "... L (H C) -> ... H L C", H=self.heads)
             q, k = apply_rope(q, k, theta)
 
-        if isinstance(mask, xfs.SparseCSRTensor):
-            y = xfa.scaled_dot_product_attention(
-                q=rearrange(q, "... L C -> (...) L C"),
-                k=rearrange(k, "... L C -> (...) L C"),
-                v=rearrange(v, "... L C -> (...) L C"),
-                att_mask=xfa.SparseCS._wrap(mask),
-                dropout=self.dropout if self.training else None,
-            )
-            y = y.reshape(q.shape[:-2] + y.shape[-2:])
-        else:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=mask,
-                dropout_p=self.dropout.p if self.training else 0,
-            )
+        # if isinstance(mask, xfs.SparseCSRTensor):
+        #     y = xfa.scaled_dot_product_attention(
+        #         q=rearrange(q, "... L C -> (...) L C"),
+        #         k=rearrange(k, "... L C -> (...) L C"),
+        #         v=rearrange(v, "... L C -> (...) L C"),
+        #         att_mask=xfa.SparseCS._wrap(mask),
+        #         dropout=self.dropout if self.training else None,
+        #     )
+        #     y = y.reshape(q.shape[:-2] + y.shape[-2:])
+        # else: !TODO remove later
+        y = torch.nn.functional.scaled_dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=mask,
+            dropout_p=self.dropout.p if self.training else 0,
+        )
 
         y = rearrange(y, "... H L C -> ... L (H C)")
         y = self.y_proj(y)
@@ -126,7 +126,7 @@ class MultiheadSelfAttention(nn.Module):
         self,
         x: Tensor,
         theta: Optional[Tensor] = None,
-        mask: Optional[Union[Tensor, xfs.SparseCSRTensor]] = None,
+        mask: Optional[Union[Tensor]] = None, # xfs.SparseCSRTensor]] = None,
     ) -> Tensor:
         if self.checkpointing:
             return checkpoint(self._forward, x, theta, mask, use_reentrant=False)
@@ -535,8 +535,8 @@ class ViT(nn.Module):
         delta = torch.minimum(delta, delta.new_tensor(shape) - delta)
         mask = torch.all(delta <= coo.new_tensor(window_size) // 2, dim=-1)
 
-        if xfa._has_cpp_library:
-            mask = xfa.SparseCS(mask, device=mask.device)._mat
+        # if xfa._has_cpp_library:
+        #     mask = xfa.SparseCS(mask, device=mask.device)._mat !TODO remove later
 
         return coo.to(dtype=dtype), mask
 

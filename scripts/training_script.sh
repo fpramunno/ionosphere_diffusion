@@ -1,27 +1,27 @@
 #!/bin/bash
-#SBATCH --gres=gpu:1 
+#SBATCH --job-name=overfit
+#SBATCH --partition=normal
 #SBATCH --nodes=1
-#SBATCH --nodelist=server0094
-#SBATCH --time=7-00:00:00
-#SBATCH --partition=performance
-#SBATCH --job-name="overfit"
+#SBATCH --gres=gpu:4
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12           # give enough CPU threads to feed 4 GPUs
+#SBATCH --time=24:00:00
+#SBATCH --output=./logs/out/out_overfit_15step_v4_cartesian_coordinates.log
 #SBATCH --error=./logs/err/err_overfit_15step_v4_cartesian_coordinates.log
-#SBATCH --out=./logs/out/out_overfit_15step_v4_cartesian_coordinates.log
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
 
 # Default values - you can modify these or pass them as command line arguments
 SEQUENCE_LENGTH=30
 PREDICT_STEPS=15
-CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_15_big_cosine_solar.json"
+CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar.json"
 CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
-BATCH_SIZE=1
-DIR_NAME="cond_forecasting_15frames_overfit_15step_v4_cartesian_coordinates"
+BATCH_SIZE=6
+DIR_NAME="cond_forecasting_15frames_overfit_v4_cartesian_coordinates_cscs"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-WANDB_RUN_NAME="iono_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_overfit_v4_cartesian_coordinates"
+WANDB_RUN_NAME="iono_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_overfit_v4_cartesian_coordinates_cscs"
 NORM_TYPE="absolute_max"  # "absolute_max" or "mean_sigma_tanh"
 
-python3 training_pred.py \
+#python3 if i want to use 1 gpu
+accelerate launch training_pred.py \ 
     --config $CONFIG_PATH \
     --sequence-length $SEQUENCE_LENGTH \
     --predict-steps $PREDICT_STEPS \
@@ -35,7 +35,7 @@ python3 training_pred.py \
     --mixed-precision bf16 \
     --use-wandb \
     --overfit-single \
-    --grad-accum-steps 6 \
+    --grad-accum-steps 1 \
     --only-complete-sequences \
     --cartesian-transform
 

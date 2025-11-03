@@ -22,3 +22,6 @@ models_results/
 solar/
 *.pdf
 RAE/
+*.pyc
+__pycache__/
+core_daint-ln001_122339

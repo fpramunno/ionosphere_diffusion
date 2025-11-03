@@ -48,9 +48,9 @@ def main():
                 help='compile the model')
     p.add_argument('--config', type=str, required=True,
                 help='the configuration file')
-    p.add_argument('--data-path', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps",
+    p.add_argument('--data-path', type=str, default="/users/framunno/data/ionosphere/ionosphere_data/pickled_maps",
                 help='the path of the dataset')
-    p.add_argument('--saving-path', type=str, default="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/models_results", 
+    p.add_argument('--saving-path', type=str, default="/users/framunno/models_results", 
                 help='the path where to save the model')
     p.add_argument('--dir-name', type=str, default='cond_forecasting_cfg_oneframe_nonorm',
                 help='the directory name to use')  # <---- Added this line
@@ -93,9 +93,9 @@ def main():
                 help='the total length of the sequence (conditioning + prediction)')
     p.add_argument('--predict-steps', type=int, default=1,
                 help='number of future steps to predict')
-    p.add_argument('--csv-path', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/npy_metrics.csv",
+    p.add_argument('--csv-path', type=str, default="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv",
                 help='path to the main CSV file with metrics')
-    p.add_argument('--transform-cond-csv', type=str, default="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv",
+    p.add_argument('--transform-cond-csv', type=str, default="/users/framunno/data/ionosphere/params.csv",
                 help='path to the transform condition CSV file')
     p.add_argument('--normalization-type', type=str, default="absolute_max",
                 choices=["absolute_max", "mean_sigma_tanh", "ionosphere_preprocess"],
@@ -958,8 +958,8 @@ def main():
                     
                     # Calculate metrics for all prediction steps
                     generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                    target_all_orig = target_sample * 80000.0  # [predict_steps, H, W]
-                    
+                    target_all_orig = (torch.cat([cond_img, target_img], dim=1) * 80000.0).cpu().numpy()  # [predict_steps, H, W]
+
                     # Overall metrics across all prediction steps
                     mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
                     mae_overall = np.mean(np.abs(generated_all_orig - target_all_orig))
@@ -998,9 +998,16 @@ def main():
                 
             # **wandb Logging (Now Includes Validation Loss and Max-Min Difference)**
             if use_wandb:
+                # Get spatial dimensions based on cartesian_transform flag
+                if args.cartesian_transform:
+                    spatial_shape = (64, 64)
+                else:
+                    spatial_shape = (24, 360)
+
                 # Calculate max-min difference after reverting transformation
                 # Use current batch target_img for consistent max-min calculation
-                target_img_reverted = target_img * 80000.0  # [batch_size, predict_steps, H, W]
+                # torch.cat([unet_cond, noised_input], dim=1)
+                target_img_reverted = torch.cat([cond_img, target_img], dim=1) * 80000.0  # [batch_size, predict_steps, H, W]
 
                 if args.predict_steps == 1:
                     # Single frame prediction - use the single frame

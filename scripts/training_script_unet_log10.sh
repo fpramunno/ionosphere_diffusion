@@ -1,30 +1,42 @@
 #!/bin/bash
-#SBATCH --gres=gpu:1
+#SBATCH --job-name=overfit
+#SBATCH --partition=normal
 #SBATCH --nodes=1
-#SBATCH --nodelist=server0094
-#SBATCH --time=7-00:00:00
-#SBATCH --partition=performance
-#SBATCH --job-name="unet_log10"
-#SBATCH --error=./logs/err/err_unet_15step_absolute_max.log
-#SBATCH --out=./logs/out/out_unet_15step_absolute_max.log
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --gres=gpu:4
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12           # give enough CPU threads to feed 4 GPUs
+#SBATCH --time=24:00:00
+#SBATCH -A sk035
+#SBATCH --output=/users/framunno/logs/out/out_overfit_15step_v4_cartesian_coordinates_absmax.log
+#SBATCH --error=/users/framunno/logs/err/err_overfit_15step_v4_cartesian_coordinates_absmax.log
+
+# Load your environment
+source /users/framunno/envs/ionosphere/bin/activate
 
 # Configuration for UNet with log10 preprocessing
 SEQUENCE_LENGTH=30
 PREDICT_STEPS=15
-CONFIG_PATH="/mnt/nas05/data01/francesco/progetto_simone/ionosphere/configs/forecast_iono_unet.json"
-CSV_PATH="/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/l1_earth_associated_with_maps.csv"
+CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_unet.json"
+CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
 BATCH_SIZE=1
-DIR_NAME="unet_forecast_15frames_overfit_absolute_max"
+DIR_NAME="unet_forecast_15frames_overfit_absolute_max_cscs"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-WANDB_RUN_NAME="unet_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max"
+WANDB_RUN_NAME="unet_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_cscs"
 
 # Preprocessing settings
 NORM_TYPE="absolute_max" #"ionosphere_preprocess"  # Use new SDO-style preprocessing
 PREPROCESS_SCALING="log10"  # Options: None, "log10", "sqrt", "symlog"
 
-python3 training_pred.py \
+mkdir -p /users/framunno/logs/out
+mkdir -p /users/framunno/logs/err
+
+#python3 if i want to use 1 gpu
+#accelerate launch training_pred.py \ 
+accelerate launch \
+    --mixed_precision bf16 \
+    --num_processes 4 \
+    --num_machines 1 \
+    training_pred.py \
     --config $CONFIG_PATH \
     --sequence-length $SEQUENCE_LENGTH \
     --predict-steps $PREDICT_STEPS \
@@ -38,7 +50,7 @@ python3 training_pred.py \
     --mixed-precision bf16 \
     --use-wandb \
     --overfit-single \
-    --grad-accum-steps 6 \
+    --grad-accum-steps 1 \
     --only-complete-sequences \
     --cartesian-transform
-    # --preprocess-scaling $PREPROCESS_SCALING \
+    # --preprocess-scaling $PREPROCESS_SCALING
