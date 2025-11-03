@@ -36,7 +36,7 @@ def main():
 
     from util import generate_samples
     import torch
-    from src.data.dataset import get_data_objects, get_sequence_data_objects
+    from src.data.dataset import get_data_objects, get_sequence_data_objects, get_sequence_data_objects_iterable
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -130,6 +130,16 @@ def main():
     p.add_argument('--only-complete-sequences', action='store_true',
                 help='only use sequences with no missing frames (no zero-padded frames)')
 
+    # FSDP and scaling arguments
+    p.add_argument('--use-fsdp', action='store_true',
+                help='use FSDP config (make sure to use configs/accelerate_config_fsdp.yaml)')
+    p.add_argument('--activation-checkpointing', action='store_true',
+                help='enable activation checkpointing (saves memory, slight compute overhead)')
+    p.add_argument('--compile-model', action='store_true',
+                help='use torch.compile for 20-30%% speedup (requires PyTorch 2.0+)')
+    p.add_argument('--use-iterable-dataset', action='store_true',
+                help='use IterableDataset for proper multi-GPU/multi-worker sharding (RECOMMENDED for scaling!)')
+
     args = p.parse_args()
 
     # Apply debug mode settings
@@ -184,8 +194,8 @@ def main():
     size = model_config['input_size']
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps,
-                                            mixed_precision=args.mixed_precision, 
-                kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)])
+                                            mixed_precision=args.mixed_precision,
+                kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=False)])
 
     device = accelerator.device
     unwrap = accelerator.unwrap_model
@@ -193,7 +203,16 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         print(f'World size: {accelerator.num_processes}', flush=True)
-        print(f'Batch size: {args.batch_size * accelerator.num_processes}', flush=True)
+        print(f'Batch size per GPU: {args.batch_size}', flush=True)
+        print(f'Global batch size: {args.batch_size * accelerator.num_processes}', flush=True)
+        print(f'Effective batch size: {args.batch_size * accelerator.num_processes * args.grad_accum_steps}', flush=True)
+        print(f'Mixed precision: {args.mixed_precision}', flush=True)
+        if args.use_fsdp:
+            print(f'Using FSDP: ✅')
+        if args.activation_checkpointing:
+            print(f'Activation checkpointing: ✅')
+        if args.compile_model:
+            print(f'Torch compile: ✅')
 
     if args.seed is not None:
         seeds = torch.randint(-2 ** 63, 2 ** 63 - 1, [accelerator.num_processes], generator=torch.Generator().manual_seed(args.seed))
@@ -201,13 +220,24 @@ def main():
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
     elapsed = 0.0
 
-    # Model definition,
+    # Model definition
     inner_model = K.config.make_model(config)
     inner_model_ema = deepcopy(inner_model)
 
-    if args.compile:
-        inner_model.compile()
-        # inner_model_ema.compile()
+    # Enable activation checkpointing if requested (saves memory)
+    if args.activation_checkpointing or args.checkpointing:
+        # This will use gradient checkpointing in transformer blocks
+        if hasattr(inner_model, 'set_gradient_checkpointing'):
+            inner_model.set_gradient_checkpointing(True)
+            if accelerator.is_main_process:
+                print("✅ Enabled gradient checkpointing on model")
+
+    # Apply torch.compile for speedup
+    if args.compile or args.compile_model:
+        if accelerator.is_main_process:
+            print("Compiling model with torch.compile...")
+        inner_model = torch.compile(inner_model, mode='max-autotune')
+        # Don't compile EMA model (not used in training loop)
 
     if accelerator.is_main_process:
         print(f'Parameters: {K.utils.n_params(inner_model):,}')
@@ -299,11 +329,18 @@ def main():
                 print(f"  Scale factor: {preprocess_config['scale_factor']}")
             print(f"{'='*80}\n")
 
-    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
+    # Choose between regular Dataset and IterableDataset
+    if args.use_iterable_dataset:
+        print("✅ Using IterableDataset for proper multi-GPU/multi-worker sharding!")
+        get_data_fn = get_sequence_data_objects_iterable
+    else:
+        print("Using regular Dataset (map-style)")
+        get_data_fn = get_sequence_data_objects
+
+    train_dataset, train_sampler, train_dl = get_data_fn(
         csv_path=args.csv_path,
         transform_cond_csv=args.transform_cond_csv,
         batch_size=args.batch_size,
-        distributed=False,
         num_data_workers=args.num_workers,
         split='train',
         seed=42,
@@ -312,16 +349,17 @@ def main():
         preprocess_config=preprocess_config,
         use_l1_conditions=True,
         min_center_distance=args.min_center_distance,
-        cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
-        output_size=64,  # Output grid size for Cartesian transform
-        only_complete_sequences=args.only_complete_sequences,  # Filter out sequences with missing frames
+        cartesian_transform=args.cartesian_transform,
+        output_size=64,
+        only_complete_sequences=args.only_complete_sequences,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
-    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
+    val_dataset, val_sampler, val_dl = get_data_fn(
         csv_path=args.csv_path,
         transform_cond_csv=args.transform_cond_csv,
         batch_size=args.batch_size,
-        distributed=False,
         num_data_workers=args.num_workers,
         split='valid',
         seed=42,
@@ -330,9 +368,11 @@ def main():
         preprocess_config=preprocess_config,
         use_l1_conditions=True,
         min_center_distance=args.min_center_distance,
-        cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
-        output_size=64,  # Output grid size for Cartesian transform
-        only_complete_sequences=args.only_complete_sequences,  # Filter out sequences with missing frames
+        cartesian_transform=args.cartesian_transform,
+        output_size=64,
+        only_complete_sequences=args.only_complete_sequences,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     print(f'Train loader and Valid loader are up! Lengths: {len(train_dl)}, {len(val_dl)}')
@@ -372,7 +412,6 @@ def main():
                 return self.image, self.condition
 
         # Repeat the single sample enough times for a reasonable epoch
-        # With batch_size, this gives ~100 batches per epoch for quick overfitting tests
         repeat_count = 10000 * args.batch_size
         single_dataset = SingleSampleDataset(single_image, single_condition, repeat=repeat_count)
 
@@ -596,6 +635,17 @@ def main():
             wandb.save(filename)
 
     losses_since_last_print = []
+
+    # PROFILING: Track timing for different parts of training loop
+    timing_stats = {
+        'data_loading': [],
+        'data_transfer': [],
+        'forward': [],
+        'backward': [],
+        'optimizer': [],
+        'ema': [],
+    }
+
     model = model.to(device)
     try:
         while args.max_epochs is None or epoch < args.max_epochs:
@@ -603,33 +653,28 @@ def main():
             epoch_train_loss = 0  # Track total training loss
             num_train_batches = len(train_dl)  # Number of batches
             model.train()
+
+            batch_start_time = time.perf_counter()
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
-                if device.type == 'cuda':
-                    start_timer = torch.cuda.Event(enable_timing=True)
-                    end_timer = torch.cuda.Event(enable_timing=True)
-                    torch.cuda.synchronize()
-                    start_timer.record()
-                else:
-                    start_timer = time.time()
-                
-                print('Here')
+                # TIMING: Data loading time
+                data_load_time = time.perf_counter() - batch_start_time
+                timing_stats['data_loading'].append(data_load_time)
+
                 with accelerator.accumulate(model):
-                    # Track memory before processing
-                    torch.cuda.synchronize()
-                    mem_before = torch.cuda.memory_allocated(device) / (1024 ** 3)  # Convert to GB
-                    reserved_before = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
-                    # print(f"Memory before processing: Allocated: {mem_before:.2f} GB, Reserved: {reserved_before:.2f} GB")
-
-                    # embed()
-
+                    # TIMING: Data transfer to GPU
+                    transfer_start = time.perf_counter()
                     inpt = batch[0].contiguous().float().to(device, non_blocking=True)
                     inpt = inpt.squeeze(2)  # shape: (batch_size, sequence_length, 24, 360)
                     cond_img = inpt[:, :args.conditioning_length, :, :]    # first conditioning_length time steps
                     target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
                     cond_label = batch[1].to(device, non_blocking=True)
-
                     cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
+                    torch.cuda.synchronize()  # Wait for transfers to complete
+                    transfer_time = time.perf_counter() - transfer_start
+                    timing_stats['data_transfer'].append(transfer_time)
 
+                    # TIMING: Forward pass
+                    forward_start = time.perf_counter()
                     extra_args = {}
                     noise = torch.randn_like(target_img).to(device)
                     with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
@@ -637,21 +682,24 @@ def main():
 
                     with K.models.checkpointing(args.checkpointing):
                         losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=cond_label_inp, **extra_args)
+                    torch.cuda.synchronize()  # Wait for forward to complete
+                    forward_time = time.perf_counter() - forward_start
+                    timing_stats['forward'].append(forward_time)
 
                     # Evita NCCL timeout: non fare gather durante il training!
                     loss = losses.mean().item()
                     losses_since_last_print.append(loss)
                     epoch_train_loss += loss  # Accumulate loss
 
-                    # Backward pass
+                    # TIMING: Backward pass
+                    backward_start = time.perf_counter()
                     accelerator.backward(losses.mean())
+                    torch.cuda.synchronize()  # Wait for backward to complete
+                    backward_time = time.perf_counter() - backward_start
+                    timing_stats['backward'].append(backward_time)
 
-                    # Track memory after backward pass
-                    torch.cuda.synchronize()
-                    mem_after_backward = torch.cuda.memory_allocated(device) / (1024 ** 3)  # Convert to GB
-                    reserved_after_backward = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
-                    # print(f"Memory after backward pass: Allocated: {mem_after_backward:.2f} GB, Reserved: {reserved_after_backward:.2f} GB")
-
+                    # TIMING: Optimizer step
+                    opt_start = time.perf_counter()
                     if args.gns:
                         sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
                         gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, inpt.shape[0], inpt.shape[0] * accelerator.num_processes)
@@ -660,49 +708,67 @@ def main():
                     opt.step()
                     sched.step()
                     opt.zero_grad()
+                    torch.cuda.synchronize()  # Wait for optimizer to complete
+                    opt_time = time.perf_counter() - opt_start
+                    timing_stats['optimizer'].append(opt_time)
 
-                    # Track memory after optimizer step
-                    torch.cuda.synchronize()
-                    mem_after_step = torch.cuda.memory_allocated(device) / (1024 ** 3)  # Convert to GB
-                    reserved_after_step = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
-                    print(f"Memory after optimizer step: Allocated: {mem_after_step:.2f} GB, Reserved: {reserved_after_step:.2f} GB")
-
+                    # TIMING: EMA update
+                    ema_start = time.perf_counter()
                     ema_decay = ema_sched.get_value()
                     K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
                         K.utils.ema_update(model, model_ema, ema_decay)
                         ema_sched.step()
-
-                if device.type == 'cuda':
-                    end_timer.record()
-                    torch.cuda.synchronize()
-                    elapsed += start_timer.elapsed_time(end_timer) / 1000
-                else:
-                    elapsed += time.time() - start_timer
+                    ema_time = time.perf_counter() - ema_start
+                    timing_stats['ema'].append(ema_time)
 
                 if step % 25 == 0:
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
                     if accelerator.is_main_process:
+                        # PROFILING: Report timing breakdown
+                        if len(timing_stats['forward']) > 0:
+                            avg_data_load = sum(timing_stats['data_loading']) / len(timing_stats['data_loading']) * 1000
+                            avg_transfer = sum(timing_stats['data_transfer']) / len(timing_stats['data_transfer']) * 1000
+                            avg_forward = sum(timing_stats['forward']) / len(timing_stats['forward']) * 1000
+                            avg_backward = sum(timing_stats['backward']) / len(timing_stats['backward']) * 1000
+                            avg_optimizer = sum(timing_stats['optimizer']) / len(timing_stats['optimizer']) * 1000
+                            avg_ema = sum(timing_stats['ema']) / len(timing_stats['ema']) * 1000
+                            total_time = avg_data_load + avg_transfer + avg_forward + avg_backward + avg_optimizer + avg_ema
+
+                            tqdm.write(f'\n{"="*80}')
+                            tqdm.write(f'⏱️  TIMING BREAKDOWN (Step {step}):')
+                            tqdm.write(f'{"="*80}')
+                            tqdm.write(f'  Data Loading:   {avg_data_load:>8.2f}ms ({avg_data_load/total_time*100:>5.1f}%)')
+                            tqdm.write(f'  Data Transfer:  {avg_transfer:>8.2f}ms ({avg_transfer/total_time*100:>5.1f}%)')
+                            tqdm.write(f'  Forward Pass:   {avg_forward:>8.2f}ms ({avg_forward/total_time*100:>5.1f}%)')
+                            tqdm.write(f'  Backward Pass:  {avg_backward:>8.2f}ms ({avg_backward/total_time*100:>5.1f}%)')
+                            tqdm.write(f'  Optimizer:      {avg_optimizer:>8.2f}ms ({avg_optimizer/total_time*100:>5.1f}%)')
+                            tqdm.write(f'  EMA Update:     {avg_ema:>8.2f}ms ({avg_ema/total_time*100:>5.1f}%)')
+                            tqdm.write(f'  {"─"*80}')
+                            tqdm.write(f'  TOTAL:          {total_time:>8.2f}ms ({total_time/1000:.2f}s per iteration)')
+                            tqdm.write(f'{"="*80}\n')
+
+                            # Reset timing stats
+                            for key in timing_stats:
+                                timing_stats[key].clear()
+
                         if args.gns:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
                         else:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
 
-                        # Log GPU memory to wandb every 25 steps
-                        if use_wandb and device.type == 'cuda':
-                            torch.cuda.synchronize()
+                        # Log to wandb every 25 steps (removed GPU memory logging - it requires sync)
+                        if use_wandb:
                             wandb.log({
-                                'gpu/memory_allocated_gb': torch.cuda.memory_allocated(device) / (1024 ** 3),
-                                'gpu/memory_reserved_gb': torch.cuda.memory_reserved(device) / (1024 ** 3),
-                                'gpu/max_memory_allocated_gb': torch.cuda.max_memory_allocated(device) / (1024 ** 3),
                                 'train/loss_step': loss_disp,
                                 'train/avg_loss': avg_loss,
                             }, step=wandb_step)
 
                 step += 1
                 wandb_step += 1
+                batch_start_time = time.perf_counter()  # Start timing for next batch
 
                 if step == args.end_step:
                     if accelerator.is_main_process:
@@ -1029,17 +1095,6 @@ def main():
                     pred_reverted_flat = pred_reverted_seq.flatten()
                     max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
 
-                # Get GPU memory stats for epoch summary
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                    gpu_mem_allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-                    gpu_mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
-                    gpu_mem_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                else:
-                    gpu_mem_allocated = 0.0
-                    gpu_mem_reserved = 0.0
-                    gpu_mem_peak = 0.0
-
                 log_dict = {
                     'epoch': epoch,
                     'loss': epoch_train_loss,
@@ -1048,19 +1103,12 @@ def main():
                     'ema_decay': ema_decay,
                     'max_min_difference_sequence': max_min_diff_gt,
                     'max_min_difference_sequence_pred': max_min_diff_pred,
-                    'gpu/epoch_memory_allocated_gb': gpu_mem_allocated,
-                    'gpu/epoch_memory_reserved_gb': gpu_mem_reserved,
-                    'gpu/epoch_peak_memory_gb': gpu_mem_peak,
                 }
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
 
                 wandb.log(log_dict, step=wandb_step)
 
-                # Reset peak memory stats for next epoch
-                if device.type == 'cuda':
-                    torch.cuda.reset_peak_memory_stats(device)
-                # plt.close()
             # Save every 5 epochs or at the end
             if epoch % 5 == 0 or (args.max_epochs is not None and epoch >= args.max_epochs - 1):
                 save()

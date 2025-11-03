@@ -1,6 +1,6 @@
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
-mixed_precision: "no"  # or "fp16", or "no" if not using AMP
+mixed_precision: "bf16"  # Use BF16 for 2-3x speedup on GH200 (change to "fp16" if issues, "no" to disable)
 use_cpu: false
 gpu_ids: all
 num_processes: 4        # Adjust to match number of GPUs you want to use (e.g., 4 per node)
