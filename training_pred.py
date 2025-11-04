@@ -208,37 +208,6 @@ def main():
     assert len(model_config['input_size']) == 2 # and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
 
-    # # ------------------------------------------------------------------
-    # # Accelerate configuration tweaks
-    # # ------------------------------------------------------------------
-    # def _env_flag_enabled(name: str) -> bool:
-    #     value = os.environ.get(name, "")
-    #     if not value:
-    #         return False
-    #     return value.lower() in {"1", "true", "yes", "y", "on"}
-
-    # # ✅ ensure the flag is correctly set for subprocesses
-    # if "ACCELERATE_USE_FSDP" in os.environ and os.environ["ACCELERATE_USE_FSDP"].lower() in {"true", "1"}:
-    #     os.environ["ACCELERATE_USE_FSDP"] = "true"
-
-    # if _env_flag_enabled("ACCELERATE_USE_FSDP"):
-    #     from torch.distributed.fsdp import BackwardPrefetch, ShardingStrategy, StateDictType
-
-    #     def _coerce_accelerate_enum(env_name: str, enum_cls) -> None:
-    #         value = os.environ.get(env_name)
-    #         if not value or value.isdigit():
-    #             return
-    #         upper = value.upper()
-    #         if upper in enum_cls.__members__:
-    #             os.environ[env_name] = str(enum_cls[upper].value)
-
-    #     # Apply to both possible key formats (old/new Accelerate)
-    #     for prefix in ["ACCELERATE_FSDP_", "ACCELERATE_FSDP_FSDP_"]:
-    #         _coerce_accelerate_enum(f"{prefix}SHARDING_STRATEGY", ShardingStrategy)
-    #         _coerce_accelerate_enum(f"{prefix}STATE_DICT_TYPE", StateDictType)
-    #         _coerce_accelerate_enum(f"{prefix}BACKWARD_PREFETCH", BackwardPrefetch)
-
-
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps,
                                             mixed_precision=args.mixed_precision,
                 kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=False)])
@@ -740,6 +709,7 @@ def main():
                     transfer_time = time.perf_counter() - transfer_start
                     timing_stats['data_transfer'].append(transfer_time)
 
+                    # import pdb; pdb.set_trace()
                     # TIMING: Forward pass
                     forward_start = time.perf_counter()
                     extra_args = {}
@@ -764,6 +734,13 @@ def main():
                     torch.cuda.synchronize()  # Wait for backward to complete
                     backward_time = time.perf_counter() - backward_start
                     timing_stats['backward'].append(backward_time)
+
+                    if step == 0:
+                        try:
+                            spatial_shape = (64, 64)
+                            samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
+                        except Exception as e:
+                            print(f"Error during sample generation at step 0: {e}")
 
                     # TIMING: Optimizer step
                     opt_start = time.perf_counter()
@@ -889,17 +866,21 @@ def main():
                 tqdm.write(f"Epoch {epoch}, Train Loss: {epoch_train_loss:.6f}, Validation Loss: {val_loss:.6f}")
 
             # Sampling and Visualization
-            
-            if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
+            # NOTE: All ranks must participate in generate_samples() because model_ema uses FSDP
+            # FSDP collective operations require all ranks to participate
 
+            if epoch % args.evaluate_every == 0:
                 # Get spatial dimensions based on cartesian_transform flag
                 if args.cartesian_transform:
                     spatial_shape = (64, 64)
                 else:
                     spatial_shape = (24, 360)
 
-                # Test sampling
+                # ALL RANKS participate in sampling (FSDP requirement)
+                # But only rank 0 will use the result for visualization
                 samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
+
+            if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
 
                 import matplotlib.pyplot as plt
                 import imageio
@@ -912,7 +893,7 @@ def main():
                 target_sample = target_img[0].cpu().numpy()  # shape: [predict_steps, H, W]
 
                 # For visualization, use the first prediction step (you can modify this to show all steps)
-                generated_sample_np = generated_sample[0].cpu().numpy()  # shape: [H, W] - first predicted frame
+                generated_sample_np = generated_sample[15].cpu().numpy()  # shape: [H, W] - first predicted frame
                 target_sample_first = target_sample[0]  # shape: [H, W] - first target frame
 
                 # Revert transformation to original scale for better visualization
@@ -924,22 +905,26 @@ def main():
                     # Use regular imshow for Cartesian data (224x224)
                     if args.predict_steps == 1:
                         # Single step prediction - show comparison
-                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
+                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=False)
+
                         im0 = axes[0].imshow(target_sample_orig, cmap='plasma', aspect='auto')
                         axes[0].set_title("Target (Ground Truth)")
                         axes[0].axis('off')
-                        plt.colorbar(im0, ax=axes[0], shrink=0.8)
+                        fig_comparison.colorbar(im0, ax=[axes[0]], shrink=0.8)   # 👈 fix: wrap in list
 
                         im1 = axes[1].imshow(generated_sample_orig, cmap='plasma', aspect='auto')
                         axes[1].set_title("Generated Prediction")
                         axes[1].axis('off')
-                        plt.colorbar(im1, ax=axes[1], shrink=0.8)
+                        fig_comparison.colorbar(im1, ax=[axes[1]], shrink=0.8)   # 👈 fix: wrap in list
 
-                        fig_single, ax = plt.subplots(figsize=(10, 10))
-                        im = ax.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
-                        ax.set_title(f"Generated Ionosphere Prediction - Epoch {epoch}")
-                        ax.axis('off')
-                        plt.colorbar(im, ax=ax, shrink=0.8)
+                        # plt.savefig('comparison_debug.png', bbox_inches='tight')
+
+                        fig_single, ax_single = plt.subplots(figsize=(10, 10))
+                        im_single = ax_single.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
+                        ax_single.set_title(f"Generated Prediction - Epoch {epoch}")
+                        ax_single.axis('off')
+                        plt.colorbar(im_single, ax=ax_single, shrink=0.8)
+
                     else:
                         # Multi-step prediction
                         generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 224, 224]
@@ -950,24 +935,39 @@ def main():
                         target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
                         gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
 
+                        # Determine shared color scale from the true data
+                        vmin = np.min(target_first)
+                        vmax = np.max(target_first)
+
                         fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
-                        im0 = axes[0].imshow(target_first, cmap='plasma', aspect='auto')
+
+                        # --- Left: target ---
+                        im0 = axes[0].imshow(target_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
                         axes[0].set_title("Target Step 1")
                         axes[0].axis('off')
-                        plt.colorbar(im0, ax=axes[0], shrink=0.8)
 
-                        im1 = axes[1].imshow(gen_first, cmap='plasma', aspect='auto')
+                        # --- Right: generated ---
+                        im1 = axes[1].imshow(gen_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
                         axes[1].set_title("Generated Step 1")
                         axes[1].axis('off')
-                        plt.colorbar(im1, ax=axes[1], shrink=0.8)
+
+                        # --- One shared colorbar ---
+                        cbar = fig_comparison.colorbar(im0, ax=axes, shrink=0.8)
+                        cbar.set_label("Intensity", fontsize=12)
+
+                        # --- Add figure title ---
                         fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}", fontsize=16)
 
-                        # Single plot shows the last predicted frame
-                        fig_single, ax = plt.subplots(figsize=(10, 10))
-                        im = ax.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
-                        ax.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}")
-                        ax.axis('off')
-                        plt.colorbar(im, ax=ax, shrink=0.8)
+                        # plt.savefig("comparison_debug.png", bbox_inches="tight")
+
+                        fig_single, ax_single = plt.subplots(figsize=(10, 10))
+                        im_single = ax_single.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
+                        ax_single.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}")
+                        ax_single.axis('off')
+                        # fig_single.colorbar(im_single, ax=ax_single, shrink=0.8)    
+
+                        # plt.savefig("fig_single.png", bbox_inches="tight")
+
                 else:
                     # Use polar plotting for polar data (24x360)
                     from util import plot_polar_ionosphere_single, plot_polar_ionosphere_comparison
@@ -1030,7 +1030,7 @@ def main():
                 full_sequence = torch.cat([cond_img[0].cpu(), target_img[0].cpu()], dim=0)  # [sequence_length, H, W]
 
                 # Also create sequence with generated samples
-                generated_full_sequence = torch.cat([cond_img[0].cpu(), generated_sample.cpu()], dim=0)  # [conditioning_length + predict_steps, H, W]
+                generated_full_sequence = generated_sample.cpu() # [conditioning_length + predict_steps, H, W]
                 
                 # Dynamically set figsize
                 img_h, img_w = full_sequence.shape[1], full_sequence.shape[2]
@@ -1131,11 +1131,11 @@ def main():
                     
                     # Add per-step metrics if predicting multiple steps
                     if args.predict_steps > 1:
-                        for step in range(args.predict_steps):
-                            step_mse = np.mean((generated_all_orig[step] - target_all_orig[step]) ** 2)
-                            step_mae = np.mean(np.abs(generated_all_orig[step] - target_all_orig[step]))
-                            eval_dict[f'evaluation/mse_step_{step+1}'] = step_mse
-                            eval_dict[f'evaluation/mae_step_{step+1}'] = step_mae
+                        for frame in range(args.predict_steps):
+                            step_mse = np.mean((generated_all_orig[frame] - target_all_orig[0, frame]) ** 2)
+                            step_mae = np.mean(np.abs(generated_all_orig[frame] - target_all_orig[0, frame]))
+                            eval_dict[f'evaluation/mse_step_{frame+1}'] = step_mse
+                            eval_dict[f'evaluation/mae_step_{frame+1}'] = step_mae
                     
                     wandb.log(eval_dict, step=wandb_step)
                 
@@ -1158,35 +1158,47 @@ def main():
                 # torch.cat([unet_cond, noised_input], dim=1)
                 target_img_reverted = torch.cat([cond_img, target_img], dim=1) * 80000.0  # [batch_size, predict_steps, H, W]
 
-                if args.predict_steps == 1:
-                    # Single frame prediction - use the single frame
-                    target_reverted_flat = target_img_reverted.flatten()
-                    max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
+                # Only compute prediction metrics if we generated samples this epoch
+                if epoch % args.evaluate_every == 0:
+                    if args.predict_steps == 1:
+                        # Single frame prediction - use the single frame
+                        target_reverted_flat = target_img_reverted.flatten()
+                        max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted = generated_sample[0].cpu().numpy() * 80000.0  # [H, W]
-                    pred_reverted_flat = pred_reverted.flatten()
-                    max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+                        pred_reverted = samples[0, 0].cpu().numpy() * 80000.0  # [H, W]
+                        pred_reverted_flat = pred_reverted.flatten()
+                        max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+                    else:
+                        # Multi-step prediction - compute max-min across entire predicted sequence
+                        # Reshape to [batch_size * predict_steps, H, W] then flatten
+                        target_reverted_seq = target_img_reverted.reshape(-1, *spatial_shape)  # [batch_size * predict_steps, H, W]
+                        target_reverted_flat = target_reverted_seq.flatten()
+                        max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
+
+                        pred_reverted_seq = samples[0].cpu().numpy() * 80000.0  # [predict_steps, H, W]
+                        pred_reverted_seq = pred_reverted_seq.reshape(-1, *spatial_shape)  # [predict_steps, H, W]
+                        pred_reverted_flat = pred_reverted_seq.flatten()
+                        max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+
+                    log_dict = {
+                        'epoch': epoch,
+                        'loss': epoch_train_loss,
+                        'val_loss': val_loss,
+                        'lr': sched.get_last_lr()[0],
+                        'ema_decay': ema_decay,
+                        'max_min_difference_sequence': max_min_diff_gt,
+                        'max_min_difference_sequence_pred': max_min_diff_pred,
+                    }
                 else:
-                    # Multi-step prediction - compute max-min across entire predicted sequence
-                    # Reshape to [batch_size * predict_steps, H, W] then flatten
-                    target_reverted_seq = target_img_reverted.reshape(-1, *spatial_shape)  # [batch_size * predict_steps, H, W]
-                    target_reverted_flat = target_reverted_seq.flatten()
-                    max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
+                    # Not an evaluation epoch, skip prediction metrics
+                    log_dict = {
+                        'epoch': epoch,
+                        'loss': epoch_train_loss,
+                        'val_loss': val_loss,
+                        'lr': sched.get_last_lr()[0],
+                        'ema_decay': ema_decay,
+                    }
 
-                    pred_reverted_seq = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                    pred_reverted_seq = pred_reverted_seq.reshape(-1, *spatial_shape)  # [predict_steps, H, W]
-                    pred_reverted_flat = pred_reverted_seq.flatten()
-                    max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
-
-                log_dict = {
-                    'epoch': epoch,
-                    'loss': epoch_train_loss,
-                    'val_loss': val_loss,
-                    'lr': sched.get_last_lr()[0],
-                    'ema_decay': ema_decay,
-                    'max_min_difference_sequence': max_min_diff_gt,
-                    'max_min_difference_sequence_pred': max_min_diff_pred,
-                }
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
 
