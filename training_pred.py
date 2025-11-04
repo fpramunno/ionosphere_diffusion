@@ -5,12 +5,27 @@ Created on Sat Apr  5 15:47:31 2025
 @author: pio-r
 """
 
-# import debugpy
+# ------------------------------------------------------------------
+# ✅ Pre-FSDP enum coercion for all distributed ranks
+#     must run BEFORE importing accelerate or torch.distributed
+# ------------------------------------------------------------------
+import os
 
-# debugpy.connect(("v000675", 5678))  # VS Code listens on login node
-# print("✅ Connected to VS Code debugger!")
-# debugpy.wait_for_client()
-# print("🎯 Debugger attached!")
+if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() in {"true", "1"}:
+    from torch.distributed.fsdp import ShardingStrategy, StateDictType, BackwardPrefetch
+
+    def _coerce_accelerate_enum(env_name: str, enum_cls):
+        value = os.environ.get(env_name)
+        if not value or value.isdigit():
+            return
+        upper = value.upper()
+        if upper in enum_cls.__members__:
+            os.environ[env_name] = str(enum_cls[upper].value)
+
+    for prefix in ["ACCELERATE_FSDP_", "ACCELERATE_FSDP_FSDP_"]:
+        _coerce_accelerate_enum(f"{prefix}SHARDING_STRATEGY", ShardingStrategy)
+        _coerce_accelerate_enum(f"{prefix}STATE_DICT_TYPE", StateDictType)
+        _coerce_accelerate_enum(f"{prefix}BACKWARD_PREFETCH", BackwardPrefetch)
 
 def main():
 
@@ -192,6 +207,37 @@ def main():
 
     assert len(model_config['input_size']) == 2 # and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
+
+    # # ------------------------------------------------------------------
+    # # Accelerate configuration tweaks
+    # # ------------------------------------------------------------------
+    # def _env_flag_enabled(name: str) -> bool:
+    #     value = os.environ.get(name, "")
+    #     if not value:
+    #         return False
+    #     return value.lower() in {"1", "true", "yes", "y", "on"}
+
+    # # ✅ ensure the flag is correctly set for subprocesses
+    # if "ACCELERATE_USE_FSDP" in os.environ and os.environ["ACCELERATE_USE_FSDP"].lower() in {"true", "1"}:
+    #     os.environ["ACCELERATE_USE_FSDP"] = "true"
+
+    # if _env_flag_enabled("ACCELERATE_USE_FSDP"):
+    #     from torch.distributed.fsdp import BackwardPrefetch, ShardingStrategy, StateDictType
+
+    #     def _coerce_accelerate_enum(env_name: str, enum_cls) -> None:
+    #         value = os.environ.get(env_name)
+    #         if not value or value.isdigit():
+    #             return
+    #         upper = value.upper()
+    #         if upper in enum_cls.__members__:
+    #             os.environ[env_name] = str(enum_cls[upper].value)
+
+    #     # Apply to both possible key formats (old/new Accelerate)
+    #     for prefix in ["ACCELERATE_FSDP_", "ACCELERATE_FSDP_FSDP_"]:
+    #         _coerce_accelerate_enum(f"{prefix}SHARDING_STRATEGY", ShardingStrategy)
+    #         _coerce_accelerate_enum(f"{prefix}STATE_DICT_TYPE", StateDictType)
+    #         _coerce_accelerate_enum(f"{prefix}BACKWARD_PREFETCH", BackwardPrefetch)
+
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps,
                                             mixed_precision=args.mixed_precision,
@@ -412,27 +458,48 @@ def main():
                 return self.image, self.condition
 
         # Repeat the single sample enough times for a reasonable epoch
-        repeat_count = 10000 * args.batch_size
-        single_dataset = SingleSampleDataset(single_image, single_condition, repeat=repeat_count)
+        repeat_count_train = 10000 * args.batch_size
+        repeat_count_val = repeat_count_train // 10  # Validation set is 1/10 of training set
+
+        single_dataset_train = SingleSampleDataset(single_image, single_condition, repeat=repeat_count_train)
+        single_dataset_val = SingleSampleDataset(single_image, single_condition, repeat=repeat_count_val)
 
         if accelerator.is_main_process:
-            print(f"   Dataset size: {repeat_count} samples = {repeat_count // args.batch_size} batches per epoch")
+            print(f"   Train dataset size: {repeat_count_train} samples = {repeat_count_train // args.batch_size} batches per epoch (total)")
+            print(f"   Train per-GPU batches: {repeat_count_train // args.batch_size // accelerator.num_processes}")
+            print(f"   Val dataset size: {repeat_count_val} samples = {repeat_count_val // args.batch_size} batches per epoch (total)")
+            print(f"   Val per-GPU batches: {repeat_count_val // args.batch_size // accelerator.num_processes}")
+
+        # Create DistributedSampler to shard across GPUs
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(
+            single_dataset_train,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=False
+        )
 
         # Create new dataloader with the single sample
         # Use original batch_size so the model sees the expected batch dimension
         train_dl = torch.utils.data.DataLoader(
-            single_dataset,
+            single_dataset_train,
             batch_size=args.batch_size,
-            shuffle=False,
+            sampler=sampler,
             num_workers=0,
             pin_memory=True,
         )
 
-        # Also use the same single sample for validation
+        # Create validation dataloader (1/10 the size of training)
+        val_sampler = DistributedSampler(
+            single_dataset_val,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            shuffle=False
+        )
         val_dl = torch.utils.data.DataLoader(
-            single_dataset,
+            single_dataset_val,
             batch_size=args.batch_size,
-            shuffle=False,
+            sampler=val_sampler,
             num_workers=0,
             pin_memory=True,
         )
@@ -766,8 +833,8 @@ def main():
                                 'train/avg_loss': avg_loss,
                             }, step=wandb_step)
 
-                step += 1
-                wandb_step += 1
+                step += accelerator.num_processes
+                wandb_step += accelerator.num_processes  # Count steps across all GPUs
                 batch_start_time = time.perf_counter()  # Start timing for next batch
 
                 if step == args.end_step:
@@ -775,7 +842,13 @@ def main():
                         tqdm.write('Done!')
                     # return
             
-            epoch_train_loss /= num_train_batches 
+            epoch_train_loss /= num_train_batches
+
+            # Gather training loss across all ranks for accurate logging
+            epoch_train_loss_tensor = torch.tensor(epoch_train_loss, device=device)
+            gathered_train_loss = accelerator.gather(epoch_train_loss_tensor)
+            if accelerator.is_main_process:
+                epoch_train_loss = gathered_train_loss.mean().item()
 
             # **Validation Loop (After Training, Before wandb Logging)**
             model.eval()
@@ -871,14 +944,19 @@ def main():
                         # Multi-step prediction
                         generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 224, 224]
                         target_all_orig = target_sample * 80000.0  # [predict_steps, 224, 224]
+                        generated_sample_orig = generated_all_orig  # For vmin/vmax in later plotting
+
+                        # Handle case where dimensions might be squeezed
+                        target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
+                        gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
 
                         fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
-                        im0 = axes[0].imshow(target_all_orig[0], cmap='plasma', aspect='auto')
+                        im0 = axes[0].imshow(target_first, cmap='plasma', aspect='auto')
                         axes[0].set_title("Target Step 1")
                         axes[0].axis('off')
                         plt.colorbar(im0, ax=axes[0], shrink=0.8)
 
-                        im1 = axes[1].imshow(generated_all_orig[0], cmap='plasma', aspect='auto')
+                        im1 = axes[1].imshow(gen_first, cmap='plasma', aspect='auto')
                         axes[1].set_title("Generated Step 1")
                         axes[1].axis('off')
                         plt.colorbar(im1, ax=axes[1], shrink=0.8)
@@ -914,10 +992,15 @@ def main():
                         # Multi-step prediction - show sequence evolution
                         generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 24, 360]
                         target_all_orig = target_sample * 80000.0  # [predict_steps, 24, 360]
+                        generated_sample_orig = generated_all_orig  # For vmin/vmax in later plotting
+
+                        # Handle case where dimensions might be squeezed
+                        target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
+                        gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
 
                         fig_comparison, _ = plot_polar_ionosphere_comparison(
-                            data_original=target_all_orig[0],
-                            data_pred=generated_all_orig[0],
+                            data_original=target_first,
+                            data_pred=gen_first,
                             titles=["Target Step 1", "Generated Step 1"],
                             cmap='plasma',
                             figsize=(16, 8)
@@ -1063,7 +1146,7 @@ def main():
                 buf_single.close()
                 
             # **wandb Logging (Now Includes Validation Loss and Max-Min Difference)**
-            if use_wandb:
+            if use_wandb and accelerator.is_main_process:
                 # Get spatial dimensions based on cartesian_transform flag
                 if args.cartesian_transform:
                     spatial_shape = (64, 64)
