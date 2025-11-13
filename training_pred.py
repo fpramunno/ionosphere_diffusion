@@ -65,7 +65,7 @@ def main():
                 help='the configuration file')
     p.add_argument('--data-path', type=str, default="/users/framunno/data/ionosphere/ionosphere_data/pickled_maps",
                 help='the path of the dataset')
-    p.add_argument('--saving-path', type=str, default="/users/framunno/models_results", 
+    p.add_argument('--saving-path', type=str, default="/capstor/scratch/cscs/framunno/models_results", 
                 help='the path where to save the model')
     p.add_argument('--dir-name', type=str, default='cond_forecasting_cfg_oneframe_nonorm',
                 help='the directory name to use')  # <---- Added this line
@@ -210,7 +210,7 @@ def main():
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps,
                                             mixed_precision=args.mixed_precision,
-                kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=False)])
+                kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)])
 
     device = accelerator.device
     unwrap = accelerator.unwrap_model
@@ -237,7 +237,8 @@ def main():
 
     # Model definition
     inner_model = K.config.make_model(config)
-    inner_model_ema = deepcopy(inner_model)
+    # NOTE: inner_model_ema will be created AFTER accelerator.prepare() to avoid
+    # deepcopy issues in multi-node DDP initialization
 
     # Enable activation checkpointing if requested (saves memory)
     if args.activation_checkpointing or args.checkpointing:
@@ -265,7 +266,8 @@ def main():
         log_config = vars(args)
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params(inner_model)
-        wandb.init(project="ionosphere", entity="francescopio", name=args.wandb_runname, config=log_config, save_code=True)
+        # Use current working directory for wandb (where we launch the script)
+        wandb.init(project="ionosphere", entity="francescopio", name=args.wandb_runname, config=log_config, save_code=True, dir=os.getcwd(), resume="allow")
     
     # MODEL SUMMARY
     if accelerator.is_main_process:
@@ -363,7 +365,7 @@ def main():
         normalization_type=args.normalization_type,
         preprocess_config=preprocess_config,
         use_l1_conditions=True,
-        min_center_distance=args.min_center_distance,
+        min_center_distance=1,
         cartesian_transform=args.cartesian_transform,
         output_size=64,
         only_complete_sequences=args.only_complete_sequences,
@@ -382,7 +384,7 @@ def main():
         normalization_type=args.normalization_type,
         preprocess_config=preprocess_config,
         use_l1_conditions=True,
-        min_center_distance=args.min_center_distance,
+        min_center_distance=1,
         cartesian_transform=args.cartesian_transform,
         output_size=64,
         only_complete_sequences=args.only_complete_sequences,
@@ -439,39 +441,58 @@ def main():
             print(f"   Val dataset size: {repeat_count_val} samples = {repeat_count_val // args.batch_size} batches per epoch (total)")
             print(f"   Val per-GPU batches: {repeat_count_val // args.batch_size // accelerator.num_processes}")
 
-        # Create DistributedSampler to shard across GPUs
-        from torch.utils.data.distributed import DistributedSampler
-        sampler = DistributedSampler(
-            single_dataset_train,
-            num_replicas=accelerator.num_processes,
-            rank=accelerator.process_index,
-            shuffle=False
-        )
-
-        # Create new dataloader with the single sample
-        # Use original batch_size so the model sees the expected batch dimension
+        # ✅ NEW WAY: Let accelerator.prepare() handle distributed logic automatically
+        # This works for DDP, FSDP, and other backends without manual DistributedSampler
         train_dl = torch.utils.data.DataLoader(
             single_dataset_train,
             batch_size=args.batch_size,
-            sampler=sampler,
+            shuffle=False,  # No shuffle for overfitting
             num_workers=0,
             pin_memory=True,
         )
 
-        # Create validation dataloader (1/10 the size of training)
-        val_sampler = DistributedSampler(
-            single_dataset_val,
-            num_replicas=accelerator.num_processes,
-            rank=accelerator.process_index,
-            shuffle=False
-        )
         val_dl = torch.utils.data.DataLoader(
             single_dataset_val,
             batch_size=args.batch_size,
-            sampler=val_sampler,
+            shuffle=False,
             num_workers=0,
             pin_memory=True,
         )
+
+        # ❌ OLD MANUAL WAY (commented out - kept for reference):
+        # # Create DistributedSampler to shard across GPUs
+        # from torch.utils.data.distributed import DistributedSampler
+        # sampler = DistributedSampler(
+        #     single_dataset_train,
+        #     num_replicas=accelerator.num_processes,
+        #     rank=accelerator.process_index,
+        #     shuffle=False
+        # )
+        #
+        # # Create new dataloader with the single sample
+        # # Use original batch_size so the model sees the expected batch dimension
+        # train_dl = torch.utils.data.DataLoader(
+        #     single_dataset_train,
+        #     batch_size=args.batch_size,
+        #     sampler=sampler,
+        #     num_workers=0,
+        #     pin_memory=True,
+        # )
+        #
+        # # Create validation dataloader (1/10 the size of training)
+        # val_sampler = DistributedSampler(
+        #     single_dataset_val,
+        #     num_replicas=accelerator.num_processes,
+        #     rank=accelerator.process_index,
+        #     shuffle=False
+        # )
+        # val_dl = torch.utils.data.DataLoader(
+        #     single_dataset_val,
+        #     batch_size=args.batch_size,
+        #     sampler=val_sampler,
+        #     num_workers=0,
+        #     pin_memory=True,
+        # )
 
         if accelerator.is_main_process:
             print(f"   New dataloader will produce batches of size {args.batch_size} with the same trajectory repeated")
@@ -518,8 +539,15 @@ def main():
             raise ValueError("max_epochs must be specified when using cosine scheduler")
 
         epoch_size = len(train_dl)  # steps per epoch
-        warmup_epochs = sched_config.get('warmup_epochs', 0)
-        warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
+
+        # Support both warmup_steps (direct) and warmup_epochs (computed)
+        if 'warmup_steps' in sched_config:
+            warmup_steps = sched_config['warmup_steps']
+            warmup_epochs = warmup_steps * args.grad_accum_steps / epoch_size
+        else:
+            warmup_epochs = sched_config.get('warmup_epochs', 0)
+            warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
+
         total_steps = (args.max_epochs * epoch_size) // args.grad_accum_steps
         eta_min_factor = sched_config.get('eta_min_factor', 100)  # LR will decay to lr/100
 
@@ -544,7 +572,7 @@ def main():
 
             if accelerator.is_main_process:
                 print(f"📊 Cosine LR Schedule:")
-                print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs})")
+                print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs:.2f})")
                 print(f"   Total steps: {total_steps} (epochs: {args.max_epochs})")
                 print(f"   Base LR: {lr:.2e}")
                 print(f"   Min LR: {lr/eta_min_factor:.2e}")
@@ -571,11 +599,24 @@ def main():
 
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
-    if not args.overfit_single:
-        inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
-    else:
-        # For overfitting mode, don't prepare dataloaders (they're already simple)
-        inner_model, inner_model_ema, opt = accelerator.prepare(inner_model, inner_model_ema, opt)
+    # ✅ Now we ALWAYS prepare dataloaders - accelerator handles distribution automatically
+    # NOTE: We only prepare inner_model here (not EMA) to avoid deepcopy issues in multi-node DDP
+    inner_model, opt, train_dl = accelerator.prepare(inner_model, opt, train_dl)
+
+    # Create EMA model AFTER DDP wrapping to avoid multi-node initialization issues
+    # EMA model doesn't need DDP wrapping as it's only used for inference
+    if accelerator.is_main_process:
+        print("Creating EMA model from DDP-wrapped model...")
+    inner_model_ema = deepcopy(unwrap(inner_model))
+    if accelerator.is_main_process:
+        print(f"✅ EMA model created with {K.utils.n_params(inner_model_ema):,} parameters")
+
+    # ❌ OLD WAY (commented out - kept for reference):
+    # if not args.overfit_single:
+    #     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    # else:
+    #     # For overfitting mode, don't prepare dataloaders (they're already simple)
+    #     inner_model, inner_model_ema, opt = accelerator.prepare(inner_model, inner_model_ema, opt)
 
     use_wandb = args.use_wandb
 
@@ -643,15 +684,22 @@ def main():
 
     def save():
         accelerator.wait_for_everyone()
-        filename = os.path.join(args.saving_path, dir_path_mdl, f"{args.name}_epoch_{epoch:04}.pth") 
+        filename = os.path.join(dir_path_mdl, f"{args.name}_epoch_{epoch:04}.pth")
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
+
+        # For FSDP, we need to get full state dict, not sharded
         inner_model = unwrap(model.inner_model)
         inner_model_ema = unwrap(model_ema.inner_model)
+
+        # Use accelerator.get_state_dict to properly gather full model from FSDP shards
+        model_state = accelerator.get_state_dict(inner_model)
+        model_ema_state = accelerator.get_state_dict(inner_model_ema)
+
         obj = {
             'config': config,
-            'model': inner_model.state_dict(),
-            'model_ema': inner_model_ema.state_dict(),
+            'model': model_state,
+            'model_ema': model_ema_state,
             'opt': opt.state_dict(),
             'sched': sched.state_dict(),
             'ema_sched': ema_sched.state_dict(),
@@ -663,24 +711,61 @@ def main():
             'demo_gen': demo_gen.get_state(),
             'elapsed': elapsed,
         }
-        accelerator.save(obj, filename)
+
+        # Only rank 0 should save the checkpoint to avoid file corruption
         if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': filename}
-            json.dump(state_obj, open(state_path, 'w'))
-        if args.wandb_save_model and use_wandb:
-            wandb.save(filename)
+            import tempfile
+            import shutil
+
+            # Save to local /tmp first (reliable for large files on network filesystem)
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pth', dir='/tmp', delete=False) as tmp_file:
+                temp_path = tmp_file.name
+
+            try:
+                tqdm.write(f'Saving checkpoint to local temp: {temp_path}')
+                torch.save(obj, temp_path)
+
+                file_size_gb = os.path.getsize(temp_path) / (1024**3)
+                tqdm.write(f'Local save complete ({file_size_gb:.2f} GB). Copying to network filesystem...')
+
+                shutil.copy2(temp_path, filename)
+                tqdm.write(f'Copy complete. Verifying checkpoint integrity...')
+
+                # Verify the network copy is readable
+                test_load = torch.load(filename, map_location='cpu')
+                del test_load
+
+                tqdm.write(f'✅ Checkpoint saved successfully to {filename}')
+
+                # Clean up temp file
+                os.remove(temp_path)
+
+                state_obj = {'latest_checkpoint': filename}
+                json.dump(state_obj, open(state_path, 'w'))
+
+                if args.wandb_save_model and use_wandb:
+                    wandb.save(filename)
+
+            except Exception as e:
+                tqdm.write(f'❌ Error during checkpoint save: {e}')
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+
+        # Wait for rank 0 to finish saving before all ranks continue
+        accelerator.wait_for_everyone()
 
     losses_since_last_print = []
 
     # PROFILING: Track timing for different parts of training loop
-    timing_stats = {
-        'data_loading': [],
-        'data_transfer': [],
-        'forward': [],
-        'backward': [],
-        'optimizer': [],
-        'ema': [],
-    }
+    # timing_stats = {
+    #     'data_loading': [],
+    #     'data_transfer': [],
+    #     'forward': [],
+    #     'backward': [],
+    #     'optimizer': [],
+    #     'ema': [],
+    # }
 
     model = model.to(device)
     try:
@@ -694,7 +779,7 @@ def main():
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
                 # TIMING: Data loading time
                 data_load_time = time.perf_counter() - batch_start_time
-                timing_stats['data_loading'].append(data_load_time)
+                # timing_stats['data_loading'].append(data_load_time)
 
                 with accelerator.accumulate(model):
                     # TIMING: Data transfer to GPU
@@ -707,7 +792,7 @@ def main():
                     cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
                     torch.cuda.synchronize()  # Wait for transfers to complete
                     transfer_time = time.perf_counter() - transfer_start
-                    timing_stats['data_transfer'].append(transfer_time)
+                    # timing_stats['data_transfer'].append(transfer_time)
 
                     # import pdb; pdb.set_trace()
                     # TIMING: Forward pass
@@ -721,7 +806,7 @@ def main():
                         losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=cond_label_inp, **extra_args)
                     torch.cuda.synchronize()  # Wait for forward to complete
                     forward_time = time.perf_counter() - forward_start
-                    timing_stats['forward'].append(forward_time)
+                    # timing_stats['forward'].append(forward_time)
 
                     # Evita NCCL timeout: non fare gather durante il training!
                     loss = losses.mean().item()
@@ -733,14 +818,7 @@ def main():
                     accelerator.backward(losses.mean())
                     torch.cuda.synchronize()  # Wait for backward to complete
                     backward_time = time.perf_counter() - backward_start
-                    timing_stats['backward'].append(backward_time)
-
-                    if step == 0:
-                        try:
-                            spatial_shape = (64, 64)
-                            samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
-                        except Exception as e:
-                            print(f"Error during sample generation at step 0: {e}")
+                    # timing_stats['backward'].append(backward_time)
 
                     # TIMING: Optimizer step
                     opt_start = time.perf_counter()
@@ -749,54 +827,57 @@ def main():
                         gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, inpt.shape[0], inpt.shape[0] * accelerator.num_processes)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.)
-                    opt.step()
-                    sched.step()
-                    opt.zero_grad()
+                        opt.step()
+                        sched.step()  # Only step scheduler when gradients are actually synced
+                        opt.zero_grad()
+                    # Note: When using gradient accumulation, opt/sched should only step when sync_gradients=True
                     torch.cuda.synchronize()  # Wait for optimizer to complete
                     opt_time = time.perf_counter() - opt_start
-                    timing_stats['optimizer'].append(opt_time)
+                    # timing_stats['optimizer'].append(opt_time)
 
                     # TIMING: EMA update
                     ema_start = time.perf_counter()
                     ema_decay = ema_sched.get_value()
                     K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
-                        K.utils.ema_update(model, model_ema, ema_decay)
+                        # Unwrap model.inner_model to match model_ema.inner_model parameter names (DDP vs non-DDP)
+                        K.utils.ema_update(unwrap(model.inner_model), model_ema.inner_model, ema_decay)
                         ema_sched.step()
                     ema_time = time.perf_counter() - ema_start
-                    timing_stats['ema'].append(ema_time)
+                    # timing_stats['ema'].append(ema_time)
 
-                if step % 25 == 0:
+                # Only log when we've actually done an optimizer step (gradients synced)
+                if accelerator.sync_gradients and step % 25 == 0:
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
                     if accelerator.is_main_process:
                         # PROFILING: Report timing breakdown
-                        if len(timing_stats['forward']) > 0:
-                            avg_data_load = sum(timing_stats['data_loading']) / len(timing_stats['data_loading']) * 1000
-                            avg_transfer = sum(timing_stats['data_transfer']) / len(timing_stats['data_transfer']) * 1000
-                            avg_forward = sum(timing_stats['forward']) / len(timing_stats['forward']) * 1000
-                            avg_backward = sum(timing_stats['backward']) / len(timing_stats['backward']) * 1000
-                            avg_optimizer = sum(timing_stats['optimizer']) / len(timing_stats['optimizer']) * 1000
-                            avg_ema = sum(timing_stats['ema']) / len(timing_stats['ema']) * 1000
-                            total_time = avg_data_load + avg_transfer + avg_forward + avg_backward + avg_optimizer + avg_ema
+                        # if len(timing_stats['forward']) > 0:
+                        #     avg_data_load = sum(timing_stats['data_loading']) / len(timing_stats['data_loading']) * 1000
+                        #     avg_transfer = sum(timing_stats['data_transfer']) / len(timing_stats['data_transfer']) * 1000
+                        #     avg_forward = sum(timing_stats['forward']) / len(timing_stats['forward']) * 1000
+                        #     avg_backward = sum(timing_stats['backward']) / len(timing_stats['backward']) * 1000
+                        #     avg_optimizer = sum(timing_stats['optimizer']) / len(timing_stats['optimizer']) * 1000
+                        #     avg_ema = sum(timing_stats['ema']) / len(timing_stats['ema']) * 1000
+                        #     total_time = avg_data_load + avg_transfer + avg_forward + avg_backward + avg_optimizer + avg_ema
 
-                            tqdm.write(f'\n{"="*80}')
-                            tqdm.write(f'⏱️  TIMING BREAKDOWN (Step {step}):')
-                            tqdm.write(f'{"="*80}')
-                            tqdm.write(f'  Data Loading:   {avg_data_load:>8.2f}ms ({avg_data_load/total_time*100:>5.1f}%)')
-                            tqdm.write(f'  Data Transfer:  {avg_transfer:>8.2f}ms ({avg_transfer/total_time*100:>5.1f}%)')
-                            tqdm.write(f'  Forward Pass:   {avg_forward:>8.2f}ms ({avg_forward/total_time*100:>5.1f}%)')
-                            tqdm.write(f'  Backward Pass:  {avg_backward:>8.2f}ms ({avg_backward/total_time*100:>5.1f}%)')
-                            tqdm.write(f'  Optimizer:      {avg_optimizer:>8.2f}ms ({avg_optimizer/total_time*100:>5.1f}%)')
-                            tqdm.write(f'  EMA Update:     {avg_ema:>8.2f}ms ({avg_ema/total_time*100:>5.1f}%)')
-                            tqdm.write(f'  {"─"*80}')
-                            tqdm.write(f'  TOTAL:          {total_time:>8.2f}ms ({total_time/1000:.2f}s per iteration)')
-                            tqdm.write(f'{"="*80}\n')
+                        #     tqdm.write(f'\n{"="*80}')
+                        #     tqdm.write(f'⏱️  TIMING BREAKDOWN (Step {step}):')
+                        #     tqdm.write(f'{"="*80}')
+                        #     tqdm.write(f'  Data Loading:   {avg_data_load:>8.2f}ms ({avg_data_load/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Data Transfer:  {avg_transfer:>8.2f}ms ({avg_transfer/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Forward Pass:   {avg_forward:>8.2f}ms ({avg_forward/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Backward Pass:  {avg_backward:>8.2f}ms ({avg_backward/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Optimizer:      {avg_optimizer:>8.2f}ms ({avg_optimizer/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  EMA Update:     {avg_ema:>8.2f}ms ({avg_ema/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  {"─"*80}')
+                        #     tqdm.write(f'  TOTAL:          {total_time:>8.2f}ms ({total_time/1000:.2f}s per iteration)')
+                        #     tqdm.write(f'{"="*80}\n')
 
-                            # Reset timing stats
-                            for key in timing_stats:
-                                timing_stats[key].clear()
+                        #     # Reset timing stats
+                        #     for key in timing_stats:
+                        #         timing_stats[key].clear()
 
                         if args.gns:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
@@ -810,8 +891,12 @@ def main():
                                 'train/avg_loss': avg_loss,
                             }, step=wandb_step)
 
-                step += accelerator.num_processes
-                wandb_step += accelerator.num_processes  # Count steps across all GPUs
+                # Step counter: Each iteration processes batch_size samples per GPU
+                # In distributed training, we want to count actual optimizer steps (when gradients sync)
+                # not individual forward/backward passes
+                if accelerator.sync_gradients:
+                    step += 1  # One optimizer step happened
+                    wandb_step += 1
                 batch_start_time = time.perf_counter()  # Start timing for next batch
 
                 if step == args.end_step:
@@ -819,12 +904,15 @@ def main():
                         tqdm.write('Done!')
                     # return
             
+            # Average training loss: divide by number of batches processed on this GPU
             epoch_train_loss /= num_train_batches
 
-            # Gather training loss across all ranks for accurate logging
+            # In distributed training, each GPU has accumulated its own subset of losses
+            # We need to average across all GPUs to get the true epoch loss
             epoch_train_loss_tensor = torch.tensor(epoch_train_loss, device=device)
             gathered_train_loss = accelerator.gather(epoch_train_loss_tensor)
             if accelerator.is_main_process:
+                # Average the per-GPU averages to get global average
                 epoch_train_loss = gathered_train_loss.mean().item()
 
             # **Validation Loop (After Training, Before wandb Logging)**
@@ -893,7 +981,7 @@ def main():
                 target_sample = target_img[0].cpu().numpy()  # shape: [predict_steps, H, W]
 
                 # For visualization, use the first prediction step (you can modify this to show all steps)
-                generated_sample_np = generated_sample[15].cpu().numpy()  # shape: [H, W] - first predicted frame
+                generated_sample_np = generated_sample[0].cpu().numpy()  # shape: [H, W] - first predicted frame
                 target_sample_first = target_sample[0]  # shape: [H, W] - first target frame
 
                 # Revert transformation to original scale for better visualization
@@ -1030,7 +1118,7 @@ def main():
                 full_sequence = torch.cat([cond_img[0].cpu(), target_img[0].cpu()], dim=0)  # [sequence_length, H, W]
 
                 # Also create sequence with generated samples
-                generated_full_sequence = generated_sample.cpu() # [conditioning_length + predict_steps, H, W]
+                generated_full_sequence = torch.cat([cond_img[0].cpu(), generated_sample.cpu()], dim=0)  # [conditioning_length + predict_steps, H, W]
                 
                 # Dynamically set figsize
                 img_h, img_w = full_sequence.shape[1], full_sequence.shape[2]
@@ -1107,7 +1195,7 @@ def main():
                     
                     # Calculate metrics for all prediction steps
                     generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                    target_all_orig = (torch.cat([cond_img, target_img], dim=1) * 80000.0).cpu().numpy()  # [predict_steps, H, W]
+                    target_all_orig = (target_img * 80000.0).cpu().numpy()  # [predict_steps, H, W]
 
                     # Overall metrics across all prediction steps
                     mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
@@ -1156,7 +1244,7 @@ def main():
                 # Calculate max-min difference after reverting transformation
                 # Use current batch target_img for consistent max-min calculation
                 # torch.cat([unet_cond, noised_input], dim=1)
-                target_img_reverted = torch.cat([cond_img, target_img], dim=1) * 80000.0  # [batch_size, predict_steps, H, W]
+                target_img_reverted = target_img * 80000.0  # [batch_size, predict_steps, H, W]
 
                 # Only compute prediction metrics if we generated samples this epoch
                 if epoch % args.evaluate_every == 0:

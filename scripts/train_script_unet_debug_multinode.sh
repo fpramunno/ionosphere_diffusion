@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/users/framunno/logs/out/out_overfit_15step_v4_cartesian_coordinates_absmax_debug_multinode.log
-#SBATCH --error=/users/framunno/logs/err/err_overfit_15step_v4_cartesian_coordinates_absmax_debug_multinode.log
+#SBATCH --output=/users/framunno/logs/out/out_overfit_15step_v4_cartesian_coordinates_absmax_debug_multinode_NOCONDITION_IN_OUTPUT.log
+#SBATCH --error=/users/framunno/logs/err/err_overfit_15step_v4_cartesian_coordinates_absmax_debug_multinode_NOCONDITION_IN_OUTPUT.log
 
 # =============================================================================
 # ✅ Environment setup
@@ -64,9 +64,9 @@ export PREDICT_STEPS=15
 export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_unet.json"
 export CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
 export BATCH_SIZE=1
-export DIR_NAME="unet_forecast_15frames_overfit_absolute_max_cscs_debug_multinode"
+export DIR_NAME="unet_forecast_15frames_overfit_absolute_max_cscs_debug_multinode_NOCONDITION_IN_OUTPUT"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-export WANDB_RUN_NAME="unet_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_cscs_debug_multinode"
+export WANDB_RUN_NAME="unet_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_cscs_debug_multinode_NOCONDITION_IN_OUTPUT"
 
 export NORM_TYPE="absolute_max"
 export PREPROCESS_SCALING="log10"

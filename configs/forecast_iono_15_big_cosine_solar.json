@@ -44,7 +44,7 @@
     },
     "lr_sched": {
         "type": "cosine",
-        "warmup_epochs": 2,
+        "warmup_steps": 1000,
         "eta_min_factor": 100
     },
     "ema_sched": {

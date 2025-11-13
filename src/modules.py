@@ -421,7 +421,7 @@ class PaletteModelV2(nn.Module):
         num_cond_frames = cond.shape[1] if cond is not None else 0
 
         # # Concatenate the source image and reference image
-        # x = torch.cat([x, cond], dim=1)
+        x = torch.cat([cond, x], dim=1)
 
         temporal_positions = torch.arange(-num_cond_frames, num_cond_frames,
                                          device=x.device, dtype=x.dtype)
@@ -473,7 +473,11 @@ class PaletteModelV2(nn.Module):
         output = self.outc(x)
         output = output.squeeze(1)  # Remove channel dim if needed: (B, 1, T, H, W) -> (B, T, H, W)
 
-        return output.requires_grad_(True)
+        output = output[:, -num_pred_frames:, :, :]
+
+        return output
+
+        # return output.requires_grad_(True)
 
     def param_groups(self, base_lr=2e-4):
         """
