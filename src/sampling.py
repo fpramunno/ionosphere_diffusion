@@ -623,7 +623,7 @@ def sample_dpmpp_2m_sde(model, x, sigmas, unet_cond, extra_args=None, callback=N
         raise ValueError('solver_type must be \'heun\' or \'midpoint\'')
 
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
-    x = torch.cat([unet_cond, x], dim=1)
+    # x = torch.cat([unet_cond, x], dim=1)
     noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max) if noise_sampler is None else noise_sampler
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])

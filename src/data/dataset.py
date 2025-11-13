@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 import random
 from pathlib import Path
 from torchvision.transforms import Compose, Normalize
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler, IterableDataset, get_worker_info
 from typing import Iterator
 from datetime import datetime, timedelta
 from collections.abc import Sized
@@ -451,10 +451,15 @@ def extract_timestamp(filename):
             return dt
 
 
+# Global cache for Cartesian transform coordinates
+_CARTESIAN_TRANSFORM_CACHE = {}
+
 def latlon_to_cartesian_grid(data, output_size=224):
     """
     Convert (24, 360) lat/lon ionosphere data to (output_size, output_size) Cartesian grid.
     Creates a circular disk representation.
+
+    OPTIMIZED: Caches coordinate transformations to avoid recomputing on every call.
 
     Args:
         data: (24, 360) numpy array
@@ -467,32 +472,58 @@ def latlon_to_cartesian_grid(data, output_size=224):
     if data.ndim > 2:
         data = data.squeeze()
 
-    # Original lat/lon coordinates
-    mag_lat = np.linspace(-90, -66, data.shape[0])  # 24 latitude points
-    mag_lon = np.linspace(0, 360, data.shape[1], endpoint=False)  # 360 longitude points
-    lon_grid, lat_grid = np.meshgrid(mag_lon, mag_lat)
+    cache_key = (data.shape[0], data.shape[1], output_size)
 
-    # Convert to polar (r, theta)
-    r = 90 - np.abs(lat_grid.flatten())  # radial distance
-    theta = np.deg2rad(lon_grid.flatten())  # angle in radians
+    # Check if we've already computed the coordinate transformation
+    if cache_key not in _CARTESIAN_TRANSFORM_CACHE:
+        # Original lat/lon coordinates
+        mag_lat = np.linspace(-90, -66, data.shape[0])  # 24 latitude points
+        mag_lon = np.linspace(0, 360, data.shape[1], endpoint=False)  # 360 longitude points
+        lon_grid, lat_grid = np.meshgrid(mag_lon, mag_lat)
 
-    # Convert polar to Cartesian (x, y)
-    x_src = r * np.cos(theta)
-    y_src = r * np.sin(theta)
+        # Convert to polar (r, theta)
+        r = 90 - np.abs(lat_grid.flatten())  # radial distance
+        theta = np.deg2rad(lon_grid.flatten())  # angle in radians
 
-    # Create target Cartesian grid (output_size x output_size)
-    max_r = r.max()
-    x_target = np.linspace(-max_r, max_r, output_size)
-    y_target = np.linspace(-max_r, max_r, output_size)
-    x_grid, y_grid = np.meshgrid(x_target, y_target)
+        # Convert polar to Cartesian (x, y)
+        x_src = r * np.cos(theta)
+        y_src = r * np.sin(theta)
 
-    # Interpolate data onto Cartesian grid
-    points = np.column_stack((x_src, y_src))
-    grid_values = griddata(points, data.flatten(), (x_grid, y_grid), method='linear', fill_value=0)
+        # Create target Cartesian grid (output_size x output_size)
+        max_r = r.max()
+        x_target = np.linspace(-max_r, max_r, output_size)
+        y_target = np.linspace(-max_r, max_r, output_size)
+        x_grid, y_grid = np.meshgrid(x_target, y_target)
 
-    # Mask values outside the circle
-    r_grid = np.sqrt(x_grid**2 + y_grid**2)
-    grid_values[r_grid > max_r] = 0  # Zero outside the circle
+        # Mask for values outside the circle
+        r_grid = np.sqrt(x_grid**2 + y_grid**2)
+        mask = r_grid > max_r
+
+        # Source points for interpolation
+        points = np.column_stack((x_src, y_src))
+
+        # Cache everything we need for interpolation
+        _CARTESIAN_TRANSFORM_CACHE[cache_key] = {
+            'points': points,
+            'x_grid': x_grid,
+            'y_grid': y_grid,
+            'mask': mask
+        }
+
+    # Retrieve cached coordinates
+    cache = _CARTESIAN_TRANSFORM_CACHE[cache_key]
+
+    # Interpolate data onto Cartesian grid (this is the only expensive operation now)
+    grid_values = griddata(
+        cache['points'],
+        data.flatten(),
+        (cache['x_grid'], cache['y_grid']),
+        method='linear',
+        fill_value=0
+    )
+
+    # Apply mask
+    grid_values[cache['mask']] = 0
 
     return grid_values
 class IonoSequenceDataset(Dataset):
@@ -562,12 +593,26 @@ class IonoSequenceDataset(Dataset):
             # Using L1 conditions from merged CSV
             if 'proton_vx_gsm' not in df.columns:
                 raise ValueError("CSV file must contain L1 columns when use_l1_conditions=True")
-            
+
             # Store min and max for L1 columns for normalization (exclude missing values)
             l1_cols = ['bx_gsm', 'by_gsm', 'bz_gsm', 'proton_vx_gsm']
             df_clean = df[l1_cols].replace(-99999, np.nan)  # Replace missing values with NaN
             self.cond_min = df_clean.min().values.astype(np.float32)  # min ignores NaN
             self.cond_max = df_clean.max().values.astype(np.float32)  # max ignores NaN
+
+            # Create a dictionary for O(1) lookup: filename -> row data
+            # This is MUCH faster than reading CSV or filtering dataframe on every __getitem__
+            print(f"Building L1 conditions cache for {split} split...")
+            self.filename_to_conditions = {}
+            for _, row in df.iterrows():
+                filename = os.path.basename(row['filename'])
+                self.filename_to_conditions[filename] = np.array([
+                    row['bx_gsm'],
+                    row['by_gsm'],
+                    row['bz_gsm'],
+                    row['proton_vx_gsm'],
+                ], dtype=np.float32)
+            print(f"Cached L1 conditions for {len(self.filename_to_conditions)} files")
         else:
             # Using original projected bow shock conditions from separate CSV
             if self.transform_cond_csv is None:
@@ -750,10 +795,6 @@ class IonoSequenceDataset(Dataset):
         data_tensors = []
         cond_tensors = []
 
-        # Get the CSV dataframe for condition lookup if using L1 conditions
-        if self.use_l1_conditions:
-            df = pd.read_csv(self.csv_path)
-
         # Calculate expected timestamps for the sequence (2-min cadence)
         center_time = self.all_timestamps[center_idx]
         expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
@@ -810,18 +851,11 @@ class IonoSequenceDataset(Dataset):
                         data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1 # normalize to [-1, 1]
 
                 if self.use_l1_conditions:
+                    # Use cached conditions dictionary for O(1) lookup
                     filename = os.path.basename(file_path)
-                    file_row = df[df['filename'] == filename]
-
-                    if len(file_row) == 0:
-                        raise ValueError(f"Filename {filename} not found in CSV")
-
-                    cond_raw = np.array([
-                        file_row['bx_gsm'].iloc[0],
-                        file_row['by_gsm'].iloc[0],
-                        file_row['bz_gsm'].iloc[0],
-                        file_row['proton_vx_gsm'].iloc[0],
-                    ], dtype=np.float32)
+                    if filename not in self.filename_to_conditions:
+                        raise ValueError(f"Filename {filename} not found in conditions cache")
+                    cond_raw = self.filename_to_conditions[filename]
                 else:
                     cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
                 
@@ -909,6 +943,8 @@ def get_sequence_data_objects(
     only_complete_sequences=False,  # Only use sequences with no missing frames
     preprocess_config=None,  # Preprocessing config for ionosphere_preprocess normalization
     seed=42,
+    persistent_workers=False,  # Keep data loading workers alive between epochs
+    prefetch_factor=None,  # Number of batches to prefetch per worker (default: 2 in PyTorch)
 ):
     dataset = IonoSequenceDataset(
         csv_path=csv_path,
@@ -933,16 +969,332 @@ def get_sequence_data_objects(
         )
     else:
         sampler = RandomSamplerSeed(dataset)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_data_workers,
-        shuffle=False,
-        sampler=sampler,
-        drop_last=True,
-        pin_memory=torch.cuda.is_available()
-    )
+
+    # Build dataloader kwargs with optimizations
+    dataloader_kwargs = {
+        'dataset': dataset,
+        'batch_size': batch_size,
+        'num_workers': num_data_workers,
+        'shuffle': False,
+        'sampler': sampler,
+        'drop_last': True,
+        'pin_memory': torch.cuda.is_available(),
+    }
+
+    # Add optimization parameters only if workers are used
+    if num_data_workers > 0:
+        if persistent_workers:
+            dataloader_kwargs['persistent_workers'] = True
+        if prefetch_factor is not None:
+            dataloader_kwargs['prefetch_factor'] = prefetch_factor
+
+    dataloader = DataLoader(**dataloader_kwargs)
     return dataset, sampler, dataloader
+
+
+class IonoSequenceIterableDataset(IterableDataset):
+    """
+    Iterable version of IonoSequenceDataset with proper sharding for multi-GPU/multi-worker scaling.
+
+    Key improvements for scaling:
+    - Proper sharding across GPU ranks (no data duplication between GPUs)
+    - Proper sharding across data loading workers (no overlap)
+    - Sequential file access (faster disk I/O than random seeks)
+    - Streams data instead of loading all at once
+
+    Inspired by TorchTitan's data loading architecture.
+    """
+
+    def __init__(
+        self,
+        csv_path,
+        transform_cond_csv=None,
+        resolution=(24, 360),
+        train_val_test=[0.8, 0.10, 0.10],
+        split="train",
+        sequence_length=5,
+        transforms=True,
+        normalization_type="absolute_max",
+        use_l1_conditions=False,
+        min_center_distance=15,
+        cartesian_transform=False,
+        output_size=64,
+        per_file_stats_path=None,
+        only_complete_sequences=False,
+        preprocess_config=None,
+        seed=42,
+        dp_rank=0,  # GPU rank for multi-GPU sharding
+        dp_world_size=1,  # Total number of GPUs
+        infinite=False,  # Whether to loop infinitely
+        shuffle=True,  # Whether to shuffle each epoch
+    ):
+        super().__init__()
+
+        self.csv_path = csv_path
+        self.transform_cond_csv = transform_cond_csv
+        self.sequence_length = sequence_length
+        self.transforms = transforms
+        self.normalization_type = normalization_type
+        self.use_l1_conditions = use_l1_conditions
+        self.min_center_distance = min_center_distance
+        self.cartesian_transform = cartesian_transform
+        self.output_size = output_size
+        self.only_complete_sequences = only_complete_sequences
+        self.preprocess_config = preprocess_config
+        self.seed = seed
+        self.split = split
+        self.train_perc = train_val_test[0]
+        self.valid_perc = train_val_test[1]
+        self.test_perc = train_val_test[2]
+
+        # Sharding config (like TorchTitan)
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        self.infinite = infinite
+        self.shuffle = shuffle
+        self._epoch = 0
+
+        # Load global stats if provided
+        self.global_mean = None
+        self.global_std = None
+        if per_file_stats_path is not None:
+            import json
+            with open(per_file_stats_path, 'r') as f:
+                stats = json.load(f)
+                if isinstance(stats, dict) and 'mean' in stats and 'std' in stats:
+                    self.global_mean = stats['mean']
+                    self.global_std = stats['std']
+
+        # Initialize normalizer
+        if self.normalization_type == "mean_sigma_tanh":
+            self.normalizer = MeanSigmaTanhNormalizer()
+        else:
+            self.normalizer = None
+
+        # Read CSV and build sequence list (same as original)
+        df = pd.read_csv(self.csv_path)
+
+        if self.use_l1_conditions:
+            if 'proton_vx_gsm' not in df.columns:
+                raise ValueError("CSV file must contain L1 columns when use_l1_conditions=True")
+
+            l1_cols = ['bx_gsm', 'by_gsm', 'bz_gsm', 'proton_vx_gsm']
+            df_clean = df[l1_cols].replace(-99999, np.nan)
+            self.cond_min = df_clean.min().values.astype(np.float32)
+            self.cond_max = df_clean.max().values.astype(np.float32)
+
+            # Build conditions cache
+            print(f"Building L1 conditions cache for {split} split...")
+            self.filename_to_conditions = {}
+            for _, row in df.iterrows():
+                filename = os.path.basename(row['filename'])
+                self.filename_to_conditions[filename] = np.array([
+                    row['bx_gsm'], row['by_gsm'], row['bz_gsm'], row['proton_vx_gsm'],
+                ], dtype=np.float32)
+            print(f"Cached L1 conditions for {len(self.filename_to_conditions)} files")
+        else:
+            if self.transform_cond_csv is None:
+                raise ValueError("transform_cond_csv must be provided when use_l1_conditions=False")
+            df_cond = pd.read_csv(self.transform_cond_csv)
+            df_cond["float4"] = df_cond["float4"] * -1
+            df_cond_clean = df_cond[["float1", "float2", "float3", "float4"]].replace(-99999, np.nan)
+            self.cond_min = df_cond_clean.min().values.astype(np.float32)
+            self.cond_max = df_cond_clean.max().values.astype(np.float32)
+
+        # Build file and timestamp lists
+        df['timestamp'] = df['filename'].apply(extract_timestamp)
+        df = df.dropna(subset=['timestamp'])
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        self.all_files = df['filename'].tolist()
+        self.all_timestamps = df['timestamp'].tolist()
+
+        # Build sequences
+        self.sequences = []
+        n = len(self.all_files)
+        i = 0
+        while i + self.sequence_length <= n:
+            center_idx = i + self.sequence_length // 2
+            if not self.sequences or (center_idx - self.sequences[-1] >= self.min_center_distance):
+                self.sequences.append(center_idx)
+                i += self.min_center_distance
+            else:
+                i += 1
+
+        # Split by month
+        train_seqs, val_seqs, test_seqs = [], [], []
+        for center_idx in self.sequences:
+            month = self.all_timestamps[center_idx].month
+            if 1 <= month <= 8:
+                train_seqs.append(center_idx)
+            elif 9 <= month <= 10:
+                val_seqs.append(center_idx)
+            elif 11 <= month <= 12:
+                test_seqs.append(center_idx)
+
+        split_seqs = {'train': train_seqs, 'valid': val_seqs, 'test': test_seqs}[self.split]
+        self.sequences = split_seqs
+
+        # Filter complete sequences if requested
+        if self.only_complete_sequences:
+            original_count = len(self.sequences)
+            self.sequences = self._filter_complete_sequences()
+            filtered_count = len(self.sequences)
+            print(f"Filtered sequences for {self.split}: {original_count} -> {filtered_count} "
+                  f"({filtered_count/original_count*100:.1f}% complete)")
+
+        print(f"IonoSequenceIterableDataset [{split}]: {len(self.sequences)} sequences")
+        print(f"  GPU rank: {dp_rank}/{dp_world_size}, Shuffle: {shuffle}")
+
+    def _filter_complete_sequences(self):
+        """Filter out sequences with missing frames."""
+        complete = []
+        for center_idx in self.sequences:
+            start_idx = center_idx - self.sequence_length // 2
+            center_time = self.all_timestamps[center_idx]
+            expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
+
+            is_complete = True
+            for frame_offset in range(self.sequence_length):
+                file_idx = start_idx + frame_offset
+                expected_time = expected_start_time + timedelta(minutes=2 * frame_offset)
+
+                frame_exists = False
+                if 0 <= file_idx < len(self.all_files):
+                    actual_time = self.all_timestamps[file_idx]
+                    if abs((actual_time - expected_time).total_seconds()) <= 1:
+                        frame_exists = True
+
+                if not frame_exists:
+                    is_complete = False
+                    break
+
+            if is_complete:
+                complete.append(center_idx)
+
+        return complete
+
+    def _shard_sequences_global(self):
+        """Shard sequences across GPU ranks."""
+        sequences = self.sequences.copy()
+        if self.shuffle:
+            rng = random.Random(self.seed + self._epoch)
+            rng.shuffle(sequences)
+        # Each GPU rank gets every Nth sequence
+        return sequences[self.dp_rank::self.dp_world_size]
+
+    def _shard_sequences_worker(self, sequences):
+        """Shard sequences across workers within this GPU rank."""
+        worker_info = get_worker_info()
+        if worker_info:
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+            # Each worker gets every Nth sequence
+            sequences = sequences[worker_id::num_workers]
+        return sequences
+
+    def _load_sequence(self, center_idx):
+        """Load a single sequence."""
+        start_idx = center_idx - self.sequence_length // 2
+        data_tensors = []
+        cond_tensors = []
+
+        center_time = self.all_timestamps[center_idx]
+        expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
+
+        for frame_offset in range(self.sequence_length):
+            file_idx = start_idx + frame_offset
+            expected_time = expected_start_time + timedelta(minutes=2 * frame_offset)
+
+            frame_exists = False
+            if 0 <= file_idx < len(self.all_files):
+                actual_time = self.all_timestamps[file_idx]
+                if abs((actual_time - expected_time).total_seconds()) <= 1:
+                    frame_exists = True
+
+            if frame_exists:
+                file_path = self.all_files[file_idx]
+                data = np.load('/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/' + file_path, allow_pickle=True)
+
+                data_map = data[0].astype(np.float32)
+                if self.cartesian_transform:
+                    data_map = latlon_to_cartesian_grid(data_map, output_size=self.output_size)
+
+                data_tensor = torch.from_numpy(data_map).float().unsqueeze(0)
+
+                if self.transforms:
+                    if self.normalization_type == "ionosphere_preprocess":
+                        data_tensor = get_ionosphere_transform(data_tensor, config=self.preprocess_config)
+                    else:
+                        data_tensor = torch.clamp(data_tensor, -80000, 80000)
+                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1
+
+                if self.use_l1_conditions:
+                    filename = os.path.basename(file_path)
+                    cond_raw = self.filename_to_conditions[filename]
+                else:
+                    cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
+
+                cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
+                cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
+            else:
+                # Missing frame
+                if self.cartesian_transform:
+                    data_tensor = torch.zeros(1, self.output_size, self.output_size, dtype=torch.float32)
+                else:
+                    data_tensor = torch.zeros(1, 24, 360, dtype=torch.float32)
+                cond_tensor = torch.full((4,), 2.0, dtype=torch.float32)
+
+            data_tensors.append(data_tensor)
+            cond_tensors.append(cond_tensor)
+
+        data_seq = torch.stack(data_tensors, dim=0)
+        cond_seq = torch.stack(cond_tensors, dim=0)
+        return data_seq, cond_seq
+
+    def __iter__(self):
+        """Iterate through sequences assigned to this worker."""
+        # Shard across GPU ranks first
+        sequences = self._shard_sequences_global()
+        # Then shard across workers
+        sequences = self._shard_sequences_worker(sequences)
+
+        while True:
+            for center_idx in sequences:
+                try:
+                    data_seq, cond_seq = self._load_sequence(center_idx)
+                    yield data_seq, cond_seq
+                except Exception as e:
+                    print(f"Error loading sequence center_idx={center_idx}: {e}")
+                    continue
+
+            if not self.infinite:
+                break
+
+            # Reshuffle for next epoch
+            self._epoch += 1
+            sequences = self._shard_sequences_global()
+            sequences = self._shard_sequences_worker(sequences)
+
+    def set_epoch(self, epoch):
+        """Set epoch for shuffling."""
+        self._epoch = epoch
+
+    def __len__(self):
+        """
+        Return approximate length for progress bars and logging.
+
+        Note: IterableDataset doesn't need __len__, but it's useful for:
+        - Progress bars (tqdm)
+        - Logging dataset size
+        - Estimating epoch length
+        """
+        # Total sequences divided by (GPUs * workers)
+        # This is approximate since we don't know num_workers until __iter__ is called
+        num_sequences = len(self.sequences)
+        sequences_per_rank = num_sequences // self.dp_world_size
+        # Assume 8 workers (rough estimate)
+        # In practice, each worker gets sequences_per_rank // num_workers
+        return sequences_per_rank
 
 
 class IonoRAEDataset(Dataset):
@@ -1215,3 +1567,96 @@ def get_ionosphere_rae_dataloaders(
     )
 
     return train_loader, val_loader, train_dataset, val_dataset
+
+
+def get_sequence_data_objects_iterable(
+    batch_size,
+    num_data_workers,
+    sequence_length,
+    train_val_test=[0.8, 0.10, 0.10],
+    rank=None,
+    world_size=None,
+    split="train",
+    csv_path=None,
+    transform_cond_csv=None,
+    transforms=True,
+    normalization_type="absolute_max",
+    use_l1_conditions=False,
+    min_center_distance=15,
+    cartesian_transform=False,
+    output_size=224,
+    per_file_stats_path=None,
+    only_complete_sequences=False,
+    preprocess_config=None,
+    seed=42,
+    persistent_workers=False,
+    prefetch_factor=None,
+    shuffle=True,
+):
+    """
+    Create IterableDataset version with proper multi-GPU and multi-worker sharding.
+
+    This is the RECOMMENDED way to use data loading for scaling!
+
+    Benefits over map-style Dataset:
+    - Proper sharding across GPUs (no data duplication)
+    - Proper sharding across workers (no overlap)
+    - Sequential disk I/O (much faster than random seeks)
+    - Better memory efficiency
+    """
+
+    # Determine dp_rank and dp_world_size
+    if rank is not None and world_size is not None:
+        dp_rank = rank
+        dp_world_size = world_size
+    else:
+        # Try to get from torch.distributed
+        if torch.distributed.is_initialized():
+            dp_rank = torch.distributed.get_rank()
+            dp_world_size = torch.distributed.get_world_size()
+        else:
+            dp_rank = 0
+            dp_world_size = 1
+
+    dataset = IonoSequenceIterableDataset(
+        csv_path=csv_path,
+        transform_cond_csv=transform_cond_csv,
+        transforms=transforms,
+        split=split,
+        seed=seed,
+        train_val_test=train_val_test,
+        sequence_length=sequence_length,
+        normalization_type=normalization_type,
+        use_l1_conditions=use_l1_conditions,
+        min_center_distance=min_center_distance,
+        cartesian_transform=cartesian_transform,
+        output_size=output_size,
+        per_file_stats_path=per_file_stats_path,
+        only_complete_sequences=only_complete_sequences,
+        preprocess_config=preprocess_config,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        infinite=False,  # Set to True for infinite iteration if needed
+        shuffle=shuffle,
+    )
+
+    # Build dataloader kwargs with optimizations
+    dataloader_kwargs = {
+        'dataset': dataset,
+        'batch_size': batch_size,
+        'num_workers': num_data_workers,
+        'pin_memory': torch.cuda.is_available(),
+        'drop_last': True,
+    }
+
+    # Add optimization parameters only if workers are used
+    if num_data_workers > 0:
+        if persistent_workers:
+            dataloader_kwargs['persistent_workers'] = True
+        if prefetch_factor is not None:
+            dataloader_kwargs['prefetch_factor'] = prefetch_factor
+
+    # IterableDataset doesn't use sampler
+    dataloader = DataLoader(**dataloader_kwargs)
+
+    return dataset, None, dataloader

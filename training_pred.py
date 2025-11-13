@@ -5,12 +5,27 @@ Created on Sat Apr  5 15:47:31 2025
 @author: pio-r
 """
 
-# import debugpy
+# ------------------------------------------------------------------
+# ✅ Pre-FSDP enum coercion for all distributed ranks
+#     must run BEFORE importing accelerate or torch.distributed
+# ------------------------------------------------------------------
+import os
 
-# debugpy.connect(("v000675", 5678))  # VS Code listens on login node
-# print("✅ Connected to VS Code debugger!")
-# debugpy.wait_for_client()
-# print("🎯 Debugger attached!")
+if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() in {"true", "1"}:
+    from torch.distributed.fsdp import ShardingStrategy, StateDictType, BackwardPrefetch
+
+    def _coerce_accelerate_enum(env_name: str, enum_cls):
+        value = os.environ.get(env_name)
+        if not value or value.isdigit():
+            return
+        upper = value.upper()
+        if upper in enum_cls.__members__:
+            os.environ[env_name] = str(enum_cls[upper].value)
+
+    for prefix in ["ACCELERATE_FSDP_", "ACCELERATE_FSDP_FSDP_"]:
+        _coerce_accelerate_enum(f"{prefix}SHARDING_STRATEGY", ShardingStrategy)
+        _coerce_accelerate_enum(f"{prefix}STATE_DICT_TYPE", StateDictType)
+        _coerce_accelerate_enum(f"{prefix}BACKWARD_PREFETCH", BackwardPrefetch)
 
 def main():
 
@@ -36,7 +51,7 @@ def main():
 
     from util import generate_samples
     import torch
-    from src.data.dataset import get_data_objects, get_sequence_data_objects
+    from src.data.dataset import get_data_objects, get_sequence_data_objects, get_sequence_data_objects_iterable
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -50,7 +65,7 @@ def main():
                 help='the configuration file')
     p.add_argument('--data-path', type=str, default="/users/framunno/data/ionosphere/ionosphere_data/pickled_maps",
                 help='the path of the dataset')
-    p.add_argument('--saving-path', type=str, default="/users/framunno/models_results", 
+    p.add_argument('--saving-path', type=str, default="/capstor/scratch/cscs/framunno/models_results", 
                 help='the path where to save the model')
     p.add_argument('--dir-name', type=str, default='cond_forecasting_cfg_oneframe_nonorm',
                 help='the directory name to use')  # <---- Added this line
@@ -130,6 +145,16 @@ def main():
     p.add_argument('--only-complete-sequences', action='store_true',
                 help='only use sequences with no missing frames (no zero-padded frames)')
 
+    # FSDP and scaling arguments
+    p.add_argument('--use-fsdp', action='store_true',
+                help='use FSDP config (make sure to use configs/accelerate_config_fsdp.yaml)')
+    p.add_argument('--activation-checkpointing', action='store_true',
+                help='enable activation checkpointing (saves memory, slight compute overhead)')
+    p.add_argument('--compile-model', action='store_true',
+                help='use torch.compile for 20-30%% speedup (requires PyTorch 2.0+)')
+    p.add_argument('--use-iterable-dataset', action='store_true',
+                help='use IterableDataset for proper multi-GPU/multi-worker sharding (RECOMMENDED for scaling!)')
+
     args = p.parse_args()
 
     # Apply debug mode settings
@@ -184,7 +209,7 @@ def main():
     size = model_config['input_size']
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps,
-                                            mixed_precision=args.mixed_precision, 
+                                            mixed_precision=args.mixed_precision,
                 kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)])
 
     device = accelerator.device
@@ -193,7 +218,16 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         print(f'World size: {accelerator.num_processes}', flush=True)
-        print(f'Batch size: {args.batch_size * accelerator.num_processes}', flush=True)
+        print(f'Batch size per GPU: {args.batch_size}', flush=True)
+        print(f'Global batch size: {args.batch_size * accelerator.num_processes}', flush=True)
+        print(f'Effective batch size: {args.batch_size * accelerator.num_processes * args.grad_accum_steps}', flush=True)
+        print(f'Mixed precision: {args.mixed_precision}', flush=True)
+        if args.use_fsdp:
+            print(f'Using FSDP: ✅')
+        if args.activation_checkpointing:
+            print(f'Activation checkpointing: ✅')
+        if args.compile_model:
+            print(f'Torch compile: ✅')
 
     if args.seed is not None:
         seeds = torch.randint(-2 ** 63, 2 ** 63 - 1, [accelerator.num_processes], generator=torch.Generator().manual_seed(args.seed))
@@ -201,13 +235,25 @@ def main():
     demo_gen = torch.Generator().manual_seed(torch.randint(-2 ** 63, 2 ** 63 - 1, ()).item())
     elapsed = 0.0
 
-    # Model definition,
+    # Model definition
     inner_model = K.config.make_model(config)
-    inner_model_ema = deepcopy(inner_model)
+    # NOTE: inner_model_ema will be created AFTER accelerator.prepare() to avoid
+    # deepcopy issues in multi-node DDP initialization
 
-    if args.compile:
-        inner_model.compile()
-        # inner_model_ema.compile()
+    # Enable activation checkpointing if requested (saves memory)
+    if args.activation_checkpointing or args.checkpointing:
+        # This will use gradient checkpointing in transformer blocks
+        if hasattr(inner_model, 'set_gradient_checkpointing'):
+            inner_model.set_gradient_checkpointing(True)
+            if accelerator.is_main_process:
+                print("✅ Enabled gradient checkpointing on model")
+
+    # Apply torch.compile for speedup
+    if args.compile or args.compile_model:
+        if accelerator.is_main_process:
+            print("Compiling model with torch.compile...")
+        inner_model = torch.compile(inner_model, mode='max-autotune')
+        # Don't compile EMA model (not used in training loop)
 
     if accelerator.is_main_process:
         print(f'Parameters: {K.utils.n_params(inner_model):,}')
@@ -220,7 +266,8 @@ def main():
         log_config = vars(args)
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params(inner_model)
-        wandb.init(project="ionosphere", entity="francescopio", name=args.wandb_runname, config=log_config, save_code=True)
+        # Use current working directory for wandb (where we launch the script)
+        wandb.init(project="ionosphere", entity="francescopio", name=args.wandb_runname, config=log_config, save_code=True, dir=os.getcwd(), resume="allow")
     
     # MODEL SUMMARY
     if accelerator.is_main_process:
@@ -299,11 +346,18 @@ def main():
                 print(f"  Scale factor: {preprocess_config['scale_factor']}")
             print(f"{'='*80}\n")
 
-    train_dataset, train_sampler, train_dl = get_sequence_data_objects(
+    # Choose between regular Dataset and IterableDataset
+    if args.use_iterable_dataset:
+        print("✅ Using IterableDataset for proper multi-GPU/multi-worker sharding!")
+        get_data_fn = get_sequence_data_objects_iterable
+    else:
+        print("Using regular Dataset (map-style)")
+        get_data_fn = get_sequence_data_objects
+
+    train_dataset, train_sampler, train_dl = get_data_fn(
         csv_path=args.csv_path,
         transform_cond_csv=args.transform_cond_csv,
         batch_size=args.batch_size,
-        distributed=False,
         num_data_workers=args.num_workers,
         split='train',
         seed=42,
@@ -311,17 +365,18 @@ def main():
         normalization_type=args.normalization_type,
         preprocess_config=preprocess_config,
         use_l1_conditions=True,
-        min_center_distance=args.min_center_distance,
-        cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
-        output_size=64,  # Output grid size for Cartesian transform
-        only_complete_sequences=args.only_complete_sequences,  # Filter out sequences with missing frames
+        min_center_distance=1,
+        cartesian_transform=args.cartesian_transform,
+        output_size=64,
+        only_complete_sequences=args.only_complete_sequences,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
-    val_dataset, val_sampler, val_dl = get_sequence_data_objects(
+    val_dataset, val_sampler, val_dl = get_data_fn(
         csv_path=args.csv_path,
         transform_cond_csv=args.transform_cond_csv,
         batch_size=args.batch_size,
-        distributed=False,
         num_data_workers=args.num_workers,
         split='valid',
         seed=42,
@@ -329,10 +384,12 @@ def main():
         normalization_type=args.normalization_type,
         preprocess_config=preprocess_config,
         use_l1_conditions=True,
-        min_center_distance=args.min_center_distance,
-        cartesian_transform=args.cartesian_transform,  # Convert to Cartesian circular grid
-        output_size=64,  # Output grid size for Cartesian transform
-        only_complete_sequences=args.only_complete_sequences,  # Filter out sequences with missing frames
+        min_center_distance=1,
+        cartesian_transform=args.cartesian_transform,
+        output_size=64,
+        only_complete_sequences=args.only_complete_sequences,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     print(f'Train loader and Valid loader are up! Lengths: {len(train_dl)}, {len(val_dl)}')
@@ -372,31 +429,70 @@ def main():
                 return self.image, self.condition
 
         # Repeat the single sample enough times for a reasonable epoch
-        # With batch_size, this gives ~100 batches per epoch for quick overfitting tests
-        repeat_count = 10000 * args.batch_size
-        single_dataset = SingleSampleDataset(single_image, single_condition, repeat=repeat_count)
+        repeat_count_train = 10000 * args.batch_size
+        repeat_count_val = repeat_count_train // 10  # Validation set is 1/10 of training set
+
+        single_dataset_train = SingleSampleDataset(single_image, single_condition, repeat=repeat_count_train)
+        single_dataset_val = SingleSampleDataset(single_image, single_condition, repeat=repeat_count_val)
 
         if accelerator.is_main_process:
-            print(f"   Dataset size: {repeat_count} samples = {repeat_count // args.batch_size} batches per epoch")
+            print(f"   Train dataset size: {repeat_count_train} samples = {repeat_count_train // args.batch_size} batches per epoch (total)")
+            print(f"   Train per-GPU batches: {repeat_count_train // args.batch_size // accelerator.num_processes}")
+            print(f"   Val dataset size: {repeat_count_val} samples = {repeat_count_val // args.batch_size} batches per epoch (total)")
+            print(f"   Val per-GPU batches: {repeat_count_val // args.batch_size // accelerator.num_processes}")
 
-        # Create new dataloader with the single sample
-        # Use original batch_size so the model sees the expected batch dimension
+        # ✅ NEW WAY: Let accelerator.prepare() handle distributed logic automatically
+        # This works for DDP, FSDP, and other backends without manual DistributedSampler
         train_dl = torch.utils.data.DataLoader(
-            single_dataset,
+            single_dataset_train,
+            batch_size=args.batch_size,
+            shuffle=False,  # No shuffle for overfitting
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        val_dl = torch.utils.data.DataLoader(
+            single_dataset_val,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=0,
             pin_memory=True,
         )
 
-        # Also use the same single sample for validation
-        val_dl = torch.utils.data.DataLoader(
-            single_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-        )
+        # ❌ OLD MANUAL WAY (commented out - kept for reference):
+        # # Create DistributedSampler to shard across GPUs
+        # from torch.utils.data.distributed import DistributedSampler
+        # sampler = DistributedSampler(
+        #     single_dataset_train,
+        #     num_replicas=accelerator.num_processes,
+        #     rank=accelerator.process_index,
+        #     shuffle=False
+        # )
+        #
+        # # Create new dataloader with the single sample
+        # # Use original batch_size so the model sees the expected batch dimension
+        # train_dl = torch.utils.data.DataLoader(
+        #     single_dataset_train,
+        #     batch_size=args.batch_size,
+        #     sampler=sampler,
+        #     num_workers=0,
+        #     pin_memory=True,
+        # )
+        #
+        # # Create validation dataloader (1/10 the size of training)
+        # val_sampler = DistributedSampler(
+        #     single_dataset_val,
+        #     num_replicas=accelerator.num_processes,
+        #     rank=accelerator.process_index,
+        #     shuffle=False
+        # )
+        # val_dl = torch.utils.data.DataLoader(
+        #     single_dataset_val,
+        #     batch_size=args.batch_size,
+        #     sampler=val_sampler,
+        #     num_workers=0,
+        #     pin_memory=True,
+        # )
 
         if accelerator.is_main_process:
             print(f"   New dataloader will produce batches of size {args.batch_size} with the same trajectory repeated")
@@ -443,8 +539,15 @@ def main():
             raise ValueError("max_epochs must be specified when using cosine scheduler")
 
         epoch_size = len(train_dl)  # steps per epoch
-        warmup_epochs = sched_config.get('warmup_epochs', 0)
-        warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
+
+        # Support both warmup_steps (direct) and warmup_epochs (computed)
+        if 'warmup_steps' in sched_config:
+            warmup_steps = sched_config['warmup_steps']
+            warmup_epochs = warmup_steps * args.grad_accum_steps / epoch_size
+        else:
+            warmup_epochs = sched_config.get('warmup_epochs', 0)
+            warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
+
         total_steps = (args.max_epochs * epoch_size) // args.grad_accum_steps
         eta_min_factor = sched_config.get('eta_min_factor', 100)  # LR will decay to lr/100
 
@@ -469,7 +572,7 @@ def main():
 
             if accelerator.is_main_process:
                 print(f"📊 Cosine LR Schedule:")
-                print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs})")
+                print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs:.2f})")
                 print(f"   Total steps: {total_steps} (epochs: {args.max_epochs})")
                 print(f"   Base LR: {lr:.2e}")
                 print(f"   Min LR: {lr/eta_min_factor:.2e}")
@@ -496,11 +599,24 @@ def main():
 
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
-    if not args.overfit_single:
-        inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
-    else:
-        # For overfitting mode, don't prepare dataloaders (they're already simple)
-        inner_model, inner_model_ema, opt = accelerator.prepare(inner_model, inner_model_ema, opt)
+    # ✅ Now we ALWAYS prepare dataloaders - accelerator handles distribution automatically
+    # NOTE: We only prepare inner_model here (not EMA) to avoid deepcopy issues in multi-node DDP
+    inner_model, opt, train_dl = accelerator.prepare(inner_model, opt, train_dl)
+
+    # Create EMA model AFTER DDP wrapping to avoid multi-node initialization issues
+    # EMA model doesn't need DDP wrapping as it's only used for inference
+    if accelerator.is_main_process:
+        print("Creating EMA model from DDP-wrapped model...")
+    inner_model_ema = deepcopy(unwrap(inner_model))
+    if accelerator.is_main_process:
+        print(f"✅ EMA model created with {K.utils.n_params(inner_model_ema):,} parameters")
+
+    # ❌ OLD WAY (commented out - kept for reference):
+    # if not args.overfit_single:
+    #     inner_model, inner_model_ema, opt, train_dl = accelerator.prepare(inner_model, inner_model_ema, opt, train_dl)
+    # else:
+    #     # For overfitting mode, don't prepare dataloaders (they're already simple)
+    #     inner_model, inner_model_ema, opt = accelerator.prepare(inner_model, inner_model_ema, opt)
 
     use_wandb = args.use_wandb
 
@@ -568,15 +684,22 @@ def main():
 
     def save():
         accelerator.wait_for_everyone()
-        filename = os.path.join(args.saving_path, dir_path_mdl, f"{args.name}_epoch_{epoch:04}.pth") 
+        filename = os.path.join(dir_path_mdl, f"{args.name}_epoch_{epoch:04}.pth")
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
+
+        # For FSDP, we need to get full state dict, not sharded
         inner_model = unwrap(model.inner_model)
         inner_model_ema = unwrap(model_ema.inner_model)
+
+        # Use accelerator.get_state_dict to properly gather full model from FSDP shards
+        model_state = accelerator.get_state_dict(inner_model)
+        model_ema_state = accelerator.get_state_dict(inner_model_ema)
+
         obj = {
             'config': config,
-            'model': inner_model.state_dict(),
-            'model_ema': inner_model_ema.state_dict(),
+            'model': model_state,
+            'model_ema': model_ema_state,
             'opt': opt.state_dict(),
             'sched': sched.state_dict(),
             'ema_sched': ema_sched.state_dict(),
@@ -588,14 +711,62 @@ def main():
             'demo_gen': demo_gen.get_state(),
             'elapsed': elapsed,
         }
-        accelerator.save(obj, filename)
+
+        # Only rank 0 should save the checkpoint to avoid file corruption
         if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': filename}
-            json.dump(state_obj, open(state_path, 'w'))
-        if args.wandb_save_model and use_wandb:
-            wandb.save(filename)
+            import tempfile
+            import shutil
+
+            # Save to local /tmp first (reliable for large files on network filesystem)
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pth', dir='/tmp', delete=False) as tmp_file:
+                temp_path = tmp_file.name
+
+            try:
+                tqdm.write(f'Saving checkpoint to local temp: {temp_path}')
+                torch.save(obj, temp_path)
+
+                file_size_gb = os.path.getsize(temp_path) / (1024**3)
+                tqdm.write(f'Local save complete ({file_size_gb:.2f} GB). Copying to network filesystem...')
+
+                shutil.copy2(temp_path, filename)
+                tqdm.write(f'Copy complete. Verifying checkpoint integrity...')
+
+                # Verify the network copy is readable
+                test_load = torch.load(filename, map_location='cpu')
+                del test_load
+
+                tqdm.write(f'✅ Checkpoint saved successfully to {filename}')
+
+                # Clean up temp file
+                os.remove(temp_path)
+
+                state_obj = {'latest_checkpoint': filename}
+                json.dump(state_obj, open(state_path, 'w'))
+
+                if args.wandb_save_model and use_wandb:
+                    wandb.save(filename)
+
+            except Exception as e:
+                tqdm.write(f'❌ Error during checkpoint save: {e}')
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+
+        # Wait for rank 0 to finish saving before all ranks continue
+        accelerator.wait_for_everyone()
 
     losses_since_last_print = []
+
+    # PROFILING: Track timing for different parts of training loop
+    # timing_stats = {
+    #     'data_loading': [],
+    #     'data_transfer': [],
+    #     'forward': [],
+    #     'backward': [],
+    #     'optimizer': [],
+    #     'ema': [],
+    # }
+
     model = model.to(device)
     try:
         while args.max_epochs is None or epoch < args.max_epochs:
@@ -603,33 +774,29 @@ def main():
             epoch_train_loss = 0  # Track total training loss
             num_train_batches = len(train_dl)  # Number of batches
             model.train()
+
+            batch_start_time = time.perf_counter()
             for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
-                if device.type == 'cuda':
-                    start_timer = torch.cuda.Event(enable_timing=True)
-                    end_timer = torch.cuda.Event(enable_timing=True)
-                    torch.cuda.synchronize()
-                    start_timer.record()
-                else:
-                    start_timer = time.time()
-                
-                print('Here')
+                # TIMING: Data loading time
+                data_load_time = time.perf_counter() - batch_start_time
+                # timing_stats['data_loading'].append(data_load_time)
+
                 with accelerator.accumulate(model):
-                    # Track memory before processing
-                    torch.cuda.synchronize()
-                    mem_before = torch.cuda.memory_allocated(device) / (1024 ** 3)  # Convert to GB
-                    reserved_before = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
-                    # print(f"Memory before processing: Allocated: {mem_before:.2f} GB, Reserved: {reserved_before:.2f} GB")
-
-                    # embed()
-
+                    # TIMING: Data transfer to GPU
+                    transfer_start = time.perf_counter()
                     inpt = batch[0].contiguous().float().to(device, non_blocking=True)
                     inpt = inpt.squeeze(2)  # shape: (batch_size, sequence_length, 24, 360)
                     cond_img = inpt[:, :args.conditioning_length, :, :]    # first conditioning_length time steps
                     target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
                     cond_label = batch[1].to(device, non_blocking=True)
-
                     cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
+                    torch.cuda.synchronize()  # Wait for transfers to complete
+                    transfer_time = time.perf_counter() - transfer_start
+                    # timing_stats['data_transfer'].append(transfer_time)
 
+                    # import pdb; pdb.set_trace()
+                    # TIMING: Forward pass
+                    forward_start = time.perf_counter()
                     extra_args = {}
                     noise = torch.randn_like(target_img).to(device)
                     with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
@@ -637,79 +804,116 @@ def main():
 
                     with K.models.checkpointing(args.checkpointing):
                         losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=cond_label_inp, **extra_args)
+                    torch.cuda.synchronize()  # Wait for forward to complete
+                    forward_time = time.perf_counter() - forward_start
+                    # timing_stats['forward'].append(forward_time)
 
                     # Evita NCCL timeout: non fare gather durante il training!
                     loss = losses.mean().item()
                     losses_since_last_print.append(loss)
                     epoch_train_loss += loss  # Accumulate loss
 
-                    # Backward pass
+                    # TIMING: Backward pass
+                    backward_start = time.perf_counter()
                     accelerator.backward(losses.mean())
+                    torch.cuda.synchronize()  # Wait for backward to complete
+                    backward_time = time.perf_counter() - backward_start
+                    # timing_stats['backward'].append(backward_time)
 
-                    # Track memory after backward pass
-                    torch.cuda.synchronize()
-                    mem_after_backward = torch.cuda.memory_allocated(device) / (1024 ** 3)  # Convert to GB
-                    reserved_after_backward = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
-                    # print(f"Memory after backward pass: Allocated: {mem_after_backward:.2f} GB, Reserved: {reserved_after_backward:.2f} GB")
-
+                    # TIMING: Optimizer step
+                    opt_start = time.perf_counter()
                     if args.gns:
                         sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
                         gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, inpt.shape[0], inpt.shape[0] * accelerator.num_processes)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.)
-                    opt.step()
-                    sched.step()
-                    opt.zero_grad()
+                        opt.step()
+                        sched.step()  # Only step scheduler when gradients are actually synced
+                        opt.zero_grad()
+                    # Note: When using gradient accumulation, opt/sched should only step when sync_gradients=True
+                    torch.cuda.synchronize()  # Wait for optimizer to complete
+                    opt_time = time.perf_counter() - opt_start
+                    # timing_stats['optimizer'].append(opt_time)
 
-                    # Track memory after optimizer step
-                    torch.cuda.synchronize()
-                    mem_after_step = torch.cuda.memory_allocated(device) / (1024 ** 3)  # Convert to GB
-                    reserved_after_step = torch.cuda.memory_reserved(device) / (1024 ** 3)  # Convert to GB
-                    print(f"Memory after optimizer step: Allocated: {mem_after_step:.2f} GB, Reserved: {reserved_after_step:.2f} GB")
-
+                    # TIMING: EMA update
+                    ema_start = time.perf_counter()
                     ema_decay = ema_sched.get_value()
                     K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
                     if accelerator.sync_gradients:
-                        K.utils.ema_update(model, model_ema, ema_decay)
+                        # Unwrap model.inner_model to match model_ema.inner_model parameter names (DDP vs non-DDP)
+                        K.utils.ema_update(unwrap(model.inner_model), model_ema.inner_model, ema_decay)
                         ema_sched.step()
+                    ema_time = time.perf_counter() - ema_start
+                    # timing_stats['ema'].append(ema_time)
 
-                if device.type == 'cuda':
-                    end_timer.record()
-                    torch.cuda.synchronize()
-                    elapsed += start_timer.elapsed_time(end_timer) / 1000
-                else:
-                    elapsed += time.time() - start_timer
-
-                if step % 25 == 0:
+                # Only log when we've actually done an optimizer step (gradients synced)
+                if accelerator.sync_gradients and step % 25 == 0:
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
                     if accelerator.is_main_process:
+                        # PROFILING: Report timing breakdown
+                        # if len(timing_stats['forward']) > 0:
+                        #     avg_data_load = sum(timing_stats['data_loading']) / len(timing_stats['data_loading']) * 1000
+                        #     avg_transfer = sum(timing_stats['data_transfer']) / len(timing_stats['data_transfer']) * 1000
+                        #     avg_forward = sum(timing_stats['forward']) / len(timing_stats['forward']) * 1000
+                        #     avg_backward = sum(timing_stats['backward']) / len(timing_stats['backward']) * 1000
+                        #     avg_optimizer = sum(timing_stats['optimizer']) / len(timing_stats['optimizer']) * 1000
+                        #     avg_ema = sum(timing_stats['ema']) / len(timing_stats['ema']) * 1000
+                        #     total_time = avg_data_load + avg_transfer + avg_forward + avg_backward + avg_optimizer + avg_ema
+
+                        #     tqdm.write(f'\n{"="*80}')
+                        #     tqdm.write(f'⏱️  TIMING BREAKDOWN (Step {step}):')
+                        #     tqdm.write(f'{"="*80}')
+                        #     tqdm.write(f'  Data Loading:   {avg_data_load:>8.2f}ms ({avg_data_load/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Data Transfer:  {avg_transfer:>8.2f}ms ({avg_transfer/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Forward Pass:   {avg_forward:>8.2f}ms ({avg_forward/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Backward Pass:  {avg_backward:>8.2f}ms ({avg_backward/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  Optimizer:      {avg_optimizer:>8.2f}ms ({avg_optimizer/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  EMA Update:     {avg_ema:>8.2f}ms ({avg_ema/total_time*100:>5.1f}%)')
+                        #     tqdm.write(f'  {"─"*80}')
+                        #     tqdm.write(f'  TOTAL:          {total_time:>8.2f}ms ({total_time/1000:.2f}s per iteration)')
+                        #     tqdm.write(f'{"="*80}\n')
+
+                        #     # Reset timing stats
+                        #     for key in timing_stats:
+                        #         timing_stats[key].clear()
+
                         if args.gns:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
                         else:
                             tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
 
-                        # Log GPU memory to wandb every 25 steps
-                        if use_wandb and device.type == 'cuda':
-                            torch.cuda.synchronize()
+                        # Log to wandb every 25 steps (removed GPU memory logging - it requires sync)
+                        if use_wandb:
                             wandb.log({
-                                'gpu/memory_allocated_gb': torch.cuda.memory_allocated(device) / (1024 ** 3),
-                                'gpu/memory_reserved_gb': torch.cuda.memory_reserved(device) / (1024 ** 3),
-                                'gpu/max_memory_allocated_gb': torch.cuda.max_memory_allocated(device) / (1024 ** 3),
                                 'train/loss_step': loss_disp,
                                 'train/avg_loss': avg_loss,
                             }, step=wandb_step)
 
-                step += 1
-                wandb_step += 1
+                # Step counter: Each iteration processes batch_size samples per GPU
+                # In distributed training, we want to count actual optimizer steps (when gradients sync)
+                # not individual forward/backward passes
+                if accelerator.sync_gradients:
+                    step += 1  # One optimizer step happened
+                    wandb_step += 1
+                batch_start_time = time.perf_counter()  # Start timing for next batch
 
                 if step == args.end_step:
                     if accelerator.is_main_process:
                         tqdm.write('Done!')
                     # return
             
-            epoch_train_loss /= num_train_batches 
+            # Average training loss: divide by number of batches processed on this GPU
+            epoch_train_loss /= num_train_batches
+
+            # In distributed training, each GPU has accumulated its own subset of losses
+            # We need to average across all GPUs to get the true epoch loss
+            epoch_train_loss_tensor = torch.tensor(epoch_train_loss, device=device)
+            gathered_train_loss = accelerator.gather(epoch_train_loss_tensor)
+            if accelerator.is_main_process:
+                # Average the per-GPU averages to get global average
+                epoch_train_loss = gathered_train_loss.mean().item()
 
             # **Validation Loop (After Training, Before wandb Logging)**
             model.eval()
@@ -750,17 +954,21 @@ def main():
                 tqdm.write(f"Epoch {epoch}, Train Loss: {epoch_train_loss:.6f}, Validation Loss: {val_loss:.6f}")
 
             # Sampling and Visualization
-            
-            if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
+            # NOTE: All ranks must participate in generate_samples() because model_ema uses FSDP
+            # FSDP collective operations require all ranks to participate
 
+            if epoch % args.evaluate_every == 0:
                 # Get spatial dimensions based on cartesian_transform flag
                 if args.cartesian_transform:
                     spatial_shape = (64, 64)
                 else:
                     spatial_shape = (24, 360)
 
-                # Test sampling
+                # ALL RANKS participate in sampling (FSDP requirement)
+                # But only rank 0 will use the result for visualization
                 samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
+
+            if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
 
                 import matplotlib.pyplot as plt
                 import imageio
@@ -785,45 +993,69 @@ def main():
                     # Use regular imshow for Cartesian data (224x224)
                     if args.predict_steps == 1:
                         # Single step prediction - show comparison
-                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
+                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=False)
+
                         im0 = axes[0].imshow(target_sample_orig, cmap='plasma', aspect='auto')
                         axes[0].set_title("Target (Ground Truth)")
                         axes[0].axis('off')
-                        plt.colorbar(im0, ax=axes[0], shrink=0.8)
+                        fig_comparison.colorbar(im0, ax=[axes[0]], shrink=0.8)   # 👈 fix: wrap in list
 
                         im1 = axes[1].imshow(generated_sample_orig, cmap='plasma', aspect='auto')
                         axes[1].set_title("Generated Prediction")
                         axes[1].axis('off')
-                        plt.colorbar(im1, ax=axes[1], shrink=0.8)
+                        fig_comparison.colorbar(im1, ax=[axes[1]], shrink=0.8)   # 👈 fix: wrap in list
 
-                        fig_single, ax = plt.subplots(figsize=(10, 10))
-                        im = ax.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
-                        ax.set_title(f"Generated Ionosphere Prediction - Epoch {epoch}")
-                        ax.axis('off')
-                        plt.colorbar(im, ax=ax, shrink=0.8)
+                        # plt.savefig('comparison_debug.png', bbox_inches='tight')
+
+                        fig_single, ax_single = plt.subplots(figsize=(10, 10))
+                        im_single = ax_single.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
+                        ax_single.set_title(f"Generated Prediction - Epoch {epoch}")
+                        ax_single.axis('off')
+                        plt.colorbar(im_single, ax=ax_single, shrink=0.8)
+
                     else:
                         # Multi-step prediction
                         generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 224, 224]
                         target_all_orig = target_sample * 80000.0  # [predict_steps, 224, 224]
+                        generated_sample_orig = generated_all_orig  # For vmin/vmax in later plotting
+
+                        # Handle case where dimensions might be squeezed
+                        target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
+                        gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
+
+                        # Determine shared color scale from the true data
+                        vmin = np.min(target_first)
+                        vmax = np.max(target_first)
 
                         fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
-                        im0 = axes[0].imshow(target_all_orig[0], cmap='plasma', aspect='auto')
+
+                        # --- Left: target ---
+                        im0 = axes[0].imshow(target_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
                         axes[0].set_title("Target Step 1")
                         axes[0].axis('off')
-                        plt.colorbar(im0, ax=axes[0], shrink=0.8)
 
-                        im1 = axes[1].imshow(generated_all_orig[0], cmap='plasma', aspect='auto')
+                        # --- Right: generated ---
+                        im1 = axes[1].imshow(gen_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
                         axes[1].set_title("Generated Step 1")
                         axes[1].axis('off')
-                        plt.colorbar(im1, ax=axes[1], shrink=0.8)
+
+                        # --- One shared colorbar ---
+                        cbar = fig_comparison.colorbar(im0, ax=axes, shrink=0.8)
+                        cbar.set_label("Intensity", fontsize=12)
+
+                        # --- Add figure title ---
                         fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}", fontsize=16)
 
-                        # Single plot shows the last predicted frame
-                        fig_single, ax = plt.subplots(figsize=(10, 10))
-                        im = ax.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
-                        ax.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}")
-                        ax.axis('off')
-                        plt.colorbar(im, ax=ax, shrink=0.8)
+                        # plt.savefig("comparison_debug.png", bbox_inches="tight")
+
+                        fig_single, ax_single = plt.subplots(figsize=(10, 10))
+                        im_single = ax_single.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
+                        ax_single.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}")
+                        ax_single.axis('off')
+                        # fig_single.colorbar(im_single, ax=ax_single, shrink=0.8)    
+
+                        # plt.savefig("fig_single.png", bbox_inches="tight")
+
                 else:
                     # Use polar plotting for polar data (24x360)
                     from util import plot_polar_ionosphere_single, plot_polar_ionosphere_comparison
@@ -848,10 +1080,15 @@ def main():
                         # Multi-step prediction - show sequence evolution
                         generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 24, 360]
                         target_all_orig = target_sample * 80000.0  # [predict_steps, 24, 360]
+                        generated_sample_orig = generated_all_orig  # For vmin/vmax in later plotting
+
+                        # Handle case where dimensions might be squeezed
+                        target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
+                        gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
 
                         fig_comparison, _ = plot_polar_ionosphere_comparison(
-                            data_original=target_all_orig[0],
-                            data_pred=generated_all_orig[0],
+                            data_original=target_first,
+                            data_pred=gen_first,
                             titles=["Target Step 1", "Generated Step 1"],
                             cmap='plasma',
                             figsize=(16, 8)
@@ -958,7 +1195,7 @@ def main():
                     
                     # Calculate metrics for all prediction steps
                     generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                    target_all_orig = (torch.cat([cond_img, target_img], dim=1) * 80000.0).cpu().numpy()  # [predict_steps, H, W]
+                    target_all_orig = (target_img * 80000.0).cpu().numpy()  # [predict_steps, H, W]
 
                     # Overall metrics across all prediction steps
                     mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
@@ -982,11 +1219,11 @@ def main():
                     
                     # Add per-step metrics if predicting multiple steps
                     if args.predict_steps > 1:
-                        for step in range(args.predict_steps):
-                            step_mse = np.mean((generated_all_orig[step] - target_all_orig[step]) ** 2)
-                            step_mae = np.mean(np.abs(generated_all_orig[step] - target_all_orig[step]))
-                            eval_dict[f'evaluation/mse_step_{step+1}'] = step_mse
-                            eval_dict[f'evaluation/mae_step_{step+1}'] = step_mae
+                        for frame in range(args.predict_steps):
+                            step_mse = np.mean((generated_all_orig[frame] - target_all_orig[0, frame]) ** 2)
+                            step_mae = np.mean(np.abs(generated_all_orig[frame] - target_all_orig[0, frame]))
+                            eval_dict[f'evaluation/mse_step_{frame+1}'] = step_mse
+                            eval_dict[f'evaluation/mae_step_{frame+1}'] = step_mae
                     
                     wandb.log(eval_dict, step=wandb_step)
                 
@@ -997,7 +1234,7 @@ def main():
                 buf_single.close()
                 
             # **wandb Logging (Now Includes Validation Loss and Max-Min Difference)**
-            if use_wandb:
+            if use_wandb and accelerator.is_main_process:
                 # Get spatial dimensions based on cartesian_transform flag
                 if args.cartesian_transform:
                     spatial_shape = (64, 64)
@@ -1007,60 +1244,54 @@ def main():
                 # Calculate max-min difference after reverting transformation
                 # Use current batch target_img for consistent max-min calculation
                 # torch.cat([unet_cond, noised_input], dim=1)
-                target_img_reverted = torch.cat([cond_img, target_img], dim=1) * 80000.0  # [batch_size, predict_steps, H, W]
+                target_img_reverted = target_img * 80000.0  # [batch_size, predict_steps, H, W]
 
-                if args.predict_steps == 1:
-                    # Single frame prediction - use the single frame
-                    target_reverted_flat = target_img_reverted.flatten()
-                    max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
+                # Only compute prediction metrics if we generated samples this epoch
+                if epoch % args.evaluate_every == 0:
+                    if args.predict_steps == 1:
+                        # Single frame prediction - use the single frame
+                        target_reverted_flat = target_img_reverted.flatten()
+                        max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
 
-                    pred_reverted = generated_sample[0].cpu().numpy() * 80000.0  # [H, W]
-                    pred_reverted_flat = pred_reverted.flatten()
-                    max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+                        pred_reverted = samples[0, 0].cpu().numpy() * 80000.0  # [H, W]
+                        pred_reverted_flat = pred_reverted.flatten()
+                        max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+                    else:
+                        # Multi-step prediction - compute max-min across entire predicted sequence
+                        # Reshape to [batch_size * predict_steps, H, W] then flatten
+                        target_reverted_seq = target_img_reverted.reshape(-1, *spatial_shape)  # [batch_size * predict_steps, H, W]
+                        target_reverted_flat = target_reverted_seq.flatten()
+                        max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
+
+                        pred_reverted_seq = samples[0].cpu().numpy() * 80000.0  # [predict_steps, H, W]
+                        pred_reverted_seq = pred_reverted_seq.reshape(-1, *spatial_shape)  # [predict_steps, H, W]
+                        pred_reverted_flat = pred_reverted_seq.flatten()
+                        max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
+
+                    log_dict = {
+                        'epoch': epoch,
+                        'loss': epoch_train_loss,
+                        'val_loss': val_loss,
+                        'lr': sched.get_last_lr()[0],
+                        'ema_decay': ema_decay,
+                        'max_min_difference_sequence': max_min_diff_gt,
+                        'max_min_difference_sequence_pred': max_min_diff_pred,
+                    }
                 else:
-                    # Multi-step prediction - compute max-min across entire predicted sequence
-                    # Reshape to [batch_size * predict_steps, H, W] then flatten
-                    target_reverted_seq = target_img_reverted.reshape(-1, *spatial_shape)  # [batch_size * predict_steps, H, W]
-                    target_reverted_flat = target_reverted_seq.flatten()
-                    max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
+                    # Not an evaluation epoch, skip prediction metrics
+                    log_dict = {
+                        'epoch': epoch,
+                        'loss': epoch_train_loss,
+                        'val_loss': val_loss,
+                        'lr': sched.get_last_lr()[0],
+                        'ema_decay': ema_decay,
+                    }
 
-                    pred_reverted_seq = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                    pred_reverted_seq = pred_reverted_seq.reshape(-1, *spatial_shape)  # [predict_steps, H, W]
-                    pred_reverted_flat = pred_reverted_seq.flatten()
-                    max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
-
-                # Get GPU memory stats for epoch summary
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                    gpu_mem_allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-                    gpu_mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
-                    gpu_mem_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-                else:
-                    gpu_mem_allocated = 0.0
-                    gpu_mem_reserved = 0.0
-                    gpu_mem_peak = 0.0
-
-                log_dict = {
-                    'epoch': epoch,
-                    'loss': epoch_train_loss,
-                    'val_loss': val_loss,
-                    'lr': sched.get_last_lr()[0],
-                    'ema_decay': ema_decay,
-                    'max_min_difference_sequence': max_min_diff_gt,
-                    'max_min_difference_sequence_pred': max_min_diff_pred,
-                    'gpu/epoch_memory_allocated_gb': gpu_mem_allocated,
-                    'gpu/epoch_memory_reserved_gb': gpu_mem_reserved,
-                    'gpu/epoch_peak_memory_gb': gpu_mem_peak,
-                }
                 if args.gns:
                     log_dict['gradient_noise_scale'] = gns_stats.get_gns()
 
                 wandb.log(log_dict, step=wandb_step)
 
-                # Reset peak memory stats for next epoch
-                if device.type == 'cuda':
-                    torch.cuda.reset_peak_memory_stats(device)
-                # plt.close()
             # Save every 5 epochs or at the end
             if epoch % 5 == 0 or (args.max_epochs is not None and epoch >= args.max_epochs - 1):
                 save()
