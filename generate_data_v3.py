@@ -118,7 +118,7 @@ inner_model = K.config.make_model(config)
 model_ema = K.config.make_denoiser_wrapper(config)(inner_model)
 
 # embed()
-ckpt = torch.load("/capstor/scratch/cscs/framunno/models_results/models_ViT_forecast_15frames_absolute_max_ddp_bs1/model_epoch_0100.pth")
+ckpt = torch.load("/capstor/scratch/cscs/framunno/models_results/models_ViT_forecast_15frames_absolute_max_ddp_bs1_nocond/model_epoch_0090.pth")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_ema.inner_model.load_state_dict(ckpt['model_ema'])
@@ -127,11 +127,11 @@ model_ema.eval()
 
 import os
 
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/input_imgs")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/generated_imgs")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/gifs")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/ground_truth")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/conditions")
+# os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/input_imgs")
+# os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/generated_imgs")
+# os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/gifs")
+# os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/ground_truth")
+# os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/conditions")
 
 cartesian_transform = True
 
@@ -155,10 +155,10 @@ with torch.no_grad():
         samples = generate_samples(model_ema, 20, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(20, 1, 1, 1), num_pred_frames=15).cpu()
 
         # Save the oeiginal sample
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/input_imgs/original_forecasting_{k}.npy", cond_img[0].cpu().numpy())
+        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/input_imgs/original_forecasting_{k}.npy", cond_img[0].cpu().numpy())
         # Save the generated sampl
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/generated_imgs/sample_forecasting_{k}.npy", samples.cpu().numpy())
+        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/generated_imgs/sample_forecasting_{k}.npy", samples.cpu().numpy())
         # Save the target sample
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/ground_truth/arget_forecasting_{k}.npy", target_img[0].cpu().numpy())
+        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/ground_truth/arget_forecasting_{k}.npy", target_img[0].cpu().numpy())
         # Save the condition
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/conditions/cond_{k}.npy", cond_label[0].cpu().numpy())
+        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/conditions/cond_{k}.npy", cond_label[0].cpu().numpy())

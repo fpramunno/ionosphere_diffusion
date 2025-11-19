@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/users/framunno/logs/out/out_ViT_15step_ddp_bs1.log
-#SBATCH --error=/users/framunno/logs/err/err_ViT_15step_ddp_bs1.log
+#SBATCH --output=/users/framunno/logs/out/out_ViT_15step_ddp_bs1_nocond_continue.log
+#SBATCH --error=/users/framunno/logs/err/err_ViT_15step_ddp_bs1_nocond_continue.log
 
 # =============================================================================
 # ✅ Environment setup
@@ -61,9 +61,9 @@ export PREDICT_STEPS=15
 export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar.json"
 export CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
 export BATCH_SIZE=1
-export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1"
+export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1_nocond"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET"
+export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET_nocond"
 
 export NORM_TYPE="absolute_max"
 export PREPROCESS_SCALING="log10"
@@ -84,7 +84,7 @@ accelerate launch \
   --batch-size $BATCH_SIZE \
   --dir-name $DIR_NAME \
   --wandb-runname $WANDB_RUN_NAME \
-  --max-epochs 500 \
+  --max-epochs 101 \
   --evaluate-every 5 \
   --normalization-type $NORM_TYPE \
   --mixed-precision bf16 \
@@ -93,4 +93,5 @@ accelerate launch \
   --only-complete-sequences \
   --cartesian-transform \
   --num-workers 8 \
-  --use-iterable-dataset
+  --use-iterable-dataset \
+  --no-mapping-cond

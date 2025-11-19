@@ -134,6 +134,100 @@ class MultiheadSelfAttention(nn.Module):
             return self._forward(x, theta, mask)
 
 
+class MultiheadCrossAttention(nn.Module):
+    r"""Creates a multi-head cross-attention layer.
+
+    Arguments:
+        channels: The number of channels :math:`H \times C`.
+        context_channels: The number of context channels. If None, defaults to channels.
+        attention_heads: The number of attention heads :math:`H`.
+        qk_norm: Whether to use query-key RMS-normalization or not.
+        dropout: The dropout rate in :math:`[0, 1]`.
+        checkpointing: Whether to use gradient checkpointing or not.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        context_channels: Optional[int] = None,
+        attention_heads: int = 1,
+        qk_norm: bool = True,
+        dropout: Optional[float] = None,
+        checkpointing: bool = False,
+    ):
+        super().__init__()
+
+        assert channels % attention_heads == 0
+
+        if context_channels is None:
+            context_channels = channels
+
+        self.q_proj = nn.Linear(channels, channels, bias=False)
+        self.kv_proj = nn.Linear(context_channels, 2 * channels, bias=False)
+        self.y_proj = nn.Linear(channels, channels)
+
+        if qk_norm:
+            self.qk_norm = nn.RMSNorm(
+                channels // attention_heads,
+                elementwise_affine=False,
+                eps=1e-5,
+            )
+        else:
+            self.qk_norm = nn.Identity()
+
+        self.heads = attention_heads
+        self.dropout = nn.Dropout(0.0 if dropout is None else dropout)
+        self.checkpointing = checkpointing
+
+    def _forward(
+        self,
+        x: Tensor,
+        context: Tensor,
+        context_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        r"""
+        Arguments:
+            x: The input tokens :math:`x`, with shape :math:`(*, L, H \times C)`.
+            context: The context tokens, with shape :math:`(*, L_c, C_ctx)`.
+            context_mask: Optional attention mask, with shape :math:`(L, L_c)`.
+
+        Returns:
+            The output tokens :math:`y`, with shape :math:`(*, L, H \times C)`.
+        """
+
+        q = self.q_proj(x)
+        kv = self.kv_proj(context)
+
+        q = rearrange(q, "... L (H C) -> ... H L C", H=self.heads)
+        k, v = rearrange(kv, "... L (n H C) -> n ... H L C", n=2, H=self.heads)
+
+        q, k = self.qk_norm(q), self.qk_norm(k)
+
+        y = torch.nn.functional.scaled_dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=context_mask,
+            dropout_p=self.dropout.p if self.training else 0,
+        )
+
+        y = rearrange(y, "... H L C -> ... L (H C)")
+        y = self.y_proj(y)
+
+        return y
+
+    def forward(
+        self,
+        x: Tensor,
+        context: Tensor,
+        context_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        if self.checkpointing:
+            return checkpoint(self._forward, x, context, context_mask, use_reentrant=False)
+        else:
+            return self._forward(x, context, context_mask)
+
+
 def apply_rope(q: Tensor, k: Tensor, theta: Tensor) -> Tuple[Tensor, Tensor]:
     r"""
     References:
@@ -293,6 +387,7 @@ class ViTBlock(nn.Module):
     Arguments:
         channels: The number of channels :math:`C`.
         mod_features: The number of modulating features :math:`D`.
+        context_channels: The number of context channels for cross-attention. If None, no cross-attention.
         ffn_factor: The channel factor in the FFN.
         spatial: The number of spatial dimensinons :math:`N`.
         rope: Whether to use rotary positional embedding (RoPE) or not.
@@ -305,6 +400,7 @@ class ViTBlock(nn.Module):
         self,
         channels: int,
         mod_features: int = 0,
+        context_channels: Optional[int] = None,
         ffn_factor: int = 4,
         spatial: int = 2,
         rope: bool = True,
@@ -315,26 +411,40 @@ class ViTBlock(nn.Module):
         super().__init__()
 
         self.checkpointing = checkpointing
+        self.has_cross_attn = context_channels is not None
 
         # Ada-LN Zero
         self.norm = nn.LayerNorm(channels, elementwise_affine=False)
+
+        # Determine number of modulation parameters based on whether we have cross-attention
+        # Standard: 4 params (self-attn scale/shift, ffn gate, skip gate)
+        # With cross-attn: 6 params (add cross-attn scale/shift)
+        num_params = 6 if self.has_cross_attn else 4
 
         if mod_features > 0:
             self.ada_zero = nn.Sequential(
                 nn.Linear(mod_features, mod_features),
                 nn.SiLU(),
-                nn.Linear(mod_features, 4 * channels),
-                Rearrange("... (n C) -> n ... 1 C", n=4),
-                # Rearrange("... (n C) -> ... n C", n=4)
+                nn.Linear(mod_features, num_params * channels),
+                Rearrange("... (n C) -> n ... 1 C", n=num_params),
             )
 
             self.ada_zero[-2].weight.data.mul_(1e-2)
         else:
-            self.ada_zero = nn.Parameter(torch.randn(4, channels))
+            self.ada_zero = nn.Parameter(torch.randn(num_params, channels))
             self.ada_zero.data.mul_(1e-2)
 
         # MSA
         self.msa = MultiheadSelfAttention(channels, **kwargs)
+
+        # Cross-attention (optional)
+        if self.has_cross_attn:
+            self.cross_attn = MultiheadCrossAttention(
+                channels=channels,
+                context_channels=context_channels,
+                **kwargs,
+            )
+            self.norm_cross = nn.LayerNorm(channels, elementwise_affine=False)
 
         ## Rotary PE
         if rope:
@@ -360,6 +470,8 @@ class ViTBlock(nn.Module):
         coo: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         skip: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
     ) -> Tensor:
         r"""
         Arguments:
@@ -368,6 +480,8 @@ class ViTBlock(nn.Module):
             coo: The postition coordinates, with shape :math:`(*, L, N)`.
             mask: The attention mask, with shape :math:`(*, L, L)`.
             skip: A skip connection, with shape :math:`(*, L, C)`.
+            context: Optional context for cross-attention, with shape :math:`(*, L_c, C_ctx)`.
+            context_mask: Optional cross-attention mask, with shape :math:`(*, L, L_c)`.
 
         Returns:
             The ouput tokens :math:`y`, with shape :math:`(*, L, C)`.
@@ -378,16 +492,34 @@ class ViTBlock(nn.Module):
         else:
             theta = torch.einsum("...ij,jk", coo, self.theta)
 
-        if torch.is_tensor(self.ada_zero):
-            a, b, c, d = self.ada_zero
-        else:
-            a, b, c, d = self.ada_zero(mod) 
+        # embed()
 
+        if torch.is_tensor(self.ada_zero):
+            if self.has_cross_attn:
+                a, b, c_ca, d_ca, c, d = self.ada_zero
+            else:
+                a, b, c, d = self.ada_zero
+        else:
+            params = self.ada_zero(mod)
+            if self.has_cross_attn:
+                a, b, c_ca, d_ca, c, d = params
+            else:
+                a, b, c, d = params
+
+        # Self-attention (original behavior preserved)
         y = (a + 1) * self.norm(x) + b
         y = y + self.msa(y, theta, mask)
+
+        # Cross-attention (if enabled and context provided)
+        if self.has_cross_attn and context is not None:
+            y_cross = (c_ca + 1) * self.norm_cross(y) + d_ca
+            y = y + self.cross_attn(y_cross, context, context_mask)
+
+        # FFN (original behavior preserved)
         y = self.ffn(y)
         y = (x + c * y) * torch.rsqrt(1 + c * c)
 
+        # Skip connection (original behavior preserved)
         if skip is not None:
             y = (y + d * skip) * torch.rsqrt(1 + d * d)
 
@@ -400,14 +532,16 @@ class ViTBlock(nn.Module):
         coo: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         skip: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
     ) -> Tensor:
         if self.checkpointing:
             # print(f"Input to ViTBlock: {x.shape}")
-            res = checkpoint(self._forward, x, mod, coo, mask, skip, use_reentrant=False)
+            res = checkpoint(self._forward, x, mod, coo, mask, skip, context, context_mask, use_reentrant=False)
             # print(f"Output from ViTBlock: {res.shape}")
             return res
         else:
-            return self._forward(x, mod, coo, mask, skip)
+            return self._forward(x, mod, coo, mask, skip, context, context_mask)
 
 
 class ViT(nn.Module):
@@ -425,6 +559,7 @@ class ViT(nn.Module):
         unpatch_size: Union[int, Sequence[int], None] = None,
         window_size: Union[int, Sequence[int], None] = None,
         channel_mapping_cond: int = 15,
+        context_channels: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -435,8 +570,8 @@ class ViT(nn.Module):
             unpatch_size = patch_size
         elif isinstance(unpatch_size, int):
             unpatch_size = [unpatch_size] * spatial
-            
-        
+
+
 
         self.patch_size = patch_size[-1] if isinstance(patch_size, Sequence) else patch_size
         self.in_channels = in_channels
@@ -446,6 +581,7 @@ class ViT(nn.Module):
         self.channel_mapping_cond = channel_mapping_cond
         self.t_out = t_out
         self.has_variance = out_channels > in_channels
+        self.context_channels = context_channels
 
         self.patch = Patchify(patch_size, channel_last=True)
         self.unpatch = Unpatchify(unpatch_size, channel_last=True)
@@ -466,6 +602,7 @@ class ViT(nn.Module):
             ViTBlock(
                 channels=hid_channels,
                 mod_features=mod_features,
+                context_channels=context_channels,
                 spatial=spatial,
                 checkpointing=True,
                 **kwargs,
@@ -491,6 +628,16 @@ class ViT(nn.Module):
             nn.SiLU(),
             nn.Linear(mod_features, mod_features),
         )
+
+        # Cross-attention context projection for mapping_cond time series
+        if context_channels is not None:
+            self.context_proj = nn.Sequential(
+                nn.Linear(4, context_channels),  # Project each frame's 4 features to context_channels
+                nn.SiLU(),
+                nn.Linear(context_channels, context_channels),
+            )
+        else:
+            self.context_proj = None
 
         self.spatial = spatial
         self.window_size = tuple(window_size) if isinstance(window_size, Sequence) else ((window_size,) * spatial if window_size else None)
@@ -557,16 +704,29 @@ class ViT(nn.Module):
         num_pred_frames = input.shape[1]
         num_cond_frames = cond.shape[1] if cond is not None else 0
 
-        # Process mapping_cond - for now we average for compatibility with ada-zero architecture
-        # Temporal information will flow through positional encoding
+        # embed()
+
+        # Process mapping_cond for both global conditioning and cross-attention context
         if mapping_cond is None:
             mapping_cond_embed = torch.zeros_like(timestep_embed)
+            context = None
         else:
             # mapping_cond: (batch, total_frames, 4)
-            mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, emb_features)
-            mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1)
+            # Global conditioning: average across time for ada-zero modulation
+            mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, total_frames, emb_features)
+            mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1, emb_features)
+
+            # Cross-attention context: project time series to context tokens
+            if self.context_proj is not None:
+                # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
+                context = self.context_proj(mapping_cond)
+            else:
+                context = None
 
         mapping_out = self.mapping(timestep_embed + mapping_cond_embed)
+
+        # No context mask needed - we attend to all frames in mapping_cond
+        context_mask = None
 
         if cond is not None:
             # Concatenate in temporal order: [past conditioning, future prediction]
@@ -593,8 +753,13 @@ class ViT(nn.Module):
         # Following solar project approach: use (B, C, T, H, W) format
         time_coord = temporal_positions_normalized.view(1, -1, 1, 1).expand(batch_size, total_frames, input.shape[-2], input.shape[-1])
 
-        l1_cond = mapping_cond.unsqueeze(-1).unsqueeze(-1)  # (batch, total_frames, 4, 1, 1)
-        l1_cond = l1_cond.expand(batch_size, total_frames, 4, input.shape[-2], input.shape[-1])
+        # Handle mapping_cond: if None, create zeros
+        if mapping_cond is None:
+            l1_cond = torch.zeros(batch_size, total_frames, 4, input.shape[-2], input.shape[-1],
+                                 device=input.device, dtype=input.dtype)
+        else:
+            l1_cond = mapping_cond.unsqueeze(-1).unsqueeze(-1)  # (batch, total_frames, 4, 1, 1)
+            l1_cond = l1_cond.expand(batch_size, total_frames, 4, input.shape[-2], input.shape[-1])
 
         # Rearrange to (B, C, T, H, W) format like solar project
         input = input.unsqueeze(1)  # (B, 1, T, H, W)
@@ -615,7 +780,7 @@ class ViT(nn.Module):
         x = x + self.positional_embedding(coo)
 
         for block in self.blocks:
-            x = block(x, mapping_out.squeeze(1), coo=coo, mask=mask, skip=skip)
+            x = block(x, mapping_out.squeeze(1), coo=coo, mask=mask, skip=skip, context=context, context_mask=context_mask)
 
         x = torch.unflatten(x, sizes=shape, dim=-2)
         x = self.out_proj(x)

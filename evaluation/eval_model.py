@@ -17,6 +17,12 @@ import os
 import pandas as pd
 from tqdm import tqdm
 
+def revert_normalization(array):
+
+    array = ((array + 1) / 2) * (80000 - (-80000)) + (-80000)
+
+    return array
+
 def main():
     
     p = argparse.ArgumentParser(description="Evaluate ionosphere model performance")
@@ -72,13 +78,18 @@ def main():
                 ssim_val = ssim(gt_frame, pred_frame, data_range=gt_frame.max() - gt_frame.min())
                 ssim_samples.append(ssim_val)
 
+                pred_frame_renorm = revert_normalization(pred_frame)
+                gt_frame_renorm = revert_normalization(gt_frame)
+
+                # embed()
+
                 # Compute physics domain difference (max - min) for the entire sequence
-                physics_diff = ((np.max(pred_frame) - np.min(pred_frame)) - (np.max(gt_frame) - np.min(gt_frame))) / (np.max(gt_frame) - np.min(gt_frame))
+                physics_diff = ((np.max(pred_frame_renorm) - np.min(pred_frame_renorm)) - (np.max(gt_frame_renorm) - np.min(gt_frame_renorm))) / (np.max(gt_frame_renorm) - np.min(gt_frame_renorm))
                 physics_samples.append(physics_diff)
 
-            psnr_frames.append(psnr_samples)
-            ssim_frames.append(ssim_samples)
-            physics_frames.append(physics_samples) 
+            psnr_frames.extend(psnr_samples)
+            ssim_frames.extend(ssim_samples)
+            physics_frames.extend(physics_samples) 
         
         psnr_values.append(psnr_frames)
         ssim_values.append(ssim_frames)
@@ -89,7 +100,7 @@ def main():
     df['SSIM'] = ssim_values
     df['Physics_Difference'] = physics_differences
 
-    df.to_csv(os.path.join(output_path_csv, 'evaluation_metrics.csv'), index=False)
+    df.to_csv(os.path.join(output_path_csv, 'evaluation_metrics_nocond.csv'), index=False)
 
 if __name__ == "__main__":
     main()

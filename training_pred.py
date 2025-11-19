@@ -154,6 +154,8 @@ def main():
                 help='use torch.compile for 20-30%% speedup (requires PyTorch 2.0+)')
     p.add_argument('--use-iterable-dataset', action='store_true',
                 help='use IterableDataset for proper multi-GPU/multi-worker sharding (RECOMMENDED for scaling!)')
+    p.add_argument('--no-mapping-cond', action='store_true',
+                help='disable mapping conditioning (set mapping_cond to None in model.loss())')
 
     args = p.parse_args()
 
@@ -803,7 +805,11 @@ def main():
                         sigma = sample_density([target_img.shape[0]], device=device)
 
                     with K.models.checkpointing(args.checkpointing):
-                        losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=cond_label_inp, **extra_args)
+                        # Conditionally disable mapping_cond if --no-mapping-cond is set
+                        mapping_cond_val = None if args.no_mapping_cond else cond_label_inp
+
+                        print(f'Mapping cond value: {mapping_cond_val}')
+                        losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=mapping_cond_val, **extra_args)
                     torch.cuda.synchronize()  # Wait for forward to complete
                     forward_time = time.perf_counter() - forward_start
                     # timing_stats['forward'].append(forward_time)
@@ -935,7 +941,9 @@ def main():
                         sigma = sample_density([target_img.shape[0]], device=device)
 
                     with K.models.checkpointing(args.checkpointing):
-                        losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=cond_label_inp, **extra_args)
+                        # Conditionally disable mapping_cond if --no-mapping-cond is set
+                        mapping_cond_val = None if args.no_mapping_cond else cond_label_inp
+                        losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=mapping_cond_val, **extra_args)
 
                     # Make sure we only gather scalar loss (not batch tensor)
                     loss_value = losses.mean().detach()
@@ -966,7 +974,9 @@ def main():
 
                 # ALL RANKS participate in sampling (FSDP requirement)
                 # But only rank 0 will use the result for visualization
-                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4), sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
+                # Conditionally disable cond_label if --no-mapping-cond is set
+                cond_label_sample = None if args.no_mapping_cond else cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4)
+                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
 
             if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
 

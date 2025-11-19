@@ -242,7 +242,8 @@ def make_model(config):
             rope=config['rope'],
             patch_size=config['patch_size'],
             window_size=config['window_size'],
-            channel_mapping_cond=config['channel_mapping_cond'],)
+            channel_mapping_cond=config['channel_mapping_cond'],
+            context_channels=config.get('context_channels', None),)
     elif config['type'] == 'palette_unet':
         # Determine true image size from input_size
         true_img_size = config.get('true_img_size', max(config['input_size']) if 'input_size' in config else 64)
