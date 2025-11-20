@@ -11,6 +11,7 @@ References:
 __all__ = [
     "ViTBlock",
     "ViT",
+    "PhysicsInformedConditioningModule",
 ]
 
 import functools
@@ -34,6 +35,167 @@ from torch.utils.checkpoint import checkpoint
 
 # debug
 from IPython import embed
+
+
+class PhysicsInformedConditioningModule(nn.Module):
+    """
+    Physics-aware embedding for solar wind parameters with:
+    - Factorized representation (energy, geometry, dynamics)
+    - Spherical harmonic encoding for directional components (By, Bz)
+    - Derivative-aware temporal encoding
+
+    Input order: [bx, by, bz, vwind]
+    """
+
+    def __init__(
+        self,
+        mod_features: int,
+        context_channels: Optional[int] = None,
+        spherical_order: int = 4,
+    ):
+        super().__init__()
+
+        self.mod_features = mod_features
+        self.context_channels = context_channels
+        self.spherical_order = spherical_order
+
+        # Number of spherical harmonic coefficients: 1 + 2*order (DC + cos/sin pairs)
+        num_sh_coeffs = 1 + 2 * spherical_order
+
+        # === Spherical/Angular Embedding for By, Bz ===
+        self.angular_embed = nn.Sequential(
+            nn.Linear(num_sh_coeffs, mod_features // 2),
+            nn.SiLU(),
+            nn.LayerNorm(mod_features // 2),
+            nn.Linear(mod_features // 2, mod_features // 2),
+        )
+
+        # === Energy Input Factor (Bz intensity + Vwind) ===
+        self.energy_embed = nn.Sequential(
+            nn.Linear(2, mod_features),
+            nn.SiLU(),
+            nn.LayerNorm(mod_features),
+            nn.Linear(mod_features, mod_features),
+        )
+
+        # === Bx embedding (least important, simple) ===
+        self.bx_embed = nn.Sequential(
+            nn.Linear(1, mod_features // 4),
+            nn.SiLU(),
+            nn.Linear(mod_features // 4, mod_features // 4),
+        )
+
+        # === Temporal Dynamics (derivatives) ===
+        # 4 params + 4 first derivatives + 4 second derivatives = 12
+        self.dynamics_embed = nn.Sequential(
+            nn.Linear(12, mod_features // 2),
+            nn.SiLU(),
+            nn.LayerNorm(mod_features // 2),
+            nn.Linear(mod_features // 2, mod_features // 2),
+        )
+
+        # === Combine all factors ===
+        total_features = (
+            mod_features // 2 +  # angular
+            mod_features +       # energy
+            mod_features // 4 +  # bx
+            mod_features // 2    # dynamics
+        )
+        self.factor_combine = nn.Sequential(
+            nn.Linear(total_features, mod_features),
+            nn.SiLU(),
+            nn.Linear(mod_features, mod_features),
+        )
+
+        # === Cross-attention context encoder ===
+        if context_channels is not None:
+            self.context_proj = nn.Sequential(
+                nn.Linear(4 + num_sh_coeffs + 8, context_channels),  # raw + SH + derivatives
+                nn.SiLU(),
+                nn.LayerNorm(context_channels),
+                nn.Linear(context_channels, context_channels),
+            )
+        else:
+            self.context_proj = None
+
+    def compute_spherical_harmonics(self, by: Tensor, bz: Tensor) -> Tensor:
+        """
+        Compute circular harmonic features from IMF clock angle.
+
+        theta = atan2(By, Bz)
+        Features: [1, cos(θ), sin(θ), cos(2θ), sin(2θ), ...]
+        """
+        theta = torch.atan2(by, bz)
+
+        features = [torch.ones_like(theta)]
+
+        for n in range(1, self.spherical_order + 1):
+            features.append(torch.cos(n * theta))
+            features.append(torch.sin(n * theta))
+
+        return torch.stack(features, dim=-1)
+
+    def compute_derivatives(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        """Compute first and second derivatives via finite differences."""
+        # First derivative
+        dx = torch.zeros_like(x)
+        dx[:, 1:-1] = (x[:, 2:] - x[:, :-2]) / 2
+        dx[:, 0] = x[:, 1] - x[:, 0]
+        dx[:, -1] = x[:, -1] - x[:, -2]
+
+        # Second derivative
+        d2x = torch.zeros_like(x)
+        d2x[:, 1:-1] = x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]
+        d2x[:, 0] = d2x[:, 1]
+        d2x[:, -1] = d2x[:, -2]
+
+        return dx, d2x
+
+    def forward(self, mapping_cond: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Args:
+            mapping_cond: (batch, time, 4) = [bx, by, bz, vwind]
+
+        Returns:
+            global_embed: (batch, mod_features) for ada-zero modulation
+            context: (batch, time, context_channels) for cross-attention
+        """
+        # Correct order: [bx, by, bz, vwind]
+        bx = mapping_cond[..., 0]
+        by = mapping_cond[..., 1]
+        bz = mapping_cond[..., 2]
+        vwind = mapping_cond[..., 3]
+
+        dx, d2x = self.compute_derivatives(mapping_cond)
+
+        # Angular features via spherical harmonics
+        sh_features = self.compute_spherical_harmonics(by, bz)
+        angular_feat = self.angular_embed(sh_features).mean(dim=1)
+
+        # Energy input (Bz signed + Vwind)
+        energy_input = torch.stack([bz, vwind], dim=-1)
+        energy_feat = self.energy_embed(energy_input).mean(dim=1)
+
+        # Bx embedding
+        bx_feat = self.bx_embed(bx.unsqueeze(-1)).mean(dim=1)
+
+        # Dynamics
+        dynamics_input = torch.cat([mapping_cond, dx, d2x], dim=-1)
+        dynamics_feat = self.dynamics_embed(dynamics_input).mean(dim=1)
+
+        # Combine
+        global_embed = self.factor_combine(
+            torch.cat([angular_feat, energy_feat, bx_feat, dynamics_feat], dim=-1)
+        )
+
+        # Cross-attention context
+        if self.context_proj is not None:
+            context_input = torch.cat([mapping_cond, sh_features, dx, d2x], dim=-1)
+            context = self.context_proj(context_input)
+        else:
+            context = None
+
+        return global_embed, context
 
 class MultiheadSelfAttention(nn.Module):
     r"""Creates a multi-head self-attention layer.
@@ -560,6 +722,8 @@ class ViT(nn.Module):
         window_size: Union[int, Sequence[int], None] = None,
         channel_mapping_cond: int = 15,
         context_channels: Optional[int] = None,
+        use_physics_embedding: bool = False,
+        spherical_order: int = 4,
         **kwargs,
     ):
         super().__init__()
@@ -582,6 +746,7 @@ class ViT(nn.Module):
         self.t_out = t_out
         self.has_variance = out_channels > in_channels
         self.context_channels = context_channels
+        self.use_physics_embedding = use_physics_embedding
 
         self.patch = Patchify(patch_size, channel_last=True)
         self.unpatch = Unpatchify(unpatch_size, channel_last=True)
@@ -638,6 +803,16 @@ class ViT(nn.Module):
             )
         else:
             self.context_proj = None
+
+        # Physics-informed conditioning module (optional)
+        if use_physics_embedding:
+            self.physics_cond_module = PhysicsInformedConditioningModule(
+                mod_features=mod_features,
+                context_channels=context_channels,
+                spherical_order=spherical_order,
+            )
+        else:
+            self.physics_cond_module = None
 
         self.spatial = spatial
         self.window_size = tuple(window_size) if isinstance(window_size, Sequence) else ((window_size,) * spatial if window_size else None)
@@ -704,24 +879,30 @@ class ViT(nn.Module):
         num_pred_frames = input.shape[1]
         num_cond_frames = cond.shape[1] if cond is not None else 0
 
-        # embed()
+        embed()
 
         # Process mapping_cond for both global conditioning and cross-attention context
         if mapping_cond is None:
             mapping_cond_embed = torch.zeros_like(timestep_embed)
             context = None
         else:
-            # mapping_cond: (batch, total_frames, 4)
-            # Global conditioning: average across time for ada-zero modulation
-            mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, total_frames, emb_features)
-            mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1, emb_features)
-
-            # Cross-attention context: project time series to context tokens
-            if self.context_proj is not None:
-                # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
-                context = self.context_proj(mapping_cond)
+            if self.use_physics_embedding and self.physics_cond_module is not None:
+                # Use physics-informed conditioning module
+                # Returns: global_embed (batch, mod_features), context (batch, time, context_channels)
+                mapping_cond_embed, context = self.physics_cond_module(mapping_cond)
             else:
-                context = None
+                # Original approach
+                # mapping_cond: (batch, total_frames, 4)
+                # Global conditioning: average across time for ada-zero modulation
+                mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, total_frames, emb_features)
+                mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1, emb_features)
+
+                # Cross-attention context: project time series to context tokens
+                if self.context_proj is not None:
+                    # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
+                    context = self.context_proj(mapping_cond)
+                else:
+                    context = None
 
         mapping_out = self.mapping(timestep_embed + mapping_cond_embed)
 

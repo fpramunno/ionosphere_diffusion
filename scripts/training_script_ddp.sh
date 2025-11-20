@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=overfit_ddp
+#SBATCH --job-name=physics_emb
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/users/framunno/logs/out/out_ViT_15step_ddp_bs1_nocond_continue.log
-#SBATCH --error=/users/framunno/logs/err/err_ViT_15step_ddp_bs1_nocond_continue.log
+#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_ViT_15step_ddp_bs1_physics_emb.log
+#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_ViT_15step_ddp_bs1_physics_emb.log
 
 # =============================================================================
 # ✅ Environment setup
@@ -58,12 +58,12 @@ echo "Using DDP (not FSDP)"
 # =============================================================================
 export SEQUENCE_LENGTH=30
 export PREDICT_STEPS=15
-export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar.json"
+export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar_crossattn_physics.json"
 export CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
 export BATCH_SIZE=1
-export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1_nocond"
+export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1_physics_emb"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET_nocond"
+export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET_physics_emb"
 
 export NORM_TYPE="absolute_max"
 export PREPROCESS_SCALING="log10"
@@ -93,5 +93,4 @@ accelerate launch \
   --only-complete-sequences \
   --cartesian-transform \
   --num-workers 8 \
-  --use-iterable-dataset \
-  --no-mapping-cond
+  --use-iterable-dataset

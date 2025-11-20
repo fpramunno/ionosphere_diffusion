@@ -135,6 +135,8 @@ import os
 
 cartesian_transform = True
 
+no_mapping_cond = True
+
 with torch.no_grad():
     for k, batch in enumerate(tqdm(val_dl, desc="Validation")):
         inpt = batch[0].contiguous().float().to(device, non_blocking=True)
@@ -145,14 +147,18 @@ with torch.no_grad():
 
         cond_label_inp = cond_label[:, :, :].repeat(20, 1, 1) # :16
 
+        
+
         if cartesian_transform:
             spatial_shape = (64, 64)
         else:
             spatial_shape = (24, 360)
 
-        embed()
+        cond_label_sample = None if no_mapping_cond else cond_label_inp[:, :, :]
+
+        # embed()
         # samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, 24, 360), num_pred_frames=15, step=50)
-        samples = generate_samples(model_ema, 20, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(20, 1, 1, 1), num_pred_frames=15).cpu()
+        samples = generate_samples(model_ema, 20, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(20, 1, 1, 1), num_pred_frames=15).cpu()
 
         # Save the oeiginal sample
         np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln_nocond/input_imgs/original_forecasting_{k}.npy", cond_img[0].cpu().numpy())

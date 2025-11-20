@@ -243,7 +243,10 @@ def make_model(config):
             patch_size=config['patch_size'],
             window_size=config['window_size'],
             channel_mapping_cond=config['channel_mapping_cond'],
-            context_channels=config.get('context_channels', None),)
+            context_channels=config.get('context_channels', None),
+            use_physics_embedding=config.get('use_physics_embedding', False),
+            spherical_order=config.get('spherical_order', 4),
+        )
     elif config['type'] == 'palette_unet':
         # Determine true image size from input_size
         true_img_size = config.get('true_img_size', max(config['input_size']) if 'input_size' in config else 64)
