@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=physics_emb
+#SBATCH --job-name=multiscale_emb
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_ViT_15step_ddp_bs1_physics_emb.log
-#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_ViT_15step_ddp_bs1_physics_emb.log
+#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_ViT_15step_ddp_bs1_multiscale_emb_v3_interpolated_deduplicated.log
+#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_ViT_15step_ddp_bs1_multiscale_emb_v3_interpolated_deduplicated.log
 
 # =============================================================================
 # ✅ Environment setup
@@ -30,6 +30,7 @@ unset ACCELERATE_FSDP_USE_ORIG_PARAMS
 unset ACCELERATE_FSDP_USE_LOW_PRECISION_GRADIENTS
 unset ACCELERATE_FSDP_TRANSFORMER_CLS_TO_WRAP
 
+
 # -----------------------------------------------------------------------------
 # ✅ Export DDP variables
 # -----------------------------------------------------------------------------
@@ -41,6 +42,8 @@ export NCCL_SOCKET_IFNAME=hsn
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1800
 export PYTHONUNBUFFERED=1
+
+export CUDA_LAUNCH_BLOCKING=1
 
 # Multi-node coordination
 export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n 1)
@@ -58,12 +61,12 @@ echo "Using DDP (not FSDP)"
 # =============================================================================
 export SEQUENCE_LENGTH=30
 export PREDICT_STEPS=15
-export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar_crossattn_physics.json"
-export CSV_PATH="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv"
-export BATCH_SIZE=1
-export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1_physics_emb"
+export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar_multiscale.json"
+export CSV_PATH="/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_interpolated_deduplicated.csv"
+export BATCH_SIZE=20
+export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1_multiscale_emb_v3_interpolated_deduplicated"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET_physics_emb"
+export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET_multiscale_emb_v3_interpolated_deduplicated"
 
 export NORM_TYPE="absolute_max"
 export PREPROCESS_SCALING="log10"
@@ -93,4 +96,5 @@ accelerate launch \
   --only-complete-sequences \
   --cartesian-transform \
   --num-workers 8 \
-  --use-iterable-dataset
+  --use-iterable-dataset 
+  # --no-mapping-cond

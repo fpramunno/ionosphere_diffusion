@@ -246,6 +246,8 @@ def make_model(config):
             context_channels=config.get('context_channels', None),
             use_physics_embedding=config.get('use_physics_embedding', False),
             spherical_order=config.get('spherical_order', 4),
+            use_multiscale_temporal=config.get('use_multiscale_temporal', False),
+            use_adaptive_temporal=config.get('use_adaptive_temporal', False),
         )
     elif config['type'] == 'palette_unet':
         # Determine true image size from input_size

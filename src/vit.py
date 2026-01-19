@@ -12,6 +12,7 @@ __all__ = [
     "ViTBlock",
     "ViT",
     "PhysicsInformedConditioningModule",
+    "MultiScaleTemporalEncoder",
 ]
 
 import functools
@@ -196,6 +197,296 @@ class PhysicsInformedConditioningModule(nn.Module):
             context = None
 
         return global_embed, context
+
+class AttnPool1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.score = nn.Conv1d(channels, 1, kernel_size=1)
+
+    def forward(self, x):
+        # x: (B, C, T)
+        w = self.score(x)          # (B, 1, T)
+        w = torch.softmax(w, dim=-1)
+        return (x * w).sum(dim=-1)  # (B, C)
+    
+def block(dilation):
+    return nn.Sequential(
+        nn.Conv1d(
+            in_features,
+            64,
+            kernel_size=3,
+            dilation=dilation,
+            padding=dilation,
+        ),
+        nn.SiLU(),
+        nn.Conv1d(
+            64,
+            64,
+            kernel_size=3,
+            dilation=dilation,
+            padding=dilation,
+        ),
+        nn.SiLU(),
+    )
+
+class MultiScaleTemporalEncoder(nn.Module):
+    """Multi-scale temporal convolution encoder for time series conditioning.
+
+    Captures short-term, medium-term, and long-term patterns using different
+    kernel sizes optimized for 2-minute temporal resolution (30 frames = 1 hour).
+
+    Short-term (2 timesteps = 4 min): Immediate solar wind impact, rapid fluctuations
+    Medium-term (10 timesteps = 20 min): Sustained driving, cumulative effects
+    Long-term (20 timesteps = 40 min): Background state, overall trends
+    """
+    def __init__(self, in_features=4, mod_features=256):
+        super().__init__()
+
+        # Short-term: 2 timesteps = 4 minutes
+        # self.short_term = nn.Sequential(
+        #     nn.Conv1d(in_features, 64, kernel_size=2, padding='same'),
+        #     nn.SiLU(),
+        #     nn.BatchNorm1d(64),
+        #     nn.Conv1d(64, 64, kernel_size=2, padding='same'),
+        #     nn.SiLU(),
+        #     nn.Conv1d(64, 64, kernel_size=2, padding='same'),
+        # )
+
+        # # Medium-term: 15 timesteps = 30 minutes
+        # self.medium_term = nn.Sequential(
+        #     nn.Conv1d(in_features, 64, kernel_size=15, padding='same'),
+        #     nn.SiLU(),
+        #     nn.BatchNorm1d(64),
+        #     nn.Conv1d(64, 64, kernel_size=15, padding='same'),
+        #     nn.SiLU(),
+        #     nn.Conv1d(64, 64, kernel_size=15, padding='same'),
+        # )
+
+        # # Long-term: 30 timesteps = 60 minutes
+        # self.long_term = nn.Sequential(
+        #     nn.Conv1d(in_features, 64, kernel_size=30, padding='same'),
+        #     nn.SiLU(),
+        #     nn.BatchNorm1d(64),
+        #     nn.Conv1d(64, 64, kernel_size=30, padding='same'),
+        #     nn.SiLU(),
+        #     nn.Conv1d(64, 64, kernel_size=30, padding='same'),
+        # )
+
+        # Multi-scale temporal encoders
+        self.short_term  = nn.Sequential(
+                            nn.Conv1d(
+                                in_features,
+                                64,
+                                kernel_size=3,
+                                dilation=1,
+                                padding=1,
+                            ),
+                            nn.SiLU(),
+                            nn.Conv1d(
+                                64,
+                                64,
+                                kernel_size=3,
+                                dilation=1,
+                                padding=1,
+                            ),
+                            nn.SiLU(),
+                        )   # local
+        self.medium_term = nn.Sequential(
+                            nn.Conv1d(
+                                in_features,
+                                64,
+                                kernel_size=3,
+                                dilation=5,
+                                padding=5,
+                            ),
+                            nn.SiLU(),
+                            nn.Conv1d(
+                                64,
+                                64,
+                                kernel_size=3,
+                                dilation=5,
+                                padding=5,
+                            ),
+                            nn.SiLU(),
+                        )    # medium-range
+        self.long_term = nn.Sequential(
+                            nn.Conv1d(
+                                in_features,
+                                64,
+                                kernel_size=3,
+                                dilation=10,
+                                padding=10,
+                            ),
+                            nn.SiLU(),
+                            nn.Conv1d(
+                                64,
+                                64,
+                                kernel_size=3,
+                                dilation=10,
+                                padding=10,
+                            ),
+                            nn.SiLU(),
+                        )    # long-range
+
+        self.mix = nn.Conv1d(64, 192, kernel_size=1)
+        self.pool = AttnPool1D(192)
+
+        # Combine all scales (64*3 = 192 features)
+        self.combine = nn.Sequential(
+            nn.Linear(192, mod_features),
+            nn.SiLU(),
+            nn.LayerNorm(mod_features),
+            nn.Linear(mod_features, mod_features),
+            nn.SiLU(),
+            nn.Linear(mod_features, mod_features),
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, time, 4) - [bx, by, bz, vwind] time series
+
+        Returns:
+            (batch, mod_features) - global temporal embedding
+        """
+
+        # embed()
+        # x: (batch, time, 4) → (batch, 4, time) for conv1d
+        x = x.transpose(1, 2).contiguous()  # CRITICAL: Make contiguous to avoid cuDNN workspace issues with gradient accumulation
+
+        # CRITICAL FIX: Disable cuDNN entirely for dilated convolutions to avoid workspace corruption
+        # This is a known bug with dilated Conv1d + cuDNN + mixed precision + gradient accumulation
+        # Fallback to PyTorch's native implementation which is slower but stable
+        cudnn_enabled = torch.backends.cudnn.enabled
+        try:
+            torch.backends.cudnn.enabled = False
+            with torch.amp.autocast('cuda', enabled=False):
+                x = x.float()  # Ensure float32
+                # Each scale: (batch, 4, 30) → (batch, 64, 30)
+                short = self.short_term(x) #.mead(dim=-1) # (batch, 64)
+                medium = self.medium_term(x) #.mead(dim=-1) # (batch, 64)
+                long = self.long_term(x) #.mead(dim=-1)     # (batch, 64)
+
+                # Concatenate: (batch, 192)
+                features = torch.cat([short, medium, long], dim=-1)
+
+                h = self.mix(features)      # (B, 192, 90)
+                global_feat = self.pool(h) # (B, 192)
+        finally:
+            torch.backends.cudnn.enabled = cudnn_enabled
+
+        # short = self.short_term(x).mean(dim=-1) # (batch, 64)
+        # medium = self.medium_term(x).mean(dim=-1) # (batch, 64)
+        # long = self.long_term(x).mean(dim=-1)     # (batch, 64)
+
+        # features = torch.cat([short, medium, long], dim=-1)
+
+        out = self.combine(global_feat)
+
+        return out
+
+
+class AdaptiveMultiScaleTemporalEncoder(nn.Module):
+    """Multi-scale temporal encoder with learnable attention pooling.
+
+    Alternative to MultiScaleTemporalEncoder that uses attention to learn which
+    timesteps are important within each scale, rather than simple mean pooling.
+
+    This allows the model to adaptively focus on relevant temporal positions
+    for each trajectory (e.g., recent timesteps vs distant past).
+    """
+    def __init__(self, in_features=4, mod_features=256):
+        super().__init__()
+
+        # Short-term: 2 timesteps = 4 minutes
+        self.short_term = nn.Sequential(
+            nn.Conv1d(in_features, 64, kernel_size=2, padding='same'),
+            nn.SiLU(),
+            nn.BatchNorm1d(64),
+            nn.Conv1d(64, 64, kernel_size=2, padding='same'),
+            nn.SiLU(),
+            nn.Conv1d(64, 64, kernel_size=2, padding='same'),
+        )
+
+        # Medium-term: 15 timesteps = 30 minutes
+        self.medium_term = nn.Sequential(
+            nn.Conv1d(in_features, 64, kernel_size=15, padding='same'),
+            nn.SiLU(),
+            nn.BatchNorm1d(64),
+            nn.Conv1d(64, 64, kernel_size=15, padding='same'),
+            nn.SiLU(),
+            nn.Conv1d(64, 64, kernel_size=15, padding='same'),
+        )
+
+        # Long-term: 30 timesteps = 60 minutes
+        self.long_term = nn.Sequential(
+            nn.Conv1d(in_features, 64, kernel_size=30, padding='same'),
+            nn.SiLU(),
+            nn.BatchNorm1d(64),
+            nn.Conv1d(64, 64, kernel_size=30, padding='same'),
+            nn.SiLU(),
+            nn.Conv1d(64, 64, kernel_size=30, padding='same'),
+        )
+
+        # Learnable attention pooling for each scale
+        self.short_attn = nn.Linear(64, 1)
+        self.medium_attn = nn.Linear(64, 1)
+        self.long_attn = nn.Linear(64, 1)
+
+        # Combine all scales (64*3 = 192 features)
+        self.combine = nn.Sequential(
+            nn.Linear(192, mod_features),
+            nn.SiLU(),
+            nn.LayerNorm(mod_features),
+            nn.Linear(mod_features, mod_features),
+            nn.SiLU(),
+            nn.Linear(mod_features, mod_features),
+        )
+
+    def attention_pool(self, x, attn_layer):
+        """Attention-based pooling over temporal dimension.
+
+        Args:
+            x: (batch, channels, time) - convolutional features
+            attn_layer: attention layer that scores each timestep
+
+        Returns:
+            (batch, channels) - attention-weighted features
+        """
+        x_t = x.transpose(1, 2)  # (batch, time, channels)
+        scores = attn_layer(x_t)  # (batch, time, 1)
+        weights = F.softmax(scores, dim=1)  # (batch, time, 1)
+        return (x_t * weights).sum(dim=1)  # (batch, channels)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, time, 4) - [bx, by, bz, vwind] time series
+
+        Returns:
+            (batch, mod_features) - global temporal embedding
+        """
+
+        # embed()
+        # x: (batch, time, 4) → (batch, 4, time) for conv1d
+        x = x.transpose(1, 2)
+
+        # Each scale: (batch, 4, time) → (batch, 64, time)
+        short_conv = self.short_term(x)
+        medium_conv = self.medium_term(x)
+        long_conv = self.long_term(x)
+
+        # Adaptive attention pooling instead of mean
+        short = self.attention_pool(short_conv, self.short_attn)    # (batch, 64)
+        medium = self.attention_pool(medium_conv, self.medium_attn)  # (batch, 64)
+        long = self.attention_pool(long_conv, self.long_attn)        # (batch, 64)
+
+        # Concatenate: (batch, 192)
+        features = torch.cat([short, medium, long], dim=-1)
+
+        # Final projection: (batch, 192) → (batch, mod_features)
+        return self.combine(features)
+
 
 class MultiheadSelfAttention(nn.Module):
     r"""Creates a multi-head self-attention layer.
@@ -723,6 +1014,8 @@ class ViT(nn.Module):
         channel_mapping_cond: int = 15,
         context_channels: Optional[int] = None,
         use_physics_embedding: bool = False,
+        use_multiscale_temporal: bool = False,
+        use_adaptive_temporal: bool = False,
         spherical_order: int = 4,
         **kwargs,
     ):
@@ -747,6 +1040,8 @@ class ViT(nn.Module):
         self.has_variance = out_channels > in_channels
         self.context_channels = context_channels
         self.use_physics_embedding = use_physics_embedding
+        self.use_multiscale_temporal = use_multiscale_temporal
+        self.use_adaptive_temporal = use_adaptive_temporal
 
         self.patch = Patchify(patch_size, channel_last=True)
         self.unpatch = Unpatchify(unpatch_size, channel_last=True)
@@ -786,7 +1081,7 @@ class ViT(nn.Module):
             nn.Linear(mod_features, mod_features),
         )
         self.mapping_cond = nn.Sequential(
-            nn.Linear(self.channel_mapping_cond * 4, mod_features),  # Flatten spatial dimensions and project to mod_features BEFORE 16 NOW 30
+            nn.Linear(self.channel_mapping_cond * 4, mod_features),  
             nn.SiLU(),
             nn.LayerNorm(mod_features),
             nn.Linear(mod_features, mod_features),
@@ -813,6 +1108,24 @@ class ViT(nn.Module):
             )
         else:
             self.physics_cond_module = None
+
+        # Multi-scale temporal encoder (optional)
+        if use_multiscale_temporal:
+            self.multiscale_temporal = MultiScaleTemporalEncoder(
+                in_features=4,  # [bx, by, bz, vwind]
+                mod_features=mod_features,
+            )
+        else:
+            self.multiscale_temporal = None
+
+        # Adaptive multi-scale temporal encoder (optional)
+        if use_adaptive_temporal:
+            self.adaptive_temporal = AdaptiveMultiScaleTemporalEncoder(
+                in_features=4,  # [bx, by, bz, vwind]
+                mod_features=mod_features,
+            )
+        else:
+            self.adaptive_temporal = None
 
         self.spatial = spatial
         self.window_size = tuple(window_size) if isinstance(window_size, Sequence) else ((window_size,) * spatial if window_size else None)
@@ -879,7 +1192,7 @@ class ViT(nn.Module):
         num_pred_frames = input.shape[1]
         num_cond_frames = cond.shape[1] if cond is not None else 0
 
-        embed()
+        # embed()
 
         # Process mapping_cond for both global conditioning and cross-attention context
         if mapping_cond is None:
@@ -890,12 +1203,12 @@ class ViT(nn.Module):
                 # Use physics-informed conditioning module
                 # Returns: global_embed (batch, mod_features), context (batch, time, context_channels)
                 mapping_cond_embed, context = self.physics_cond_module(mapping_cond)
-            else:
-                # Original approach
-                # mapping_cond: (batch, total_frames, 4)
-                # Global conditioning: average across time for ada-zero modulation
-                mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, total_frames, emb_features)
-                mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1, emb_features)
+
+            elif self.use_multiscale_temporal and self.multiscale_temporal is not None:
+                # Multi-scale temporal convolution encoder
+                # Returns: (batch, mod_features)
+                mapping_cond_embed = self.multiscale_temporal(mapping_cond)
+                mapping_cond_embed = mapping_cond_embed.unsqueeze(1)  # (batch, 1, mod_features)
 
                 # Cross-attention context: project time series to context tokens
                 if self.context_proj is not None:
@@ -904,7 +1217,39 @@ class ViT(nn.Module):
                 else:
                     context = None
 
-        mapping_out = self.mapping(timestep_embed + mapping_cond_embed)
+            elif self.use_adaptive_temporal and self.adaptive_temporal is not None:
+                # Adaptive multi-scale temporal encoder with attention pooling
+                # Returns: (batch, mod_features)
+                mapping_cond_embed = self.adaptive_temporal(mapping_cond)
+                mapping_cond_embed = mapping_cond_embed.unsqueeze(1)  # (batch, 1, mod_features)
+
+                # Cross-attention context: project time series to context tokens
+                if self.context_proj is not None:
+                    # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
+                    context = self.context_proj(mapping_cond)
+                else:
+                    context = None
+
+            else:
+                # Original approach
+                # mapping_cond: (batch, total_frames, 4)
+                # Global conditioning: average across time for ada-zero modulation
+                # embed()
+                print('mapping_cond.shape:', mapping_cond.shape)
+                mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, total_frames, emb_features)
+                print('mapping_cond_embed.shape:', mapping_cond_embed.shape)
+                # Uncomment for classic
+                mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1, emb_features)
+                print('mapping_cond_embed.shape:', mapping_cond_embed.shape)
+                # Cross-attention context: project time series to context tokens
+                if self.context_proj is not None:
+                    # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
+                    context = self.context_proj(mapping_cond)
+                else:
+                    context = None
+
+        # print('mapping_cond_embed.squeeze(1).shape:', mapping_cond_embed.squeeze(1).shape)
+        mapping_out = self.mapping(timestep_embed + mapping_cond_embed.squeeze(1))
 
         # No context mask needed - we attend to all frames in mapping_cond
         context_mask = None

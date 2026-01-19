@@ -108,7 +108,7 @@ def main():
                 help='the total length of the sequence (conditioning + prediction)')
     p.add_argument('--predict-steps', type=int, default=1,
                 help='number of future steps to predict')
-    p.add_argument('--csv-path', type=str, default="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv",
+    p.add_argument('--csv-path', type=str, default="/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_interpolated_deduplicated.csv",
                 help='path to the main CSV file with metrics')
     p.add_argument('--transform-cond-csv', type=str, default="/users/framunno/data/ionosphere/params.csv",
                 help='path to the transform condition CSV file')
@@ -351,48 +351,96 @@ def main():
     # Choose between regular Dataset and IterableDataset
     if args.use_iterable_dataset:
         print("✅ Using IterableDataset for proper multi-GPU/multi-worker sharding!")
-        get_data_fn = get_sequence_data_objects_iterable
+
+        # For IterableDataset: pass rank and world_size so it can shard across GPUs
+        train_dataset, train_sampler, train_dl = get_sequence_data_objects_iterable(
+            csv_path=args.csv_path,
+            transform_cond_csv=args.transform_cond_csv,
+            batch_size=args.batch_size,
+            num_data_workers=args.num_workers,
+            split='train',
+            seed=42,
+            sequence_length=args.sequence_length,
+            normalization_type=args.normalization_type,
+            preprocess_config=preprocess_config,
+            use_l1_conditions=True,
+            min_center_distance=15,
+            cartesian_transform=args.cartesian_transform,
+            output_size=64,
+            only_complete_sequences=args.only_complete_sequences,
+            persistent_workers=True,
+            prefetch_factor=4,
+            rank=accelerator.process_index,  # Pass accelerator rank
+            world_size=accelerator.num_processes,  # Pass accelerator world size
+        )
+
+        val_dataset, val_sampler, val_dl = get_sequence_data_objects_iterable(
+            csv_path=args.csv_path,
+            transform_cond_csv=args.transform_cond_csv,
+            batch_size=args.batch_size,
+            num_data_workers=args.num_workers,
+            split='valid',
+            seed=42,
+            sequence_length=args.sequence_length,
+            normalization_type=args.normalization_type,
+            preprocess_config=preprocess_config,
+            use_l1_conditions=True,
+            min_center_distance=30,
+            cartesian_transform=args.cartesian_transform,
+            output_size=64,
+            only_complete_sequences=args.only_complete_sequences,
+            persistent_workers=True,
+            prefetch_factor=4,
+            rank=accelerator.process_index,  # Pass accelerator rank
+            world_size=accelerator.num_processes,  # Pass accelerator world size
+        )
     else:
         print("Using regular Dataset (map-style)")
-        get_data_fn = get_sequence_data_objects
 
-    train_dataset, train_sampler, train_dl = get_data_fn(
-        csv_path=args.csv_path,
-        transform_cond_csv=args.transform_cond_csv,
-        batch_size=args.batch_size,
-        num_data_workers=args.num_workers,
-        split='train',
-        seed=42,
-        sequence_length=args.sequence_length,
-        normalization_type=args.normalization_type,
-        preprocess_config=preprocess_config,
-        use_l1_conditions=True,
-        min_center_distance=1,
-        cartesian_transform=args.cartesian_transform,
-        output_size=64,
-        only_complete_sequences=args.only_complete_sequences,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
+        # For regular Dataset: use DistributedSampler (handled inside the function)
+        train_dataset, train_sampler, train_dl = get_sequence_data_objects(
+            csv_path=args.csv_path,
+            transform_cond_csv=args.transform_cond_csv,
+            batch_size=args.batch_size,
+            distributed=(accelerator.num_processes > 1),
+            num_data_workers=args.num_workers,
+            split='train',
+            seed=42,
+            sequence_length=args.sequence_length,
+            normalization_type=args.normalization_type,
+            preprocess_config=preprocess_config,
+            use_l1_conditions=True,
+            min_center_distance=15,
+            cartesian_transform=args.cartesian_transform,
+            output_size=64,
+            only_complete_sequences=args.only_complete_sequences,
+            persistent_workers=True,
+            prefetch_factor=4,
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+        )
 
-    val_dataset, val_sampler, val_dl = get_data_fn(
-        csv_path=args.csv_path,
-        transform_cond_csv=args.transform_cond_csv,
-        batch_size=args.batch_size,
-        num_data_workers=args.num_workers,
-        split='valid',
-        seed=42,
-        sequence_length=args.sequence_length,
-        normalization_type=args.normalization_type,
-        preprocess_config=preprocess_config,
-        use_l1_conditions=True,
-        min_center_distance=1,
-        cartesian_transform=args.cartesian_transform,
-        output_size=64,
-        only_complete_sequences=args.only_complete_sequences,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
+        val_dataset, val_sampler, val_dl = get_sequence_data_objects(
+            csv_path=args.csv_path,
+            transform_cond_csv=args.transform_cond_csv,
+            batch_size=args.batch_size,
+            distributed=(accelerator.num_processes > 1),
+            num_data_workers=args.num_workers,
+            split='valid',
+            seed=42,
+            sequence_length=args.sequence_length,
+            normalization_type=args.normalization_type,
+            preprocess_config=preprocess_config,
+            use_l1_conditions=True,
+            min_center_distance=30,
+            cartesian_transform=args.cartesian_transform,
+            output_size=64,
+            only_complete_sequences=args.only_complete_sequences,
+            persistent_workers=True,
+            prefetch_factor=4,
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+        )
 
     print(f'Train loader and Valid loader are up! Lengths: {len(train_dl)}, {len(val_dl)}')
     print(f'Using normalization method: {args.normalization_type}')
@@ -601,9 +649,15 @@ def main():
 
 
     # Prepare the model, optimizer, and dataloaders with the accelerator
-    # ✅ Now we ALWAYS prepare dataloaders - accelerator handles distribution automatically
     # NOTE: We only prepare inner_model here (not EMA) to avoid deepcopy issues in multi-node DDP
-    inner_model, opt, train_dl = accelerator.prepare(inner_model, opt, train_dl)
+    # IMPORTANT: For IterableDataset, DON'T prepare the dataloader - it already handles sharding!
+    if args.use_iterable_dataset:
+        # IterableDataset handles its own GPU sharding, don't let accelerate wrap it again
+        inner_model, opt = accelerator.prepare(inner_model, opt)
+        # Keep train_dl unwrapped to avoid double-sharding
+    else:
+        # Regular Dataset with DistributedSampler - safe to prepare
+        inner_model, opt, train_dl = accelerator.prepare(inner_model, opt, train_dl)
 
     # Create EMA model AFTER DDP wrapping to avoid multi-node initialization issues
     # EMA model doesn't need DDP wrapping as it's only used for inference
@@ -778,7 +832,27 @@ def main():
             model.train()
 
             batch_start_time = time.perf_counter()
-            for batch in tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process):
+
+            # Debug: Print actual dataloader length and first batch shape
+            if accelerator.is_main_process and epoch == 0:
+                tqdm.write(f"\n{'='*80}")
+                tqdm.write(f"DATALOADER DEBUG INFO:")
+                tqdm.write(f"  len(train_dl) = {len(train_dl)}")
+                tqdm.write(f"  num_workers = {args.num_workers}")
+                tqdm.write(f"  batch_size = {args.batch_size}")
+                tqdm.write(f"  grad_accum_steps = {args.grad_accum_steps}")
+                tqdm.write(f"  Expected iterations per epoch: {len(train_dl)}")
+                tqdm.write(f"{'='*80}\n")
+
+            for batch_idx, batch in enumerate(tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process)):
+                # Debug: Print first batch shape
+                if accelerator.is_main_process and epoch == 0 and batch_idx == 0:
+                    tqdm.write(f"\nFIRST BATCH SHAPES:")
+                    tqdm.write(f"  batch[0].shape (images) = {batch[0].shape}")
+                    tqdm.write(f"  batch[1].shape (conditions) = {batch[1].shape}")
+                    tqdm.write(f"  Batch size in data: {batch[0].shape[0]}")
+                    tqdm.write(f"")
+
                 # TIMING: Data loading time
                 data_load_time = time.perf_counter() - batch_start_time
                 # timing_stats['data_loading'].append(data_load_time)
@@ -798,6 +872,7 @@ def main():
 
                     # import pdb; pdb.set_trace()
                     # TIMING: Forward pass
+                    # embed()
                     forward_start = time.perf_counter()
                     extra_args = {}
                     noise = torch.randn_like(target_img).to(device)
