@@ -6,7 +6,7 @@ import argparse
 from copy import deepcopy
 from util import generate_samples
 import numpy as np
-from src.data.dataset import get_sequence_data_objects
+from src.data.dataset import get_sequence_data_objects_iterable
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import imageio
@@ -15,29 +15,13 @@ import torch
 import os
 from IPython import embed
 
-# LOAD DATA
-train_dataset, train_sampler, train_dl = get_sequence_data_objects(
-        csv_path="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv",
-        transform_cond_csv="/users/framunno/data/ionosphere/params.csv",
-        batch_size=1,
-        distributed=False,
-        num_data_workers=1,
-        split='train',
-        seed=42,
-        sequence_length=30,
-        normalization_type="absolute_max",
-        use_l1_conditions=True,
-        min_center_distance=1,
-        cartesian_transform=True,  # Convert to Cartesian circular grid
-        output_size=64,  # Output grid size for Cartesian transform
-        only_complete_sequences=True,  # Filter out sequences with missing frames
-    )
+## DATASET SETUP
 
-val_dataset, val_sampler, val_dl = get_sequence_data_objects(
-        csv_path="/users/framunno/data/ionosphere/l1_earth_associated_with_maps.csv",
+val_dataset, val_sampler, val_dl = get_sequence_data_objects_iterable(
+        csv_path="/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_deduplicated.csv",
         transform_cond_csv="/users/framunno/data/ionosphere/params.csv",
         batch_size=1,
-        distributed=False,
+        # distributed=False,
         num_data_workers=1,
         split='valid',
         seed=42,
@@ -48,59 +32,10 @@ val_dataset, val_sampler, val_dl = get_sequence_data_objects(
         cartesian_transform=True,  # Convert to Cartesian circular grid
         output_size=64,  # Output grid size for Cartesian transform
         only_complete_sequences=True,  # Filter out sequences with missing frames
+        activity_filter='high',  # Only sequences with epsilon ≥ 75th percentile
+        epsilon_high_quantile=0.75
     )
 
-overfit_single = False
-
-# Overfitting on a single trajectory
-if overfit_single:
-
-    # Get one batch from the training set (batch_images, batch_conditions)
-    batch_images, batch_conditions = next(iter(train_dl))
-
-    # Extract the FIRST sample from the batch (remove batch dimension)
-    # batch_images: [batch_size, seq_len, C, H, W] -> [seq_len, C, H, W]
-    # batch_conditions: [batch_size, seq_len, num_cond] -> [seq_len, num_cond]
-    single_image = batch_images[0]
-    single_condition = batch_conditions[0]
-
-    # Create a dataset that repeats this single sample
-    class SingleSampleDataset(torch.utils.data.Dataset):
-        def __init__(self, image, condition, repeat=1000):
-            self.image = image
-            self.condition = condition
-            self.repeat = repeat
-
-        def __len__(self):
-            return self.repeat
-
-        def __getitem__(self, idx):
-            return self.image, self.condition
-
-    # Repeat the single sample enough times for a reasonable epoch
-    # With batch_size, this gives ~100 batches per epoch for quick overfitting tests
-    repeat_count = 100 * 1
-    single_dataset = SingleSampleDataset(single_image, single_condition, repeat=repeat_count)
-
-
-    # Create new dataloader with the single sample
-    # Use original batch_size so the model sees the expected batch dimension
-    train_dl = torch.utils.data.DataLoader(
-        single_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
-
-    # Also use the same single sample for validation
-    val_dl = torch.utils.data.DataLoader(
-        single_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
 
 ## SETUP MODEL
 
@@ -118,7 +53,7 @@ inner_model = K.config.make_model(config)
 model_ema = K.config.make_denoiser_wrapper(config)(inner_model)
 
 # embed()
-ckpt = torch.load("/capstor/scratch/cscs/framunno/models_results/models_ViT_forecast_15frames_absolute_max_ddp_bs1/model_epoch_0100.pth")
+ckpt = torch.load("/capstor/scratch/cscs/framunno/models_results/models_ViT_forecast_15frames_absolute_max_ddp_bs1_NOCOND_v3_interpolated_deduplicated/model_epoch_0100.pth")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_ema.inner_model.load_state_dict(ckpt['model_ema'])
@@ -127,13 +62,17 @@ model_ema.eval()
 
 import os
 
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/input_imgs")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/generated_imgs")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/gifs")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/ground_truth")
-os.mkdir("/capstor/scratch/cscs/framunno/results_ViT_800mln/conditions")
+# Change only this line for different experiments
+base_dir = "/capstor/scratch/cscs/framunno/results_ViT_800mln_NOCOND_V3_075"
+
+os.makedirs(os.path.join(base_dir, "input_imgs"), exist_ok=True)
+os.makedirs(os.path.join(base_dir, "generated_imgs"), exist_ok=True)
+os.makedirs(os.path.join(base_dir, "gifs"), exist_ok=True)
+os.makedirs(os.path.join(base_dir, "ground_truth"), exist_ok=True)
+os.makedirs(os.path.join(base_dir, "conditions"), exist_ok=True)
 
 cartesian_transform = True
+no_mapping_cond = True
 
 with torch.no_grad():
     for k, batch in enumerate(tqdm(val_dl, desc="Validation")):
@@ -143,6 +82,8 @@ with torch.no_grad():
         target_img = inpt[:, 15:, :, :].unsqueeze(1)  # last 60 time steps  15:
         cond_label = batch[1].to(device, non_blocking=True)
 
+        # embed()
+
         cond_label_inp = cond_label[:, :, :].repeat(20, 1, 1) # :16
 
         if cartesian_transform:
@@ -150,15 +91,15 @@ with torch.no_grad():
         else:
             spatial_shape = (24, 360)
 
-        embed()
-        # samples = generate_samples(model_ema, 1, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, 24, 360), num_pred_frames=15, step=50)
-        samples = generate_samples(model_ema, 20, device, cond_label=cond_label_inp[:, :, :], sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(20, 1, 1, 1), num_pred_frames=15).cpu()
+        cond_label_sample = None if no_mapping_cond else cond_label_inp[:, :, :]
 
-        # Save the oeiginal sample
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/input_imgs/original_forecasting_{k}.npy", cond_img[0].cpu().numpy())
-        # Save the generated sampl
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/generated_imgs/sample_forecasting_{k}.npy", samples.cpu().numpy())
+        samples = generate_samples(model_ema, 20, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(20, 1, 1, 1), num_pred_frames=15).cpu()
+
+        # Save the original sample
+        np.save(os.path.join(base_dir, f"input_imgs/original_forecasting_{k}.npy"), cond_img[0].cpu().numpy())
+        # Save the generated sample
+        np.save(os.path.join(base_dir, f"generated_imgs/sample_forecasting_{k}.npy"), samples.cpu().numpy())
         # Save the target sample
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/ground_truth/arget_forecasting_{k}.npy", target_img[0].cpu().numpy())
+        np.save(os.path.join(base_dir, f"ground_truth/target_forecasting_{k}.npy"), target_img[0].cpu().numpy())
         # Save the condition
-        np.save(f"/capstor/scratch/cscs/framunno/results_ViT_800mln/conditions/cond_{k}.npy", cond_label[0].cpu().numpy())
+        np.save(os.path.join(base_dir, f"conditions/cond_{k}.npy"), cond_label[0].cpu().numpy())

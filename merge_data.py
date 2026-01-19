@@ -9,8 +9,8 @@ import numpy as np
 print("Script started!", flush=True)
 
 # Check file sizes first
-params_file = "/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/params.csv"
-solar_wind_file = "/mnt/nas05/data01/francesco/combined_f1m_m1m_2024.csv"
+params_file = "/users/framunno/data/ionosphere/params.csv"
+solar_wind_file = "/users/framunno/data/ionosphere/combined_f1m_m1m_2024.csv"
 
 print(f"Params file size: {os.path.getsize(params_file) / 1024 / 1024:.2f} MB", flush=True)
 print(f"Solar wind file size: {os.path.getsize(solar_wind_file) / 1024 / 1024:.2f} MB", flush=True)
@@ -193,7 +193,7 @@ for batch_start in range(0, total_rows, batch_size):
 merged_df = pd.DataFrame(merged_data)
 
 # Save the merged data
-output_path = "/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/merged_params_solar_wind_v2.csv"
+output_path = "/users/framunno/data/ionosphere/merged_params_solar_wind_v2.csv"
 merged_df.to_csv(output_path, index=False)
 
 print(f"Merged DataFrame created with {len(merged_df)} rows")

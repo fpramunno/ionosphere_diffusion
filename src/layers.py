@@ -94,8 +94,10 @@ class Denoiser(nn.Module):
         
         # input = torch.cat([unet_cond, input], dim=1)
         # Get model output: (1, 1, 256, 256)
+        
         model_output = self.inner_model(input * c_in, sigma, **kwargs) * c_out
         
+        # embed()
         # # Select the first channel of the input for skip connection
         # input_selected = input[:, 0:1, :, :]  # Keep only one channel
         

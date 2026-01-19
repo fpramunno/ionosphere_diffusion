@@ -1027,6 +1027,9 @@ class IonoSequenceIterableDataset(IterableDataset):
         dp_world_size=1,  # Total number of GPUs
         infinite=False,  # Whether to loop infinitely
         shuffle=True,  # Whether to shuffle each epoch
+        activity_filter=None,  # NEW: 'high', 'low', 'moderate', or None
+        epsilon_high_quantile=0.75,  # NEW: threshold for high activity (75th percentile)
+        epsilon_low_quantile=0.25,   # NEW: threshold for low activity (25th percentile)
     ):
         super().__init__()
 
@@ -1053,6 +1056,11 @@ class IonoSequenceIterableDataset(IterableDataset):
         self.infinite = infinite
         self.shuffle = shuffle
         self._epoch = 0
+
+        # Activity filtering config
+        self.activity_filter = activity_filter
+        self.epsilon_high_quantile = epsilon_high_quantile
+        self.epsilon_low_quantile = epsilon_low_quantile
 
         # Load global stats if provided
         self.global_mean = None
@@ -1142,8 +1150,120 @@ class IonoSequenceIterableDataset(IterableDataset):
             print(f"Filtered sequences for {self.split}: {original_count} -> {filtered_count} "
                   f"({filtered_count/original_count*100:.1f}% complete)")
 
+        # Filter by activity if requested
+        if self.activity_filter is not None and self.use_l1_conditions:
+            self.sequences = self._filter_by_activity()
+
         print(f"IonoSequenceIterableDataset [{split}]: {len(self.sequences)} sequences")
         print(f"  GPU rank: {dp_rank}/{dp_world_size}, Shuffle: {shuffle}")
+
+    def calculate_epsilon_parameter(self, vwind_kms, by, bz, l0=7e6):
+        """
+        Calculate Akasofu epsilon parameter from L1 conditions.
+
+        Parameters:
+        - vwind_kms: solar wind velocity in km/s (negative in GSM, we use abs)
+        - by, bz: IMF components in nT
+        - l0: coupling length (7 Earth radii in meters)
+
+        Returns: epsilon in GW (GigaWatts)
+        """
+        mu0 = 4 * np.pi * 1e-7  # permeability
+
+        # Convert velocity to m/s and take absolute value
+        vwind = abs(vwind_kms) * 1000
+
+        # Convert nT to Tesla
+        by_T = by * 1e-9
+        bz_T = bz * 1e-9
+
+        # Calculate perpendicular IMF and clock angle
+        B_perp = np.sqrt(by_T**2 + bz_T**2)
+        theta = np.arctan2(by_T, bz_T)
+
+        # Epsilon formula
+        epsilon = (vwind * B_perp**2 * l0**2 * np.sin(theta/2)**4) / mu0
+
+        # Convert to GW for readability
+        return epsilon / 1e9
+
+    def _filter_by_activity(self):
+        """
+        Filter sequences based on epsilon activity level.
+        Calculates epsilon for all center frames, determines thresholds using quantiles,
+        then filters based on activity_filter setting.
+        """
+        print(f"\n{'='*80}")
+        print(f"FILTERING BY {self.activity_filter.upper()} ACTIVITY")
+        print(f"{'='*80}")
+
+        # Calculate epsilon for all center frames
+        epsilon_values = []
+        for center_idx in self.sequences:
+            file_path = self.all_files[center_idx]
+            filename = os.path.basename(file_path)
+
+            if filename in self.filename_to_conditions:
+                cond = self.filename_to_conditions[filename]
+                # cond = [bx, by, bz, vx]
+                epsilon = self.calculate_epsilon_parameter(
+                    vwind_kms=cond[3],  # proton_vx_gsm
+                    by=cond[1],         # by_gsm
+                    bz=cond[2]          # bz_gsm
+                )
+                epsilon_values.append((center_idx, epsilon))
+
+        # Calculate thresholds using quantiles
+        epsilon_vals = np.array([e for _, e in epsilon_values])
+        epsilon_high = np.quantile(epsilon_vals, self.epsilon_high_quantile)
+        epsilon_low = np.quantile(epsilon_vals, self.epsilon_low_quantile)
+
+        print(f"\nEpsilon statistics for {len(epsilon_values)} sequences:")
+        print(f"  Mean:   {epsilon_vals.mean():.1f} GW")
+        print(f"  Median: {np.median(epsilon_vals):.1f} GW")
+        print(f"  Min:    {epsilon_vals.min():.1f} GW")
+        print(f"  Max:    {epsilon_vals.max():.1f} GW")
+        print(f"\nActivity thresholds:")
+        print(f"  Low activity:      epsilon < {epsilon_low:.1f} GW  (< {self.epsilon_low_quantile*100:.0f}th percentile)")
+        print(f"  Moderate activity: {epsilon_low:.1f} GW ≤ epsilon < {epsilon_high:.1f} GW")
+        print(f"  High activity:     epsilon ≥ {epsilon_high:.1f} GW  (≥ {self.epsilon_high_quantile*100:.0f}th percentile)")
+
+        # Filter based on activity level
+        filtered_sequences = []
+        high_count = 0
+        low_count = 0
+        moderate_count = 0
+
+        for center_idx, epsilon in epsilon_values:
+            is_high = epsilon >= epsilon_high
+            is_low = epsilon <= epsilon_low
+            is_moderate = not is_high and not is_low
+
+            # Count all categories
+            if is_high:
+                high_count += 1
+            if is_low:
+                low_count += 1
+            if is_moderate:
+                moderate_count += 1
+
+            # Filter based on requested activity
+            if self.activity_filter == 'high' and is_high:
+                filtered_sequences.append(center_idx)
+            elif self.activity_filter == 'low' and is_low:
+                filtered_sequences.append(center_idx)
+            elif self.activity_filter == 'moderate' and is_moderate:
+                filtered_sequences.append(center_idx)
+
+        total = len(epsilon_values)
+        print(f"\nSequence distribution:")
+        print(f"  High activity:     {high_count:4d} sequences ({high_count/total*100:5.1f}%)")
+        print(f"  Moderate activity: {moderate_count:4d} sequences ({moderate_count/total*100:5.1f}%)")
+        print(f"  Low activity:      {low_count:4d} sequences ({low_count/total*100:5.1f}%)")
+        print(f"\nFiltered to {self.activity_filter} activity: {len(filtered_sequences)} sequences")
+        print(f"{'='*80}\n")
+
+        return filtered_sequences
 
     def _filter_complete_sequences(self):
         """Filter out sequences with missing frames."""
@@ -1193,10 +1313,11 @@ class IonoSequenceIterableDataset(IterableDataset):
         return sequences
 
     def _load_sequence(self, center_idx):
-        """Load a single sequence."""
+        """Load a single sequence with epsilon parameters."""
         start_idx = center_idx - self.sequence_length // 2
         data_tensors = []
         cond_tensors = []
+        epsilon_tensors = []  # NEW: store epsilon values
 
         center_time = self.all_timestamps[center_idx]
         expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
@@ -1234,6 +1355,14 @@ class IonoSequenceIterableDataset(IterableDataset):
                 else:
                     cond_raw = np.array([data[1], data[2], data[3], data[4]], dtype=np.float32)
 
+                # Calculate epsilon parameter
+                epsilon = self.calculate_epsilon_parameter(
+                    vwind_kms=cond_raw[3],  # proton_vx_gsm
+                    by=cond_raw[1],         # by_gsm
+                    bz=cond_raw[2]          # bz_gsm
+                )
+                epsilon_tensor = torch.tensor([epsilon], dtype=torch.float32)
+
                 cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
                 cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
             else:
@@ -1243,13 +1372,16 @@ class IonoSequenceIterableDataset(IterableDataset):
                 else:
                     data_tensor = torch.zeros(1, 24, 360, dtype=torch.float32)
                 cond_tensor = torch.full((4,), 2.0, dtype=torch.float32)
+                epsilon_tensor = torch.tensor([-1.0], dtype=torch.float32)  # -1 marks missing frames
 
             data_tensors.append(data_tensor)
             cond_tensors.append(cond_tensor)
+            epsilon_tensors.append(epsilon_tensor)
 
         data_seq = torch.stack(data_tensors, dim=0)
         cond_seq = torch.stack(cond_tensors, dim=0)
-        return data_seq, cond_seq
+        epsilon_seq = torch.stack(epsilon_tensors, dim=0)  # Shape: (sequence_length, 1)
+        return data_seq, cond_seq, epsilon_seq
 
     def __iter__(self):
         """Iterate through sequences assigned to this worker."""
@@ -1261,8 +1393,8 @@ class IonoSequenceIterableDataset(IterableDataset):
         while True:
             for center_idx in sequences:
                 try:
-                    data_seq, cond_seq = self._load_sequence(center_idx)
-                    yield data_seq, cond_seq
+                    data_seq, cond_seq, epsilon_seq = self._load_sequence(center_idx)
+                    yield data_seq, cond_seq, epsilon_seq
                 except Exception as e:
                     print(f"Error loading sequence center_idx={center_idx}: {e}")
                     continue
@@ -1592,6 +1724,9 @@ def get_sequence_data_objects_iterable(
     persistent_workers=False,
     prefetch_factor=None,
     shuffle=True,
+    activity_filter=None,  # NEW: 'high', 'low', 'moderate', or None
+    epsilon_high_quantile=0.75,  # NEW: threshold for high activity
+    epsilon_low_quantile=0.25,   # NEW: threshold for low activity
 ):
     """
     Create IterableDataset version with proper multi-GPU and multi-worker sharding.
@@ -1638,6 +1773,9 @@ def get_sequence_data_objects_iterable(
         dp_world_size=dp_world_size,
         infinite=False,  # Set to True for infinite iteration if needed
         shuffle=shuffle,
+        activity_filter=activity_filter,
+        epsilon_high_quantile=epsilon_high_quantile,
+        epsilon_low_quantile=epsilon_low_quantile,
     )
 
     # Build dataloader kwargs with optimizations
