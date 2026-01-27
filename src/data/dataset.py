@@ -330,8 +330,8 @@ class IonoDataset(Dataset): # type: ignore
                 data_tensor = self.normalizer.forward(data_tensor)
             else:
                 # Use original absolute max normalization
-                data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
-                data_tensor = 2* (data_tensor - 80000) / (80000 - (-80000)) -1  # normalize to [-1, 1]
+                data_tensor = torch.clamp(data_tensor, -80000, 80000)
+                data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  # normalize to [0, 1]
 
         condition_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
 
@@ -341,12 +341,14 @@ class IonoDataset(Dataset): # type: ignore
         """Reverse the normalization applied to the data."""
         if not self.are_transform:
             return normalized_tensor
-            
+
         if self.normalization_type == "mean_sigma_tanh" and self.normalizer is not None:
             return self.normalizer.reverse(normalized_tensor)
         else:
-            # Reverse absolute max normalization
-            return 2 * ((normalized_tensor - 80000) / (80000 - 80000)) - 1 #normalized_tensor * 55000.0
+            # Reverse absolute max normalization [0, 1] -> original
+            # Original: (data - (-80000)) / (80000 - (-80000))
+            # Reverse: norm * (80000 - (-80000)) + (-80000)
+            return normalized_tensor * (80000 - (-80000)) + (-80000)
 
 class RandomSamplerSeed(Sampler[int]):
     """Overwrite the RandomSampler to allow for a seed for each epoch.
@@ -847,8 +849,8 @@ class IonoSequenceDataset(Dataset):
                         # Default absolute_max normalization
                         # data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
 
-                        data_tensor = torch.clamp(data_tensor, -80000, 80000) #/ 55000 # maximum max value among the whole dataset can be changed
-                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1 # normalize to [-1, 1]
+                        data_tensor = torch.clamp(data_tensor, -80000, 80000)
+                        data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  # normalize to [0, 1]
 
                 if self.use_l1_conditions:
                     # Use cached conditions dictionary for O(1) lookup
@@ -917,9 +919,9 @@ class IonoSequenceDataset(Dataset):
             return reverse_ionosphere_transform(normalized_tensor, config=self.preprocess_config)
         else:
             # Reverse absolute max normalization
-            # Original: data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1
-            # Reverse: x = ((norm + 1) / 2) * (80000 - (-80000)) + (-80000)
-            return ((normalized_tensor + 1) / 2) * (80000 - (-80000)) + (-80000)
+            # Original: data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  -> [0, 1]
+            # Reverse: x = norm * (80000 - (-80000)) + (-80000)
+            return normalized_tensor * (80000 - (-80000)) + (-80000)
 
 
 def get_sequence_data_objects(
@@ -1154,6 +1156,12 @@ class IonoSequenceIterableDataset(IterableDataset):
         if self.activity_filter is not None and self.use_l1_conditions:
             self.sequences = self._filter_by_activity()
 
+        # Always compute epsilon thresholds for classification (even if not filtering)
+        self.epsilon_low_threshold = None
+        self.epsilon_high_threshold = None
+        if self.use_l1_conditions:
+            self._compute_epsilon_thresholds()
+
         print(f"IonoSequenceIterableDataset [{split}]: {len(self.sequences)} sequences")
         print(f"  GPU rank: {dp_rank}/{dp_world_size}, Shuffle: {shuffle}")
 
@@ -1186,6 +1194,45 @@ class IonoSequenceIterableDataset(IterableDataset):
 
         # Convert to GW for readability
         return epsilon / 1e9
+
+    def _compute_epsilon_thresholds(self):
+        """
+        Compute epsilon thresholds for activity classification.
+        Called once during initialization to determine low/medium/high boundaries.
+        """
+        print(f"\n{'='*80}")
+        print(f"COMPUTING EPSILON THRESHOLDS FOR {self.split.upper()} SPLIT")
+        print(f"{'='*80}")
+
+        # Calculate epsilon for all center frames in this split
+        epsilon_values = []
+        for center_idx in self.sequences:
+            file_path = self.all_files[center_idx]
+            filename = os.path.basename(file_path)
+
+            if filename in self.filename_to_conditions:
+                cond = self.filename_to_conditions[filename]
+                epsilon = self.calculate_epsilon_parameter(
+                    vwind_kms=cond[3],
+                    by=cond[1],
+                    bz=cond[2]
+                )
+                epsilon_values.append(epsilon)
+
+        epsilon_vals = np.array(epsilon_values)
+        self.epsilon_low_threshold = np.quantile(epsilon_vals, self.epsilon_low_quantile)
+        self.epsilon_high_threshold = np.quantile(epsilon_vals, self.epsilon_high_quantile)
+
+        print(f"Computed from {len(epsilon_values)} sequences:")
+        print(f"  Mean:   {epsilon_vals.mean():.1f} GW")
+        print(f"  Median: {np.median(epsilon_vals):.1f} GW")
+        print(f"  Min:    {epsilon_vals.min():.1f} GW")
+        print(f"  Max:    {epsilon_vals.max():.1f} GW")
+        print(f"\nActivity thresholds:")
+        print(f"  Low (0):    epsilon < {self.epsilon_low_threshold:.1f} GW")
+        print(f"  Medium (1): {self.epsilon_low_threshold:.1f} GW ≤ epsilon < {self.epsilon_high_threshold:.1f} GW")
+        print(f"  High (2):   epsilon ≥ {self.epsilon_high_threshold:.1f} GW")
+        print(f"{'='*80}\n")
 
     def _filter_by_activity(self):
         """
@@ -1313,11 +1360,12 @@ class IonoSequenceIterableDataset(IterableDataset):
         return sequences
 
     def _load_sequence(self, center_idx):
-        """Load a single sequence with epsilon parameters."""
+        """Load a single sequence with epsilon parameters and activity labels."""
         start_idx = center_idx - self.sequence_length // 2
         data_tensors = []
         cond_tensors = []
-        epsilon_tensors = []  # NEW: store epsilon values
+        epsilon_tensors = []  # Store epsilon values
+        label_tensors = []    # Store activity labels (0=low, 1=medium, 2=high)
 
         center_time = self.all_timestamps[center_idx]
         expected_start_time = center_time - timedelta(minutes=2 * (self.sequence_length // 2))
@@ -1334,7 +1382,7 @@ class IonoSequenceIterableDataset(IterableDataset):
 
             if frame_exists:
                 file_path = self.all_files[file_idx]
-                data = np.load('/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/' + file_path, allow_pickle=True)
+                data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True) # TODO: change the path to remove the hardcoding and make it more general
 
                 data_map = data[0].astype(np.float32)
                 if self.cartesian_transform:
@@ -1347,7 +1395,7 @@ class IonoSequenceIterableDataset(IterableDataset):
                         data_tensor = get_ionosphere_transform(data_tensor, config=self.preprocess_config)
                     else:
                         data_tensor = torch.clamp(data_tensor, -80000, 80000)
-                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1
+                        data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  # normalize to [0, 1]
 
                 if self.use_l1_conditions:
                     filename = os.path.basename(file_path)
@@ -1363,6 +1411,19 @@ class IonoSequenceIterableDataset(IterableDataset):
                 )
                 epsilon_tensor = torch.tensor([epsilon], dtype=torch.float32)
 
+                # Compute activity label from epsilon
+                if self.epsilon_low_threshold is not None and self.epsilon_high_threshold is not None:
+                    if epsilon < self.epsilon_low_threshold:
+                        label = 0  # Low activity
+                    elif epsilon < self.epsilon_high_threshold:
+                        label = 1  # Medium activity
+                    else:
+                        label = 2  # High activity
+                    label_tensor = torch.tensor([label], dtype=torch.long)
+                else:
+                    # No thresholds computed (shouldn't happen if use_l1_conditions=True)
+                    label_tensor = torch.tensor([-1], dtype=torch.long)
+
                 cond_norm = 2 * (cond_raw - self.cond_min) / (self.cond_max - self.cond_min) - 1
                 cond_tensor = torch.tensor(cond_norm, dtype=torch.float32)
             else:
@@ -1373,15 +1434,18 @@ class IonoSequenceIterableDataset(IterableDataset):
                     data_tensor = torch.zeros(1, 24, 360, dtype=torch.float32)
                 cond_tensor = torch.full((4,), 2.0, dtype=torch.float32)
                 epsilon_tensor = torch.tensor([-1.0], dtype=torch.float32)  # -1 marks missing frames
+                label_tensor = torch.tensor([-1], dtype=torch.long)  # -1 marks missing frames
 
             data_tensors.append(data_tensor)
             cond_tensors.append(cond_tensor)
             epsilon_tensors.append(epsilon_tensor)
+            label_tensors.append(label_tensor)
 
         data_seq = torch.stack(data_tensors, dim=0)
         cond_seq = torch.stack(cond_tensors, dim=0)
         epsilon_seq = torch.stack(epsilon_tensors, dim=0)  # Shape: (sequence_length, 1)
-        return data_seq, cond_seq, epsilon_seq
+        label_seq = torch.stack(label_tensors, dim=0)      # Shape: (sequence_length, 1)
+        return data_seq, cond_seq, epsilon_seq, label_seq
 
     def __iter__(self):
         """Iterate through sequences assigned to this worker."""
@@ -1393,8 +1457,8 @@ class IonoSequenceIterableDataset(IterableDataset):
         while True:
             for center_idx in sequences:
                 try:
-                    data_seq, cond_seq, epsilon_seq = self._load_sequence(center_idx)
-                    yield data_seq, cond_seq, epsilon_seq
+                    data_seq, cond_seq, epsilon_seq, label_seq = self._load_sequence(center_idx)
+                    yield data_seq, cond_seq, epsilon_seq, label_seq
                 except Exception as e:
                     print(f"Error loading sequence center_idx={center_idx}: {e}")
                     continue
@@ -1573,9 +1637,9 @@ class IonoRAEDataset(Dataset):
 
         # Apply normalization
         if self.normalization == 'minmax':
-            # Clamp to [-80000, 80000] and normalize to [-1, 1]
+            # Clamp to [-80000, 80000] and normalize to [0, 1]
             data_tensor = torch.clamp(data_tensor, -80000, 80000)
-            data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1
+            data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))
         elif self.normalization == 'per_file_tanh' and self.stats_dict is not None:
             # Use per-file mean/std normalization with tanh
             filename = file_path.name
@@ -1610,8 +1674,8 @@ class IonoRAEDataset(Dataset):
             Denormalized tensor
         """
         if self.normalization == 'minmax':
-            # Reverse: x = ((norm + 1) / 2) * (max - min) + min
-            return ((normalized_tensor + 1) / 2) * (80000 - (-80000)) + (-80000)
+            # Reverse [0, 1] -> original: x = norm * (max - min) + min
+            return normalized_tensor * (80000 - (-80000)) + (-80000)
         elif self.normalization == 'per_file_tanh':
             if filename is None:
                 raise ValueError("filename must be provided for per_file_tanh denormalization")
