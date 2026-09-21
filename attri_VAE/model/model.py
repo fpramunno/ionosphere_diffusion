@@ -318,13 +318,14 @@ class ConvVAE2D(nn.Module):
         # FC layers for encoder
         self.fc1 = nn.Linear(self.flattened_size, h_dim * 2)
         self.fc2 = nn.Linear(h_dim * 2, h_dim)
+        self.fc3 = nn.Linear(h_dim, h_dim // 2)
 
         # Dropout
         self.dropout = nn.Dropout(0.25)
 
         # Latent space
-        self.mu = nn.Linear(h_dim, latent_size)
-        self.logvar = nn.Linear(h_dim, latent_size)
+        self.mu = nn.Linear(h_dim // 2, latent_size) # Change frm h_dim to h_dim // 2 in input 
+        self.logvar = nn.Linear(h_dim // 2, latent_size) # Change frm h_dim to h_dim // 2 in input 
 
         # MLP classifier (for attri-VAE)
         self.mlp1 = nn.Linear(latent_size, latent_size // 2)
@@ -340,7 +341,9 @@ class ConvVAE2D(nn.Module):
         # Decoder channels (reverse of encoder)
         self.decoder_init_channels = n_filters_ENC[4]
 
-        self.fc3 = nn.Linear(latent_size, self.flattened_size)
+        self.fc4 = nn.Linear(latent_size, h_dim // 2)
+        self.fc5 = nn.Linear(h_dim // 2, h_dim)
+        self.fc6 = nn.Linear(h_dim, self.flattened_size)
 
         self.conv1_dec = nn.Conv2d(n_filters_ENC[4], n_filters_DEC[0], kernel_size=3, stride=1, padding=1)
         self.bn1_dec = nn.BatchNorm2d(n_filters_DEC[0])
@@ -378,6 +381,7 @@ class ConvVAE2D(nn.Module):
 
         h = F.relu(self.fc1(h))
         h = F.relu(self.fc2(h))
+        h = F.relu(self.fc3(h))
 
         mu, logvar = self.mu(h), self.logvar(h)
 
@@ -387,7 +391,9 @@ class ConvVAE2D(nn.Module):
 
     def decode(self, z):
         """Decoder: z -> reconstructed image"""
-        z = F.relu(self.fc3(z))
+        z = F.relu(self.fc4(z))
+        z = F.relu(self.fc5(z))
+        z = F.relu(self.fc6(z))
         z = z.view(-1, self.decoder_init_channels, self.bottleneck_spatial, self.bottleneck_spatial)
 
         z = F.relu(self.bn1_dec(self.conv1_dec(z)))

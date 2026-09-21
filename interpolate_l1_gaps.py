@@ -274,13 +274,20 @@ def count_valid_rows(df):
 
 def main():
     parser = argparse.ArgumentParser(description="Interpolate missing L1 solar wind data")
-    parser.add_argument("--input", type=str, default=INPUT_FILE,
+    parser.add_argument("input", type=str,
                        help="Input CSV file with raw L1 data")
-    parser.add_argument("--output", type=str, default=OUTPUT_FILE,
-                       help="Output CSV file with interpolated data")
+    parser.add_argument("--output", type=str, default=None,
+                       help="Output CSV file (default: <input>_interpolated.csv)")
     parser.add_argument("--max_gap", type=int, default=MAX_GAP_MINUTES,
                        help="Maximum gap size (minutes) to interpolate")
     args = parser.parse_args()
+
+    if args.output is None:
+        p = args.input
+        if p.endswith('.csv'):
+            args.output = p[:-4] + '_interpolated.csv'
+        else:
+            args.output = p + '_interpolated.csv'
 
     print("=" * 80)
     print("L1 SOLAR WIND DATA GAP INTERPOLATION")

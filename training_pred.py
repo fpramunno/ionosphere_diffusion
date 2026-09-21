@@ -102,8 +102,10 @@ def main():
     p.add_argument('--start-method', type=str, default='spawn',
                 choices=['fork', 'forkserver', 'spawn'],
                 help='the multiprocessing start method')
+    p.add_argument('--max-steps', type=int, default=None,
+                help='maximum number of optimizer steps to train for')
     p.add_argument('--max-epochs', type=int, default=None,
-                help='maximum number of epochs to train for')
+                help='(deprecated) maximum number of epochs; converted to --max-steps at runtime')
     p.add_argument('--sequence-length', type=int, default=30,
                 help='the total length of the sequence (conditioning + prediction)')
     p.add_argument('--predict-steps', type=int, default=1,
@@ -127,6 +129,8 @@ def main():
                 help='the wandb entity name')
     p.add_argument('--wandb-group', type=str,
                 help='the wandb group name')
+    p.add_argument('--wandb-runid', type=str,
+                help='the wandb run id (specify this to resume)')
     p.add_argument('--wandb-project', type=str,
                 help='the wandb project name (specify this to enable wandb)')
     p.add_argument('--wandb-save-model', action='store_true',
@@ -144,6 +148,8 @@ def main():
                 help='overfit on a single trajectory for debugging')
     p.add_argument('--only-complete-sequences', action='store_true',
                 help='only use sequences with no missing frames (no zero-padded frames)')
+    p.add_argument('--val-steps', type=int, default=200,
+                help='number of validation batches per evaluation (default: 200)')
 
     # FSDP and scaling arguments
     p.add_argument('--use-fsdp', action='store_true',
@@ -165,14 +171,14 @@ def main():
         print("  - Disabling wandb")
         print("  - Setting batch_size=4")
         print("  - Setting num_workers=2")
-        print("  - Setting evaluate_every=1")
-        print("  - Setting max_epochs=5 (if not already set)")
+        print("  - Setting evaluate_every=500")
+        print("  - Setting max_steps=2000 (if not already set)")
         args.use_wandb = False
         args.batch_size = 4
         args.num_workers = 2
-        args.evaluate_every = 1
-        if args.max_epochs is None:
-            args.max_epochs = 5
+        args.evaluate_every = 500
+        if args.max_steps is None:
+            args.max_steps = 2000
 
     # Calculate conditioning length from total sequence length and prediction steps
     args.conditioning_length = args.sequence_length - args.predict_steps
@@ -212,7 +218,7 @@ def main():
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.grad_accum_steps,
                                             mixed_precision=args.mixed_precision,
-                kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)])
+                kwargs_handlers=[accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=args.no_mapping_cond)])
 
     device = accelerator.device
     unwrap = accelerator.unwrap_model
@@ -269,7 +275,7 @@ def main():
         log_config['config'] = config
         log_config['parameters'] = K.utils.n_params(inner_model)
         # Use current working directory for wandb (where we launch the script)
-        wandb.init(project="ionosphere", entity="francescopio", name=args.wandb_runname, config=log_config, save_code=True, dir=os.getcwd(), resume="allow")
+        wandb.init(project="ionosphere", id=args.wandb_runid, entity="francescopio", name=args.wandb_runname, config=log_config, save_code=True, dir=os.getcwd(), resume="allow")
     
     # MODEL SUMMARY
     if accelerator.is_main_process:
@@ -366,7 +372,7 @@ def main():
             use_l1_conditions=True,
             min_center_distance=15,
             cartesian_transform=args.cartesian_transform,
-            output_size=64,
+            output_size=128,
             only_complete_sequences=args.only_complete_sequences,
             persistent_workers=True,
             prefetch_factor=4,
@@ -387,7 +393,7 @@ def main():
             use_l1_conditions=True,
             min_center_distance=30,
             cartesian_transform=args.cartesian_transform,
-            output_size=64,
+            output_size=128,
             only_complete_sequences=args.only_complete_sequences,
             persistent_workers=True,
             prefetch_factor=4,
@@ -412,7 +418,7 @@ def main():
             use_l1_conditions=True,
             min_center_distance=15,
             cartesian_transform=args.cartesian_transform,
-            output_size=64,
+            output_size=128,
             only_complete_sequences=args.only_complete_sequences,
             persistent_workers=True,
             prefetch_factor=4,
@@ -434,7 +440,7 @@ def main():
             use_l1_conditions=True,
             min_center_distance=30,
             cartesian_transform=args.cartesian_transform,
-            output_size=64,
+            output_size=128,
             only_complete_sequences=args.only_complete_sequences,
             persistent_workers=True,
             prefetch_factor=4,
@@ -493,12 +499,14 @@ def main():
 
         # ✅ NEW WAY: Let accelerator.prepare() handle distributed logic automatically
         # This works for DDP, FSDP, and other backends without manual DistributedSampler
+        # IMPORTANT: drop_last=True ensures all GPUs have equal batch counts to prevent DDP deadlocks
         train_dl = torch.utils.data.DataLoader(
             single_dataset_train,
             batch_size=args.batch_size,
             shuffle=False,  # No shuffle for overfitting
             num_workers=0,
             pin_memory=True,
+            drop_last=True,
         )
 
         val_dl = torch.utils.data.DataLoader(
@@ -507,6 +515,7 @@ def main():
             shuffle=False,
             num_workers=0,
             pin_memory=True,
+            drop_last=True,
         )
 
         # ❌ OLD MANUAL WAY (commented out - kept for reference):
@@ -584,13 +593,18 @@ def main():
     elif sched_config['type'] == 'constant':
         sched = K.utils.ConstantLRWithWarmup(opt, warmup=sched_config['warmup'])
     elif sched_config['type'] == 'cosine':
-        # Calculate total steps
-        if args.max_epochs is None:
-            raise ValueError("max_epochs must be specified when using cosine scheduler")
-
-        epoch_size = len(train_dl)  # steps per epoch
+        # Resolve total training steps
+        if args.max_steps is not None:
+            total_steps = args.max_steps
+        elif args.max_epochs is not None:
+            epoch_size = len(train_dl)
+            total_steps = (args.max_epochs * epoch_size) // args.grad_accum_steps
+            args.max_steps = total_steps  # normalise so the main loop uses max_steps
+        else:
+            raise ValueError("Either --max-steps or --max-epochs must be specified for cosine scheduler")
 
         # Support both warmup_steps (direct) and warmup_epochs (computed)
+        epoch_size = len(train_dl)
         if 'warmup_steps' in sched_config:
             warmup_steps = sched_config['warmup_steps']
             warmup_epochs = warmup_steps * args.grad_accum_steps / epoch_size
@@ -598,8 +612,7 @@ def main():
             warmup_epochs = sched_config.get('warmup_epochs', 0)
             warmup_steps = (warmup_epochs * epoch_size) // args.grad_accum_steps
 
-        total_steps = (args.max_epochs * epoch_size) // args.grad_accum_steps
-        eta_min_factor = sched_config.get('eta_min_factor', 100)  # LR will decay to lr/100
+        eta_min_factor = sched_config.get('eta_min_factor', 100)
 
         if warmup_steps > 0:
             # Cosine with linear warmup
@@ -623,7 +636,7 @@ def main():
             if accelerator.is_main_process:
                 print(f"📊 Cosine LR Schedule:")
                 print(f"   Warmup steps: {warmup_steps} (epochs: {warmup_epochs:.2f})")
-                print(f"   Total steps: {total_steps} (epochs: {args.max_epochs})")
+                print(f"   Total steps: {total_steps}")
                 print(f"   Base LR: {lr:.2e}")
                 print(f"   Min LR: {lr/eta_min_factor:.2e}")
         else:
@@ -740,7 +753,7 @@ def main():
 
     def save():
         accelerator.wait_for_everyone()
-        filename = os.path.join(dir_path_mdl, f"{args.name}_epoch_{epoch:04}.pth")
+        filename = os.path.join(dir_path_mdl, f"{args.name}_step_{step:07}.pth")
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
 
@@ -813,583 +826,280 @@ def main():
 
     losses_since_last_print = []
 
-    # PROFILING: Track timing for different parts of training loop
-    # timing_stats = {
-    #     'data_loading': [],
-    #     'data_transfer': [],
-    #     'forward': [],
-    #     'backward': [],
-    #     'optimizer': [],
-    #     'ema': [],
-    # }
+    def infinite_loader(dl):
+        while True:
+            for batch in dl:
+                yield batch
 
     model = model.to(device)
+    model.train()
+
+    if accelerator.is_main_process:
+        tqdm.write(f"\n{'='*80}")
+        tqdm.write(f"DATALOADER DEBUG INFO:")
+        tqdm.write(f"  len(train_dl) = {len(train_dl)}")
+        tqdm.write(f"  num_workers = {args.num_workers}")
+        tqdm.write(f"  batch_size = {args.batch_size}")
+        tqdm.write(f"  grad_accum_steps = {args.grad_accum_steps}")
+        tqdm.write(f"  max_steps = {args.max_steps}")
+        tqdm.write(f"{'='*80}\n")
+
+    train_iter = infinite_loader(train_dl)
+    pbar = tqdm(total=args.max_steps, initial=step, smoothing=0.1, disable=not accelerator.is_main_process)
+
     try:
-        while args.max_epochs is None or epoch < args.max_epochs:
-            # Training Loop
-            epoch_train_loss = 0  # Track total training loss
-            num_train_batches = len(train_dl)  # Number of batches
-            model.train()
+        while args.max_steps is None or step < args.max_steps:
+            batch = next(train_iter)
 
-            batch_start_time = time.perf_counter()
+            # Log first batch shapes once
+            if accelerator.is_main_process and step == 0:
+                tqdm.write(f"\nFIRST BATCH SHAPES:")
+                tqdm.write(f"  batch[0].shape (images) = {batch[0].shape}")
+                tqdm.write(f"  batch[1].shape (conditions) = {batch[1].shape}")
+                tqdm.write(f"  Batch size in data: {batch[0].shape[0]}")
+                tqdm.write(f"")
 
-            # Debug: Print actual dataloader length and first batch shape
-            if accelerator.is_main_process and epoch == 0:
-                tqdm.write(f"\n{'='*80}")
-                tqdm.write(f"DATALOADER DEBUG INFO:")
-                tqdm.write(f"  len(train_dl) = {len(train_dl)}")
-                tqdm.write(f"  num_workers = {args.num_workers}")
-                tqdm.write(f"  batch_size = {args.batch_size}")
-                tqdm.write(f"  grad_accum_steps = {args.grad_accum_steps}")
-                tqdm.write(f"  Expected iterations per epoch: {len(train_dl)}")
-                tqdm.write(f"{'='*80}\n")
+            with accelerator.accumulate(model):
+                inpt = batch[0].contiguous().float().to(device, non_blocking=True)
+                inpt = inpt.squeeze(2)
+                cond_img = inpt[:, :args.conditioning_length, :, :]
+                target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]
+                cond_label = batch[1].to(device, non_blocking=True)
+                cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]
 
-            for batch_idx, batch in enumerate(tqdm(train_dl, smoothing=0.1, disable=not accelerator.is_main_process)):
-                # Debug: Print first batch shape
-                if accelerator.is_main_process and epoch == 0 and batch_idx == 0:
-                    tqdm.write(f"\nFIRST BATCH SHAPES:")
-                    tqdm.write(f"  batch[0].shape (images) = {batch[0].shape}")
-                    tqdm.write(f"  batch[1].shape (conditions) = {batch[1].shape}")
-                    tqdm.write(f"  Batch size in data: {batch[0].shape[0]}")
-                    tqdm.write(f"")
+                extra_args = {}
+                noise = torch.randn_like(target_img).to(device)
+                with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
+                    sigma = sample_density([target_img.shape[0]], device=device)
 
-                # TIMING: Data loading time
-                data_load_time = time.perf_counter() - batch_start_time
-                # timing_stats['data_loading'].append(data_load_time)
+                with K.models.checkpointing(args.checkpointing):
+                    mapping_cond_val = None if args.no_mapping_cond else cond_label_inp
+                    losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=mapping_cond_val, **extra_args)
 
-                with accelerator.accumulate(model):
-                    # TIMING: Data transfer to GPU
-                    transfer_start = time.perf_counter()
-                    inpt = batch[0].contiguous().float().to(device, non_blocking=True)
-                    inpt = inpt.squeeze(2)  # shape: (batch_size, sequence_length, 24, 360)
-                    cond_img = inpt[:, :args.conditioning_length, :, :]    # first conditioning_length time steps
-                    target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
-                    cond_label = batch[1].to(device, non_blocking=True)
-                    cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
-                    torch.cuda.synchronize()  # Wait for transfers to complete
-                    transfer_time = time.perf_counter() - transfer_start
-                    # timing_stats['data_transfer'].append(transfer_time)
+                loss = losses.mean().item()
+                losses_since_last_print.append(loss)
 
-                    # import pdb; pdb.set_trace()
-                    # TIMING: Forward pass
-                    # embed()
-                    forward_start = time.perf_counter()
-                    extra_args = {}
-                    noise = torch.randn_like(target_img).to(device)
-                    with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
-                        sigma = sample_density([target_img.shape[0]], device=device)
+                accelerator.backward(losses.mean())
 
-                    with K.models.checkpointing(args.checkpointing):
-                        # Conditionally disable mapping_cond if --no-mapping-cond is set
-                        mapping_cond_val = None if args.no_mapping_cond else cond_label_inp
+                if args.gns:
+                    sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
+                    gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, inpt.shape[0], inpt.shape[0] * accelerator.num_processes)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.)
+                    opt.step()
+                    sched.step()
+                    opt.zero_grad()
 
-                        print(f'Mapping cond value: {mapping_cond_val}')
-                        losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=mapping_cond_val, **extra_args)
-                    torch.cuda.synchronize()  # Wait for forward to complete
-                    forward_time = time.perf_counter() - forward_start
-                    # timing_stats['forward'].append(forward_time)
+                ema_decay = ema_sched.get_value()
+                K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
+                if accelerator.sync_gradients:
+                    K.utils.ema_update(unwrap(model.inner_model), model_ema.inner_model, ema_decay)
+                    ema_sched.step()
 
-                    # Evita NCCL timeout: non fare gather durante il training!
-                    loss = losses.mean().item()
-                    losses_since_last_print.append(loss)
-                    epoch_train_loss += loss  # Accumulate loss
+            if accelerator.sync_gradients:
+                step += 1
+                wandb_step += 1
+                pbar.update(1)
 
-                    # TIMING: Backward pass
-                    backward_start = time.perf_counter()
-                    accelerator.backward(losses.mean())
-                    torch.cuda.synchronize()  # Wait for backward to complete
-                    backward_time = time.perf_counter() - backward_start
-                    # timing_stats['backward'].append(backward_time)
-
-                    # TIMING: Optimizer step
-                    opt_start = time.perf_counter()
-                    if args.gns:
-                        sq_norm_small_batch, sq_norm_large_batch = gns_stats_hook.get_stats()
-                        gns_stats.update(sq_norm_small_batch, sq_norm_large_batch, inpt.shape[0], inpt.shape[0] * accelerator.num_processes)
-                    if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), 1.)
-                        opt.step()
-                        sched.step()  # Only step scheduler when gradients are actually synced
-                        opt.zero_grad()
-                    # Note: When using gradient accumulation, opt/sched should only step when sync_gradients=True
-                    torch.cuda.synchronize()  # Wait for optimizer to complete
-                    opt_time = time.perf_counter() - opt_start
-                    # timing_stats['optimizer'].append(opt_time)
-
-                    # TIMING: EMA update
-                    ema_start = time.perf_counter()
-                    ema_decay = ema_sched.get_value()
-                    K.utils.ema_update_dict(ema_stats, {'loss': loss}, ema_decay ** (1 / args.grad_accum_steps))
-                    if accelerator.sync_gradients:
-                        # Unwrap model.inner_model to match model_ema.inner_model parameter names (DDP vs non-DDP)
-                        K.utils.ema_update(unwrap(model.inner_model), model_ema.inner_model, ema_decay)
-                        ema_sched.step()
-                    ema_time = time.perf_counter() - ema_start
-                    # timing_stats['ema'].append(ema_time)
-
-                # Only log when we've actually done an optimizer step (gradients synced)
-                if accelerator.sync_gradients and step % 25 == 0:
+                # --- Loss logging every 25 steps ---
+                if step % 25 == 0:
                     loss_disp = sum(losses_since_last_print) / len(losses_since_last_print)
                     losses_since_last_print.clear()
                     avg_loss = ema_stats['loss']
                     if accelerator.is_main_process:
-                        # PROFILING: Report timing breakdown
-                        # if len(timing_stats['forward']) > 0:
-                        #     avg_data_load = sum(timing_stats['data_loading']) / len(timing_stats['data_loading']) * 1000
-                        #     avg_transfer = sum(timing_stats['data_transfer']) / len(timing_stats['data_transfer']) * 1000
-                        #     avg_forward = sum(timing_stats['forward']) / len(timing_stats['forward']) * 1000
-                        #     avg_backward = sum(timing_stats['backward']) / len(timing_stats['backward']) * 1000
-                        #     avg_optimizer = sum(timing_stats['optimizer']) / len(timing_stats['optimizer']) * 1000
-                        #     avg_ema = sum(timing_stats['ema']) / len(timing_stats['ema']) * 1000
-                        #     total_time = avg_data_load + avg_transfer + avg_forward + avg_backward + avg_optimizer + avg_ema
-
-                        #     tqdm.write(f'\n{"="*80}')
-                        #     tqdm.write(f'⏱️  TIMING BREAKDOWN (Step {step}):')
-                        #     tqdm.write(f'{"="*80}')
-                        #     tqdm.write(f'  Data Loading:   {avg_data_load:>8.2f}ms ({avg_data_load/total_time*100:>5.1f}%)')
-                        #     tqdm.write(f'  Data Transfer:  {avg_transfer:>8.2f}ms ({avg_transfer/total_time*100:>5.1f}%)')
-                        #     tqdm.write(f'  Forward Pass:   {avg_forward:>8.2f}ms ({avg_forward/total_time*100:>5.1f}%)')
-                        #     tqdm.write(f'  Backward Pass:  {avg_backward:>8.2f}ms ({avg_backward/total_time*100:>5.1f}%)')
-                        #     tqdm.write(f'  Optimizer:      {avg_optimizer:>8.2f}ms ({avg_optimizer/total_time*100:>5.1f}%)')
-                        #     tqdm.write(f'  EMA Update:     {avg_ema:>8.2f}ms ({avg_ema/total_time*100:>5.1f}%)')
-                        #     tqdm.write(f'  {"─"*80}')
-                        #     tqdm.write(f'  TOTAL:          {total_time:>8.2f}ms ({total_time/1000:.2f}s per iteration)')
-                        #     tqdm.write(f'{"="*80}\n')
-
-                        #     # Reset timing stats
-                        #     for key in timing_stats:
-                        #         timing_stats[key].clear()
-
                         if args.gns:
-                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
+                            tqdm.write(f'step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}, gns: {gns_stats.get_gns():g}')
                         else:
-                            tqdm.write(f'Epoch: {epoch}, step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
-
-                        # Log to wandb every 25 steps (removed GPU memory logging - it requires sync)
+                            tqdm.write(f'step: {step}, loss: {loss_disp:g}, avg loss: {avg_loss:g}')
                         if use_wandb:
-                            wandb.log({
-                                'train/loss_step': loss_disp,
-                                'train/avg_loss': avg_loss,
-                            }, step=wandb_step)
+                            wandb.log({'train/loss_step': loss_disp, 'train/avg_loss': avg_loss}, step=wandb_step)
 
-                # Step counter: Each iteration processes batch_size samples per GPU
-                # In distributed training, we want to count actual optimizer steps (when gradients sync)
-                # not individual forward/backward passes
-                if accelerator.sync_gradients:
-                    step += 1  # One optimizer step happened
-                    wandb_step += 1
-                batch_start_time = time.perf_counter()  # Start timing for next batch
+                # --- Evaluation every eval_every steps ---
+                if step % args.evaluate_every == 0:
+                    accelerator.wait_for_everyone()
+                    model.eval()
+                    local_val_loss = torch.tensor(0.0, device=device)
+                    val_iter_tmp = iter(val_dl)
+                    with torch.no_grad():
+                        for val_step_i in tqdm(range(args.val_steps), desc="Validation", disable=not accelerator.is_main_process, leave=False):
+                            try:
+                                val_batch = next(val_iter_tmp)
+                            except StopIteration:
+                                break
+                            inpt_v = val_batch[0].contiguous().float().to(device, non_blocking=True)
+                            inpt_v = inpt_v.squeeze(2)
+                            cond_img = inpt_v[:, :args.conditioning_length, :, :]
+                            target_img = inpt_v[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]
+                            cond_label_v = val_batch[1].to(device, non_blocking=True)
+                            cond_label_inp = cond_label_v[:, :args.conditioning_length+args.predict_steps, :]
+                            noise_v = torch.randn_like(target_img).to(device)
+                            with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
+                                sigma_v = sample_density([target_img.shape[0]], device=device)
+                            with K.models.checkpointing(args.checkpointing):
+                                mapping_cond_val = None if args.no_mapping_cond else cond_label_inp
+                                losses_v = model.loss(target_img, cond_img, noise_v, sigma_v, mapping_cond=mapping_cond_val, **extra_args)
+                            local_val_loss += losses_v.mean().detach()
+                    # Gather after all ranks finish — separate gathers, no indexing issues
+                    accelerator.wait_for_everyone()
+                    gathered_loss = accelerator.gather(local_val_loss)  # [num_processes]
+                    if accelerator.is_main_process:
+                        val_loss = gathered_loss.mean().item()
+                        tqdm.write(f"step: {step}, val_loss: {val_loss:.6f}")
+
+                    # --- Sampling (all ranks) ---
+                    spatial_shape = (128, 128) if args.cartesian_transform else (24, 360)
+                    cond_label_sample = None if args.no_mapping_cond else cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4)
+                    samples = generate_samples(model_ema, 1, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
+
+                    # --- Visualization + wandb logging (main process only) ---
+                    if accelerator.is_main_process:
+                        import numpy as np
+                        generated_sample = samples[0]  # [predict_steps, H, W]
+                        target_sample = target_img[0].cpu().numpy()
+                        generated_sample_np = generated_sample[0].cpu().numpy()
+                        target_sample_orig = target_sample[0] * 80000.0
+                        generated_sample_orig = generated_sample_np * 80000.0
+
+                        if args.cartesian_transform:
+                            if args.predict_steps == 1:
+                                fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
+                                im0 = axes[0].imshow(target_sample_orig, cmap='plasma', aspect='auto')
+                                axes[0].set_title("Target (Ground Truth)")
+                                axes[0].axis('off')
+                                fig_comparison.colorbar(im0, ax=[axes[0]], shrink=0.8)
+                                im1 = axes[1].imshow(generated_sample_orig, cmap='plasma', aspect='auto')
+                                axes[1].set_title("Generated Prediction")
+                                axes[1].axis('off')
+                                fig_comparison.colorbar(im1, ax=[axes[1]], shrink=0.8)
+                                fig_single, ax_single = plt.subplots(figsize=(10, 10))
+                                im_single = ax_single.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
+                                ax_single.set_title(f"Generated Prediction - Step {step}")
+                                ax_single.axis('off')
+                                plt.colorbar(im_single, ax=ax_single, shrink=0.8)
+                            else:
+                                generated_all_orig = generated_sample.cpu().numpy() * 80000.0
+                                target_all_orig = target_sample * 80000.0
+                                generated_sample_orig = generated_all_orig
+                                target_first = target_all_orig[0] if target_all_orig.ndim > 2 else target_all_orig
+                                gen_first = generated_all_orig[0] if generated_all_orig.ndim > 2 else generated_all_orig
+                                vmin, vmax = np.min(target_first), np.max(target_first)
+                                fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
+                                im0 = axes[0].imshow(target_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
+                                axes[0].set_title("Target Step 1"); axes[0].axis('off')
+                                im1 = axes[1].imshow(gen_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
+                                axes[1].set_title("Generated Step 1"); axes[1].axis('off')
+                                fig_comparison.colorbar(im0, ax=axes, shrink=0.8).set_label("Intensity", fontsize=12)
+                                fig_comparison.suptitle(f"Multi-Step Forecasting - Step {step}", fontsize=16)
+                                fig_single, ax_single = plt.subplots(figsize=(10, 10))
+                                im_single = ax_single.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
+                                ax_single.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Step {step}")
+                                ax_single.axis('off')
+                        else:
+                            from util import plot_polar_ionosphere_single, plot_polar_ionosphere_comparison
+                            if args.predict_steps == 1:
+                                fig_comparison, _ = plot_polar_ionosphere_comparison(target_sample_orig, generated_sample_orig, titles=["Target", "Generated"], cmap='plasma', figsize=(16, 8))
+                                fig_single, _ = plot_polar_ionosphere_single(generated_sample_orig, title=f"Generated - Step {step}", cmap='plasma', figsize=(10, 10))
+                            else:
+                                generated_all_orig = generated_sample.cpu().numpy() * 80000.0
+                                target_all_orig = target_sample * 80000.0
+                                generated_sample_orig = generated_all_orig
+                                target_first = target_all_orig[0] if target_all_orig.ndim > 2 else target_all_orig
+                                gen_first = generated_all_orig[0] if generated_all_orig.ndim > 2 else generated_all_orig
+                                fig_comparison, _ = plot_polar_ionosphere_comparison(target_first, gen_first, titles=["Target Step 1", "Generated Step 1"], cmap='plasma', figsize=(16, 8))
+                                fig_comparison.suptitle(f"Multi-Step Forecasting - Step {step}", fontsize=16)
+                                fig_single, _ = plot_polar_ionosphere_single(generated_all_orig[-1], title=f"Generated Final Frame - Step {step}", cmap='plasma', figsize=(10, 10))
+
+                        buf = io.BytesIO()
+                        fig_comparison.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                        buf.seek(0)
+                        buf_single = io.BytesIO()
+                        fig_single.savefig(buf_single, format='png', dpi=150, bbox_inches='tight')
+                        buf_single.seek(0)
+
+                        # GIF animation
+                        frames_gif = []
+                        full_sequence = torch.cat([cond_img[0].cpu(), target_img[0].cpu()], dim=0)
+                        generated_full_sequence = torch.cat([cond_img[0].cpu(), generated_sample.cpu()], dim=0)
+                        img_h, img_w = full_sequence.shape[1], full_sequence.shape[2]
+                        figsize_gif = (4 * img_w / img_h, 4)
+                        for t in range(full_sequence.shape[0]):
+                            img_frame = full_sequence[t].cpu().numpy() * 80000.0
+                            fig_f, ax_f = plt.subplots(figsize=figsize_gif)
+                            im_f = ax_f.imshow(img_frame, cmap='plasma', aspect='auto', vmin=np.array(generated_sample_orig).min(), vmax=np.array(generated_sample_orig).max())
+                            ax_f.set_title(f"Cond {t+1}/{args.conditioning_length}" if t < args.conditioning_length else f"Target {t-args.conditioning_length+1}/{args.predict_steps}")
+                            ax_f.axis('off'); fig_f.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                            plt.colorbar(im_f, ax=ax_f, shrink=0.8)
+                            fig_f.canvas.draw()
+                            frame_arr = np.frombuffer(fig_f.canvas.tostring_rgb(), dtype=np.uint8).reshape(fig_f.canvas.get_width_height()[::-1] + (3,))
+                            frames_gif.append(frame_arr); plt.close(fig_f)
+                        fig_sep, ax_sep = plt.subplots(figsize=figsize_gif)
+                        ax_sep.text(0.5, 0.5, 'PREDICTED SEQUENCE', ha='center', va='center', fontsize=20, transform=ax_sep.transAxes, bbox=dict(boxstyle='round', facecolor='lightblue'))
+                        ax_sep.set_xlim(0, 1); ax_sep.set_ylim(0, 1); ax_sep.axis('off')
+                        fig_sep.canvas.draw()
+                        frames_gif.append(np.frombuffer(fig_sep.canvas.tostring_rgb(), dtype=np.uint8).reshape(fig_sep.canvas.get_width_height()[::-1] + (3,))); plt.close(fig_sep)
+                        for t in range(generated_full_sequence.shape[0]):
+                            img_frame = generated_full_sequence[t].cpu().numpy() * 80000.0
+                            fig_f, ax_f = plt.subplots(figsize=figsize_gif)
+                            im_f = ax_f.imshow(img_frame, cmap='plasma', aspect='auto', vmin=np.array(generated_sample_orig).min(), vmax=np.array(generated_sample_orig).max())
+                            ax_f.set_title(f"Cond {t+1}/{args.conditioning_length}" if t < args.conditioning_length else f"Generated {t-args.conditioning_length+1}/{args.predict_steps}")
+                            ax_f.axis('off'); fig_f.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                            plt.colorbar(im_f, ax=ax_f, shrink=0.8)
+                            fig_f.canvas.draw()
+                            frame_arr = np.frombuffer(fig_f.canvas.tostring_rgb(), dtype=np.uint8).reshape(fig_f.canvas.get_width_height()[::-1] + (3,))
+                            frames_gif.append(frame_arr); plt.close(fig_f)
+                        gif_path = f'{dir_path_res}/sequence_gen_step{step:07}.gif'
+                        imageio.mimsave(gif_path, frames_gif, duration=0.8)
+
+                        if use_wandb:
+                            from PIL import Image
+                            generated_all_orig_w = generated_sample.cpu().numpy() * 80000.0
+                            target_all_orig_w = (target_img * 80000.0).cpu().numpy()
+                            mse_overall = np.mean((generated_all_orig_w - target_all_orig_w) ** 2)
+                            mae_overall = np.mean(np.abs(generated_all_orig_w - target_all_orig_w))
+                            buf.seek(0); buf_single.seek(0)
+                            eval_dict = {
+                                'evaluation/comparison': wandb.Image(Image.open(buf), caption=f"Step {step}"),
+                                'evaluation/generated': wandb.Image(Image.open(buf_single), caption=f"Step {step}"),
+                                'evaluation/sequence_animation': wandb.Video(gif_path, fps=1.25, format="gif"),
+                                'evaluation/mse_overall': mse_overall,
+                                'evaluation/mae_overall': mae_overall,
+                                'val_loss': val_loss,
+                                'lr': sched.get_last_lr()[0],
+                                'ema_decay': ema_decay,
+                            }
+                            if args.predict_steps > 1:
+                                for frame_idx in range(args.predict_steps):
+                                    eval_dict[f'evaluation/mse_step_{frame_idx+1}'] = np.mean((generated_all_orig_w[frame_idx] - target_all_orig_w[0, frame_idx]) ** 2)
+                                    eval_dict[f'evaluation/mae_step_{frame_idx+1}'] = np.mean(np.abs(generated_all_orig_w[frame_idx] - target_all_orig_w[0, frame_idx]))
+                            wandb.log(eval_dict, step=wandb_step)
+
+                        plt.close(fig_comparison); plt.close(fig_single)
+                        buf.close(); buf_single.close()
+
+                    model.train()
+                    accelerator.wait_for_everyone()
+
+                # --- Save every save_every steps ---
+                if step % args.save_every == 0:
+                    save()
 
                 if step == args.end_step:
                     if accelerator.is_main_process:
                         tqdm.write('Done!')
-                    # return
-            
-            # Average training loss: divide by number of batches processed on this GPU
-            epoch_train_loss /= num_train_batches
+                    break
 
-            # In distributed training, each GPU has accumulated its own subset of losses
-            # We need to average across all GPUs to get the true epoch loss
-            epoch_train_loss_tensor = torch.tensor(epoch_train_loss, device=device)
-            gathered_train_loss = accelerator.gather(epoch_train_loss_tensor)
-            if accelerator.is_main_process:
-                # Average the per-GPU averages to get global average
-                epoch_train_loss = gathered_train_loss.mean().item()
-
-            # **Validation Loop (After Training, Before wandb Logging)**
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch in tqdm(val_dl, desc="Validation", disable=not accelerator.is_main_process):
-                    inpt = batch[0].contiguous().float().to(device, non_blocking=True)
-                    inpt = inpt.squeeze(2)  # shape: (batch_size, sequence_length, 24, 360)
-                    cond_img = inpt[:, :args.conditioning_length, :, :]    # first conditioning_length time steps
-                    target_img = inpt[:, args.conditioning_length:args.conditioning_length+args.predict_steps, :, :]  # next predict_steps time steps
-                    cond_label = batch[1].to(device, non_blocking=True)
-
-                    cond_label_inp = cond_label[:, :args.conditioning_length+args.predict_steps, :]  # :16
-
-
-                    extra_args = {}
-                    noise = torch.randn_like(target_img).to(device)
-                    with K.utils.enable_stratified_accelerate(accelerator, disable=args.gns):
-                        sigma = sample_density([target_img.shape[0]], device=device)
-
-                    with K.models.checkpointing(args.checkpointing):
-                        # Conditionally disable mapping_cond if --no-mapping-cond is set
-                        mapping_cond_val = None if args.no_mapping_cond else cond_label_inp
-                        losses = model.loss(target_img, cond_img, noise, sigma, mapping_cond=mapping_cond_val, **extra_args)
-
-                    # Make sure we only gather scalar loss (not batch tensor)
-                    loss_value = losses.mean().detach()
-                    gathered_loss = accelerator.gather_for_metrics(loss_value)
-
-                    # Accumulate average across ranks only from main process
-                    if accelerator.is_main_process:
-                        val_loss += gathered_loss.mean().item()
-
-            # Final averaging
-            if accelerator.is_main_process:
-                val_loss /= len(val_dl)
-
-            # Print validation loss
-            if accelerator.is_main_process:
-                tqdm.write(f"Epoch {epoch}, Train Loss: {epoch_train_loss:.6f}, Validation Loss: {val_loss:.6f}")
-
-            # Sampling and Visualization
-            # NOTE: All ranks must participate in generate_samples() because model_ema uses FSDP
-            # FSDP collective operations require all ranks to participate
-
-            if epoch % args.evaluate_every == 0:
-                # Get spatial dimensions based on cartesian_transform flag
-                if args.cartesian_transform:
-                    spatial_shape = (64, 64)
-                else:
-                    spatial_shape = (24, 360)
-
-                # ALL RANKS participate in sampling (FSDP requirement)
-                # But only rank 0 will use the result for visualization
-                # Conditionally disable cond_label if --no-mapping-cond is set
-                cond_label_sample = None if args.no_mapping_cond else cond_label_inp[0, :args.conditioning_length+args.predict_steps, :].reshape(1, args.conditioning_length+args.predict_steps, 4)
-                samples = generate_samples(model_ema, 1, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, args.conditioning_length, *spatial_shape), num_pred_frames=args.predict_steps).cpu()
-
-            if epoch % args.evaluate_every == 0 and accelerator.is_main_process:
-
-                import matplotlib.pyplot as plt
-                import imageio
-                import numpy as np
-                import torch
-                import io
-
-                # Get the generated sample and target for comparison
-                generated_sample = samples[0]  # shape: [predict_steps, H, W]
-                target_sample = target_img[0].cpu().numpy()  # shape: [predict_steps, H, W]
-
-                # For visualization, use the first prediction step (you can modify this to show all steps)
-                generated_sample_np = generated_sample[0].cpu().numpy()  # shape: [H, W] - first predicted frame
-                target_sample_first = target_sample[0]  # shape: [H, W] - first target frame
-
-                # Revert transformation to original scale for better visualization
-                generated_sample_orig = generated_sample_np * 80000.0
-                target_sample_orig = target_sample_first * 80000.0
-
-                # Create visualizations based on cartesian_transform and prediction steps
-                if args.cartesian_transform:
-                    # Use regular imshow for Cartesian data (224x224)
-                    if args.predict_steps == 1:
-                        # Single step prediction - show comparison
-                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=False)
-
-                        im0 = axes[0].imshow(target_sample_orig, cmap='plasma', aspect='auto')
-                        axes[0].set_title("Target (Ground Truth)")
-                        axes[0].axis('off')
-                        fig_comparison.colorbar(im0, ax=[axes[0]], shrink=0.8)   # 👈 fix: wrap in list
-
-                        im1 = axes[1].imshow(generated_sample_orig, cmap='plasma', aspect='auto')
-                        axes[1].set_title("Generated Prediction")
-                        axes[1].axis('off')
-                        fig_comparison.colorbar(im1, ax=[axes[1]], shrink=0.8)   # 👈 fix: wrap in list
-
-                        # plt.savefig('comparison_debug.png', bbox_inches='tight')
-
-                        fig_single, ax_single = plt.subplots(figsize=(10, 10))
-                        im_single = ax_single.imshow(generated_sample_orig, cmap='plasma', aspect='auto')
-                        ax_single.set_title(f"Generated Prediction - Epoch {epoch}")
-                        ax_single.axis('off')
-                        plt.colorbar(im_single, ax=ax_single, shrink=0.8)
-
-                    else:
-                        # Multi-step prediction
-                        generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 224, 224]
-                        target_all_orig = target_sample * 80000.0  # [predict_steps, 224, 224]
-                        generated_sample_orig = generated_all_orig  # For vmin/vmax in later plotting
-
-                        # Handle case where dimensions might be squeezed
-                        target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
-                        gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
-
-                        # Determine shared color scale from the true data
-                        vmin = np.min(target_first)
-                        vmax = np.max(target_first)
-
-                        fig_comparison, axes = plt.subplots(1, 2, figsize=(16, 8))
-
-                        # --- Left: target ---
-                        im0 = axes[0].imshow(target_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
-                        axes[0].set_title("Target Step 1")
-                        axes[0].axis('off')
-
-                        # --- Right: generated ---
-                        im1 = axes[1].imshow(gen_first, cmap='plasma', aspect='auto', vmin=vmin, vmax=vmax)
-                        axes[1].set_title("Generated Step 1")
-                        axes[1].axis('off')
-
-                        # --- One shared colorbar ---
-                        cbar = fig_comparison.colorbar(im0, ax=axes, shrink=0.8)
-                        cbar.set_label("Intensity", fontsize=12)
-
-                        # --- Add figure title ---
-                        fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}", fontsize=16)
-
-                        # plt.savefig("comparison_debug.png", bbox_inches="tight")
-
-                        fig_single, ax_single = plt.subplots(figsize=(10, 10))
-                        im_single = ax_single.imshow(generated_all_orig[-1], cmap='plasma', aspect='auto')
-                        ax_single.set_title(f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}")
-                        ax_single.axis('off')
-                        # fig_single.colorbar(im_single, ax=ax_single, shrink=0.8)    
-
-                        # plt.savefig("fig_single.png", bbox_inches="tight")
-
-                else:
-                    # Use polar plotting for polar data (24x360)
-                    from util import plot_polar_ionosphere_single, plot_polar_ionosphere_comparison
-
-                    if args.predict_steps == 1:
-                        # Single step prediction - show comparison
-                        fig_comparison, _ = plot_polar_ionosphere_comparison(
-                            data_original=target_sample_orig,
-                            data_pred=generated_sample_orig,
-                            titles=["Target (Ground Truth)", "Generated Prediction"],
-                            cmap='plasma',
-                            figsize=(16, 8)
-                        )
-
-                        fig_single, _ = plot_polar_ionosphere_single(
-                            data=generated_sample_orig,
-                            title=f"Generated Ionosphere Prediction - Epoch {epoch}",
-                            cmap='plasma',
-                            figsize=(10, 10)
-                        )
-                    else:
-                        # Multi-step prediction - show sequence evolution
-                        generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, 24, 360]
-                        target_all_orig = target_sample * 80000.0  # [predict_steps, 24, 360]
-                        generated_sample_orig = generated_all_orig  # For vmin/vmax in later plotting
-
-                        # Handle case where dimensions might be squeezed
-                        target_first = target_all_orig[0] if len(target_all_orig.shape) > 2 else target_all_orig
-                        gen_first = generated_all_orig[0] if len(generated_all_orig.shape) > 2 else generated_all_orig
-
-                        fig_comparison, _ = plot_polar_ionosphere_comparison(
-                            data_original=target_first,
-                            data_pred=gen_first,
-                            titles=["Target Step 1", "Generated Step 1"],
-                            cmap='plasma',
-                            figsize=(16, 8)
-                        )
-                        fig_comparison.suptitle(f"Multi-Step Forecasting - Epoch {epoch}\nTop: Targets, Bottom: Generated", fontsize=16)
-
-                        # Single plot shows the last predicted frame
-                        fig_single, _ = plot_polar_ionosphere_single(
-                            data=generated_all_orig[-1],  # Last predicted frame
-                            title=f"Generated Final Frame ({args.predict_steps}/{args.predict_steps}) - Epoch {epoch}",
-                            cmap='plasma',
-                            figsize=(10, 10)
-                        )
-                
-                # Convert matplotlib figures to images for wandb
-                buf = io.BytesIO()
-                fig_comparison.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-                buf.seek(0)
-                
-                buf_single = io.BytesIO()
-                fig_single.savefig(buf_single, format='png', dpi=150, bbox_inches='tight')
-                buf_single.seek(0)
-
-                # Create traditional sequence animation for gif
-                frames = []
-                # For sequence, show the conditioning frames + all generated frames
-                full_sequence = torch.cat([cond_img[0].cpu(), target_img[0].cpu()], dim=0)  # [sequence_length, H, W]
-
-                # Also create sequence with generated samples
-                generated_full_sequence = torch.cat([cond_img[0].cpu(), generated_sample.cpu()], dim=0)  # [conditioning_length + predict_steps, H, W]
-                
-                # Dynamically set figsize
-                img_h, img_w = full_sequence.shape[1], full_sequence.shape[2]
-                aspect = img_w / img_h
-                base_height = 4
-                figsize = (base_height * aspect, base_height)
-
-                # Create frames for target sequence
-                for t in range(full_sequence.shape[0]):
-                    img = full_sequence[t].cpu().numpy() * 80000.0  # Original scale
-                    fig, ax = plt.subplots(figsize=figsize)
-                    im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
-                    
-                    if t < args.conditioning_length:
-                        ax.set_title(f"Conditioning Frame {t+1}/{args.conditioning_length}")
-                    else:
-                        pred_step = t - args.conditioning_length + 1
-                        ax.set_title(f"Target Frame {pred_step}/{args.predict_steps}")
-                    
-                    ax.axis('off')
-                    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                    plt.colorbar(im, ax=ax, shrink=0.8)
-                    
-                    # Convert plot to image array
-                    fig.canvas.draw()
-                    frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-                    frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-                    frames.append(frame)
-                    plt.close(fig)
-
-                # Add separator frame
-                fig, ax = plt.subplots(figsize=figsize)
-                ax.text(0.5, 0.5, 'PREDICTED SEQUENCE', ha='center', va='center', fontsize=20, 
-                       transform=ax.transAxes, bbox=dict(boxstyle='round', facecolor='lightblue'))
-                ax.set_xlim(0, 1)
-                ax.set_ylim(0, 1)
-                ax.axis('off')
-                fig.canvas.draw()
-                frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-                frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-                frames.append(frame)
-                plt.close(fig)
-
-                # Create frames for generated sequence
-                for t in range(generated_full_sequence.shape[0]):
-                    img = generated_full_sequence[t].cpu().numpy() * 55000.0  # Original scale
-                    fig, ax = plt.subplots(figsize=figsize)
-                    im = ax.imshow(img, cmap='plasma', aspect='auto', vmin=generated_sample_orig.min(), vmax=generated_sample_orig.max())
-                    
-                    if t < args.conditioning_length:
-                        ax.set_title(f"Conditioning Frame {t+1}/{args.conditioning_length}")
-                    else:
-                        pred_step = t - args.conditioning_length + 1
-                        ax.set_title(f"Generated Frame {pred_step}/{args.predict_steps}")
-                    
-                    ax.axis('off')
-                    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                    plt.colorbar(im, ax=ax, shrink=0.8)
-                    
-                    # Convert plot to image array
-                    fig.canvas.draw()
-                    frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-                    frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-                    frames.append(frame)
-                    plt.close(fig)
-
-                # Save sequence as gif
-                imageio.mimsave(f'{dir_path_res}/sequence_gen_{epoch}.gif', frames, duration=0.8)
-                
-                # Log to wandb
-                if use_wandb:
-                    import wandb
-                    from PIL import Image
-                    
-                    # Calculate metrics for all prediction steps
-                    generated_all_orig = generated_sample.cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                    target_all_orig = (target_img * 80000.0).cpu().numpy()  # [predict_steps, H, W]
-
-                    # Overall metrics across all prediction steps
-                    mse_overall = np.mean((generated_all_orig - target_all_orig) ** 2)
-                    mae_overall = np.mean(np.abs(generated_all_orig - target_all_orig))
-                    
-                    # Convert BytesIO buffers to PIL Images for wandb
-                    buf.seek(0)
-                    pil_comparison = Image.open(buf)
-                    buf_single.seek(0)
-                    pil_single = Image.open(buf_single)
-                    
-                    # Per-step metrics
-                    eval_dict = {
-                        'evaluation/polar_comparison': wandb.Image(pil_comparison, caption=f"Polar comparison at epoch {epoch} (step 1/{args.predict_steps})"),
-                        'evaluation/polar_generated': wandb.Image(pil_single, caption=f"Generated polar plot at epoch {epoch} (step 1/{args.predict_steps})"),
-                        'evaluation/sequence_animation': wandb.Video(f'{dir_path_res}/sequence_gen_{epoch}.gif', 
-                                                                   fps=1.25, format="gif"),
-                        'evaluation/mse_overall': mse_overall,
-                        'evaluation/mae_overall': mae_overall,
-                    }
-                    
-                    # Add per-step metrics if predicting multiple steps
-                    if args.predict_steps > 1:
-                        for frame in range(args.predict_steps):
-                            step_mse = np.mean((generated_all_orig[frame] - target_all_orig[0, frame]) ** 2)
-                            step_mae = np.mean(np.abs(generated_all_orig[frame] - target_all_orig[0, frame]))
-                            eval_dict[f'evaluation/mse_step_{frame+1}'] = step_mse
-                            eval_dict[f'evaluation/mae_step_{frame+1}'] = step_mae
-                    
-                    wandb.log(eval_dict, step=wandb_step)
-                
-                # Clean up
-                plt.close(fig_comparison)
-                plt.close(fig_single)
-                buf.close()
-                buf_single.close()
-                
-            # **wandb Logging (Now Includes Validation Loss and Max-Min Difference)**
-            if use_wandb and accelerator.is_main_process:
-                # Get spatial dimensions based on cartesian_transform flag
-                if args.cartesian_transform:
-                    spatial_shape = (64, 64)
-                else:
-                    spatial_shape = (24, 360)
-
-                # Calculate max-min difference after reverting transformation
-                # Use current batch target_img for consistent max-min calculation
-                # torch.cat([unet_cond, noised_input], dim=1)
-                target_img_reverted = target_img * 80000.0  # [batch_size, predict_steps, H, W]
-
-                # Only compute prediction metrics if we generated samples this epoch
-                if epoch % args.evaluate_every == 0:
-                    if args.predict_steps == 1:
-                        # Single frame prediction - use the single frame
-                        target_reverted_flat = target_img_reverted.flatten()
-                        max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
-
-                        pred_reverted = samples[0, 0].cpu().numpy() * 80000.0  # [H, W]
-                        pred_reverted_flat = pred_reverted.flatten()
-                        max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
-                    else:
-                        # Multi-step prediction - compute max-min across entire predicted sequence
-                        # Reshape to [batch_size * predict_steps, H, W] then flatten
-                        target_reverted_seq = target_img_reverted.reshape(-1, *spatial_shape)  # [batch_size * predict_steps, H, W]
-                        target_reverted_flat = target_reverted_seq.flatten()
-                        max_min_diff_gt = (target_reverted_flat.max() - target_reverted_flat.min()).item()
-
-                        pred_reverted_seq = samples[0].cpu().numpy() * 80000.0  # [predict_steps, H, W]
-                        pred_reverted_seq = pred_reverted_seq.reshape(-1, *spatial_shape)  # [predict_steps, H, W]
-                        pred_reverted_flat = pred_reverted_seq.flatten()
-                        max_min_diff_pred = (pred_reverted_flat.max() - pred_reverted_flat.min()).item()
-
-                    log_dict = {
-                        'epoch': epoch,
-                        'loss': epoch_train_loss,
-                        'val_loss': val_loss,
-                        'lr': sched.get_last_lr()[0],
-                        'ema_decay': ema_decay,
-                        'max_min_difference_sequence': max_min_diff_gt,
-                        'max_min_difference_sequence_pred': max_min_diff_pred,
-                    }
-                else:
-                    # Not an evaluation epoch, skip prediction metrics
-                    log_dict = {
-                        'epoch': epoch,
-                        'loss': epoch_train_loss,
-                        'val_loss': val_loss,
-                        'lr': sched.get_last_lr()[0],
-                        'ema_decay': ema_decay,
-                    }
-
-                if args.gns:
-                    log_dict['gradient_noise_scale'] = gns_stats.get_gns()
-
-                wandb.log(log_dict, step=wandb_step)
-
-            # Save every 5 epochs or at the end
-            if epoch % 5 == 0 or (args.max_epochs is not None and epoch >= args.max_epochs - 1):
-                save()
-            epoch += 1  # Move to the next epoch
-            
-            # Check if we've reached max epochs
-            if args.max_epochs is not None and epoch >= args.max_epochs:
-                if accelerator.is_main_process:
-                    tqdm.write(f'Reached maximum epochs ({args.max_epochs}). Training complete!')
+            if args.max_steps is not None and step >= args.max_steps:
                 break
 
+        if accelerator.is_main_process:
+            tqdm.write(f'Training complete at step {step}.')
+        save()
+
     except KeyboardInterrupt:
-        pass
+        if accelerator.is_main_process:
+            tqdm.write('Interrupted. Saving checkpoint...')
+        save()
 
 if __name__ == "__main__":
     main()
+

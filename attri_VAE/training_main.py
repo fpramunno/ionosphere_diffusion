@@ -136,6 +136,10 @@ def main():
                 help='reconstruction parameter')
     p.add_argument('--beta', type=float, default=2.0,
                 help='beta value of the beta-VAE')
+    p.add_argument('--kl-anneal-epochs', type=int, default=0,
+                help='number of epochs to linearly anneal beta from 0 to target. 0 = no annealing')
+    p.add_argument('--kl-anneal-start', type=float, default=0.0,
+                help='starting beta value for KL annealing')
     p.add_argument('--alpha', type=float, default=1.0,
                 help='alpha multiplier for mlp_loss')
     p.add_argument('--gamma', type=float, default=10.0,
@@ -167,6 +171,8 @@ def main():
                 help='wandb project name')
     p.add_argument('--wandb-runname', type=str,
                 help='the run name for wandb')
+    p.add_argument('--wandb-run-id', type=str, default=None,
+                help='wandb run ID to resume (overrides checkpoint value)')
     p.add_argument('--sequence-length', type=int, default=30,
                 help='the total length of the sequence')
     p.add_argument('--normalization-type', type=str, default='absolute_max',
@@ -189,9 +195,8 @@ def main():
     # n_filters need to stay as tuples (hard to pass via argparse)
     # n_filters_ENC = (8, 16, 32, 64, 16)
     n_filters_ENC = (16, 32, 64, 128, 256)
-    n_filters_DEC = (64, 32, 16, 8, 4, 2)
-
-    print(f"Parameter List: \n recon_param = {args.recon_param} ; beta = {args.beta} ; alpha = {args.alpha} ; gamma = {args.gamma} ; factor = {args.factor} \n epoch number is {args.epochs} and latent dimension is {args.latent_size} ")
+    # n_filters_DEC = (64, 32, 16, 8, 4, 2)
+    n_filters_DEC = (256, 128, 64, 32, 16)
 
     path_tosave_nets = args.saving_path + "/Experiment1_WHOLE_betaVAE_mlp_ar_woL1_VarianceMI_onlyVolume_woCapWoAnnealing" + "_epochs%d_batchs%d"%(args.epochs, args.batch_size) + "_beta%2f_alpha%2f_gamma%2f_factor%2f_reconparam%d_latentsize%d_batchsize%d"%(args.beta, args.alpha, args.gamma, args.factor, args.recon_param, args.latent_size, args.batch_size) + "/"
     # check_dir(path_tosave_nets)  # Uncomment when check_dir function is available
@@ -207,6 +212,7 @@ def main():
     unwrap = accelerator.unwrap_model
 
     if accelerator.is_main_process:
+        print(f"Parameter List: \n recon_param = {args.recon_param} ; beta = {args.beta} ; alpha = {args.alpha} ; gamma = {args.gamma} ; factor = {args.factor} \n epoch number is {args.epochs} and latent dimension is {args.latent_size} ")
         print(f'Process {accelerator.process_index} using device: {device}')
         print(f'World size: {accelerator.num_processes}')
         print(f'Batch size per GPU: {args.batch_size}')
@@ -243,7 +249,7 @@ def main():
             normalization_type=args.normalization_type,
             preprocess_config=preprocess_config,
             use_l1_conditions=True,
-            min_center_distance=15,
+            min_center_distance=5,
             cartesian_transform=args.cartesian_transform,
             output_size=64,
             only_complete_sequences=args.only_complete_sequences,
@@ -363,17 +369,54 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     # --- Discriminator (SD-style PatchGAN) ---
     if args.disc_loss:
-        D = NLayerDiscriminator(input_nc=1).to(device)
+        D = NLayerDiscriminator(input_nc=1)
         optimizer_D = optim.Adam(D.parameters(), lr=args.learning_rate)
+        D, optimizer_D = accelerator.prepare(D, optimizer_D)
         disc_start = 5000   # same idea as Stable Diffusion
         global_step = 0
 
-    # Initialize wandb (only on main process)
+    # wandb init is deferred until after checkpoint loading (to get run ID for resume)
+
+    # Prepare model and optimizer with accelerator
+    if args.use_iterable_dataset:
+        model, optimizer = accelerator.prepare(model, optimizer)
+    else:
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+    wandb_run_id = args.wandb_run_id  # CLI override takes priority
+
+    if resume:
+
+        resume_path = path_tosave_nets + "checkpoint.pth"
+        if accelerator.is_main_process:
+            print('=> loading checkpoint %s' % resume)
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        start_epoch = checkpoint['epoch'] + 1
+        best_test_loss = checkpoint['best_test_loss']
+        best_test_loss_epoch = checkpoint['best_test_loss_epoch']
+        best_metric = checkpoint['best_metric']
+        best_metric_epoch = checkpoint['best_metric_epoch']
+        best_auc = checkpoint['best_auc']
+        best_auc_epoch = checkpoint['best_auc_epoch']
+        unwrap(model).load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        # Use saved wandb run ID if no CLI override
+        if wandb_run_id is None:
+            wandb_run_id = checkpoint.get('wandb_run_id', None)
+        # Restore discriminator global_step
+        if args.disc_loss:
+            global_step = checkpoint.get('global_step', 0)
+        if accelerator.is_main_process:
+            print('=> loaded checkpoint %s' % resume)
+
+    # Initialize wandb (after checkpoint loading so we can resume the same run)
     if accelerator.is_main_process and args.use_wandb:
         wandb.init(
             project=args.wandb_project if args.wandb_project else "attri-vae",
             entity="francescopio",
             name=args.wandb_runname,
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id else None,
             config={
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
@@ -389,37 +432,24 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 "n_filters_ENC": n_filters_ENC,
                 "n_filters_DEC": n_filters_DEC,
                 "use_AR_LOSS": use_AR_LOSS,
+                "kl_anneal_epochs": args.kl_anneal_epochs,
+                "kl_anneal_start": args.kl_anneal_start,
             }
         )
-
-    # Prepare model and optimizer with accelerator
-    if args.use_iterable_dataset:
-        model, optimizer = accelerator.prepare(model, optimizer)
-    else:
-        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-
-    # Watch model with wandb (track gradients and parameters)
-    if accelerator.is_main_process and args.use_wandb:
-        wandb.watch(model, log="all", log_freq=1) 
-
-
-    if resume:
-
-        resume_path = path_tosave_nets + "checkpoint.pth"
-        print('=> loading checkpoint %s' % resume)
-        checkpoint = torch.load(resume_path, weights_only=False)
-        start_epoch = checkpoint['epoch'] + 1
-        best_test_loss = checkpoint['best_test_loss']
-        best_test_loss_epoch = checkpoint['best_test_loss_epoch']
-        best_metric = checkpoint['best_metric']
-        best_metric_epoch = checkpoint['best_metric_epoch']
-        best_auc = checkpoint['best_auc']
-        best_auc_epoch = checkpoint['best_auc_epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        print('=> loaded checkpoint %s' % resume)
+        wandb.watch(model, log="all", log_freq=1)
 
     for epoch in range(start_epoch, args.epochs):
+        # ============================================
+        # KL ANNEALING
+        # ============================================
+        if args.kl_anneal_epochs > 0 and epoch < args.kl_anneal_epochs:
+            beta_current = args.kl_anneal_start + (args.beta - args.kl_anneal_start) * (epoch / args.kl_anneal_epochs)
+        else:
+            beta_current = args.beta
+
+        if accelerator.is_main_process and (epoch == start_epoch or (epoch + 1) % 10 == 0):
+            print(f"  [KL annealing] epoch {epoch+1}, beta_current = {beta_current:.4f} (target = {args.beta})")
+
         # ============================================
         # TRAINING LOOP
         # ============================================
@@ -460,7 +490,6 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 # center_idx = args.sequence_length // 2
                 data = inpt # (batch_size, H, W)
                 # data = data.unsqueeze(1)  # (batch_size, 1, H, W) - add channel dimension
-
                 # Use center frame conditions and labels
                 rad_ = cond_label.squeeze(1)  # (batch_size, num_conditions) - L1 conditions for attr reg
                 label = label_seq.squeeze(1)   # (batch_size, 1) - activity label (0, 1, or 2)
@@ -469,8 +498,9 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 recon_batch, mu, logvar, out_mlp, z_sampled_eq, z_prior, prior_dist, z_tilde, z_dist = model(data)
                 # Compute losses
                 recon_loss = reconstruction_loss(recon_batch, data, args.recon_param, dist='gaussian')
+
                 mlp_loss = mlp_loss_function(label, out_mlp, args.alpha)
-                kl_loss1, kl_loss2 = KL_loss(mu, logvar, z_dist, prior_dist, args.beta, c=0.0)
+                kl_loss1, kl_loss2 = KL_loss(mu, logvar, z_dist, prior_dist, beta_current, c=0.0)
                 loss = recon_loss + mlp_loss + kl_loss2
 
                 # Optional: Attribute regularization loss
@@ -533,7 +563,7 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 epoch_kl_loss += kl_loss2.item()
                 epoch_attr_reg_loss += attr_reg_loss.item()
                 epoch_percep_loss += percep_loss.item()
-                # epoch_disc_loss += disc_train_loss.item()
+                # epoch_disc_loss += (lambda_gan * g_adv_loss).item()
                 epoch_train_acc += accuracy
                 epoch_train_auc += roc
                 num_train_batches += 1
@@ -553,10 +583,15 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
         epoch_train_auc /= num_train_batches
 
         # Gather training metrics across GPUs
-        train_loss_tensor = torch.tensor(epoch_train_loss, device=device)
-        gathered_train_loss = accelerator.gather(train_loss_tensor)
+        train_metrics_tensor = torch.tensor(
+            [epoch_train_loss, epoch_train_acc, epoch_train_auc], device=device
+        )
+        gathered_train_metrics = accelerator.gather(train_metrics_tensor)
         if accelerator.is_main_process:
-            train_loss = gathered_train_loss.mean().item()
+            gathered_train_metrics = gathered_train_metrics.view(-1, 3).mean(dim=0)
+            train_loss = gathered_train_metrics[0].item()
+            epoch_train_acc = gathered_train_metrics[1].item()
+            epoch_train_auc = gathered_train_metrics[2].item()
         else:
             train_loss = epoch_train_loss
 
@@ -597,9 +632,9 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 # Forward pass
                 recon_batch, mu, logvar, out_mlp, z_sampled_eq, z_prior, prior_dist, z_tilde, z_dist = model(data_test)
 
-                # Compute losses 
+                # Compute losses
                 recon_loss = reconstruction_loss(recon_batch, data_test, args.recon_param, dist='gaussian')
-                kl_loss1, kl_loss2 = KL_loss(mu, logvar, z_dist, prior_dist, args.beta, c=0.0)
+                kl_loss1, kl_loss2 = KL_loss(mu, logvar, z_dist, prior_dist, beta_current, c=0.0)
                 mlp_loss = mlp_loss_function(label, out_mlp, args.alpha)
                 loss_ = recon_loss + mlp_loss + kl_loss2
 
@@ -632,7 +667,7 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 epoch_val_kl_loss += kl_loss2.item()
                 epoch_val_attr_reg_loss += attr_reg_loss.item()
                 epoch_val_percep_loss += percep_loss.item()
-                # epoch_val_disc_loss += disc_train_loss.item()
+                # epoch_val_disc_loss += (lambda_gan * g_adv_loss).item()
                 epoch_val_acc += accuracy
                 epoch_val_auc += roc
                 num_val_batches += 1
@@ -649,12 +684,15 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
         epoch_val_auc /= num_val_batches
 
         # Gather validation metrics across GPUs
-        val_loss_tensor = torch.tensor(epoch_val_loss, device=device)
-        gathered_val_loss = accelerator.gather(val_loss_tensor)
+        val_metrics_tensor = torch.tensor(
+            [epoch_val_loss, epoch_val_acc, epoch_val_auc], device=device
+        )
+        gathered_val_metrics = accelerator.gather(val_metrics_tensor)
         if accelerator.is_main_process:
-            test_loss = gathered_val_loss.mean().item()
-            acc_metric = epoch_val_acc
-            auc_metric = epoch_val_auc
+            gathered_val_metrics = gathered_val_metrics.view(-1, 3).mean(dim=0)
+            test_loss = gathered_val_metrics[0].item()
+            acc_metric = gathered_val_metrics[1].item()
+            auc_metric = gathered_val_metrics[2].item()
         else:
             test_loss = epoch_val_loss
             acc_metric = epoch_val_acc
@@ -669,7 +707,7 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
         # Print epoch summary (only on main process)
         if accelerator.is_main_process:
             print('='*80)
-            print(f'Epoch [{epoch + 1}/{args.epochs}]')
+            print(f'Epoch [{epoch + 1}/{args.epochs}]  beta_current={beta_current:.4f}')
             print(f'  Training   - Loss: {train_loss:.4f}, Acc: {epoch_train_acc:.4f}, AUC: {epoch_train_auc:.4f}')
             print(f'             - Recon: {epoch_recon_loss:.4f}, MLP: {epoch_mlp_loss:.4f}, KL: {epoch_kl_loss:.4f}, AR: {epoch_attr_reg_loss:.4f}, Percep: {epoch_percep_loss:.4f}')
             print(f'  Validation - Loss: {test_loss:.4f}, Acc: {acc_metric:.4f}, AUC: {auc_metric:.4f}')
@@ -687,6 +725,7 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                     "train/kl_loss": epoch_kl_loss,
                     "train/attr_reg_loss": epoch_attr_reg_loss,
                     "train/percep_loss": epoch_percep_loss,
+                    "train/beta_current": beta_current,
                     "train/accuracy": epoch_train_acc,
                     "train/auc": epoch_train_auc,
                     # "train/disc_loss": epoch_disc_loss,
@@ -726,7 +765,9 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
                 'best_auc': best_auc,
                 'best_auc_epoch': best_auc_epoch,
                 'state_dict': accelerator.get_state_dict(model),
-                'optimizer': optimizer.state_dict()
+                'optimizer': optimizer.state_dict(),
+                'wandb_run_id': wandb.run.id if args.use_wandb else None,
+                'global_step': global_step if args.disc_loss else 0,
             }
             save_ckp(checkpoint, path_tosave_nets)
 
@@ -752,10 +793,11 @@ def main_train(args, accelerator, n_filters_ENC, n_filters_DEC, train_loader, va
         # Wait for all processes to sync
         accelerator.wait_for_everyone()
 
-    print("OUTCOME")
-    print(f"Best accuracy of {best_metric} was achieved in epoch {best_metric_epoch}")
-    print(f"Best loss of {best_test_loss} was achieved in epoch {best_test_loss_epoch}")
-    print(f"Best AUC of {best_auc} was achieved in epoch {best_auc_epoch}")
+    if accelerator.is_main_process:
+        print("OUTCOME")
+        print(f"Best accuracy of {best_metric} was achieved in epoch {best_metric_epoch}")
+        print(f"Best loss of {best_test_loss} was achieved in epoch {best_test_loss_epoch}")
+        print(f"Best AUC of {best_auc} was achieved in epoch {best_auc_epoch}")
 
     # Close wandb run
     if accelerator.is_main_process and args.use_wandb:

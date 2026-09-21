@@ -18,7 +18,7 @@ from IPython import embed
 ## DATASET SETUP
 
 val_dataset, val_sampler, val_dl = get_sequence_data_objects_iterable(
-        csv_path="/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_deduplicated.csv",
+        csv_path="/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv",
         transform_cond_csv="/users/framunno/data/ionosphere/params.csv",
         batch_size=1,
         # distributed=False,
@@ -46,14 +46,14 @@ p = argparse.ArgumentParser(description=__doc__,
 p.add_argument('--config', type=str, required=True,
             help='the configuration file')
 
-args = p.parse_args(["--config", "/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar.json"])
+args = p.parse_args(["--config", "/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar_classic.json"])
 
 config = K.config.load_config(args.config)
 inner_model = K.config.make_model(config)
 model_ema = K.config.make_denoiser_wrapper(config)(inner_model)
 
 # embed()
-ckpt = torch.load("/capstor/scratch/cscs/framunno/models_results/models_ViT_forecast_15frames_absolute_max_ddp_bs1_NOCOND_v3_interpolated_deduplicated/model_epoch_0100.pth")
+ckpt = torch.load("/capstor/scratch/cscs/framunno/models_results/models_ViT_forecast_cond15_pred7_absolute_max_ddp_NOCOND_v1_BS1/model_step_0200000.pth")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model_ema.inner_model.load_state_dict(ckpt['model_ema'])
@@ -63,7 +63,7 @@ model_ema.eval()
 import os
 
 # Change only this line for different experiments
-base_dir = "/capstor/scratch/cscs/framunno/results_ViT_800mln_NOCOND_V3_075"
+base_dir = "/capstor/scratch/cscs/framunno/results_ViT_800mln_CLASSIC_NOMEAN_v5_075_new_epoch160"
 
 os.makedirs(os.path.join(base_dir, "input_imgs"), exist_ok=True)
 os.makedirs(os.path.join(base_dir, "generated_imgs"), exist_ok=True)
@@ -72,7 +72,8 @@ os.makedirs(os.path.join(base_dir, "ground_truth"), exist_ok=True)
 os.makedirs(os.path.join(base_dir, "conditions"), exist_ok=True)
 
 cartesian_transform = True
-no_mapping_cond = True
+no_mapping_cond = False
+
 
 with torch.no_grad():
     for k, batch in enumerate(tqdm(val_dl, desc="Validation")):
@@ -84,7 +85,7 @@ with torch.no_grad():
 
         # embed()
 
-        cond_label_inp = cond_label[:, :, :].repeat(20, 1, 1) # :16
+        cond_label_inp = cond_label[:, :, :].repeat(10, 1, 1) # :16
 
         if cartesian_transform:
             spatial_shape = (64, 64)
@@ -93,7 +94,7 @@ with torch.no_grad():
 
         cond_label_sample = None if no_mapping_cond else cond_label_inp[:, :, :]
 
-        samples = generate_samples(model_ema, 20, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(20, 1, 1, 1), num_pred_frames=15).cpu()
+        samples = generate_samples(model_ema, 10, device, cond_label=cond_label_sample, sampler="dpmpp_2m_sde", cond_img=cond_img[0].reshape(1, 15, *spatial_shape).repeat(10, 1, 1, 1), num_pred_frames=15).cpu()
 
         # Save the original sample
         np.save(os.path.join(base_dir, f"input_imgs/original_forecasting_{k}.npy"), cond_img[0].cpu().numpy())

@@ -328,7 +328,11 @@ class MultiScaleTemporalEncoder(nn.Module):
                             nn.SiLU(),
                         )    # long-range
 
-        self.mix = nn.Conv1d(64, 192, kernel_size=1)
+        # self.mix = nn.Conv1d(64, 192, kernel_size=1)
+
+        # For version 2.0
+        self.mix = nn.Conv1d(192, 192, kernel_size=1)
+        
         self.pool = AttnPool1D(192)
 
         # Combine all scales (64*3 = 192 features)
@@ -368,7 +372,10 @@ class MultiScaleTemporalEncoder(nn.Module):
                 long = self.long_term(x) #.mead(dim=-1)     # (batch, 64)
 
                 # Concatenate: (batch, 192)
-                features = torch.cat([short, medium, long], dim=-1)
+                # features = torch.cat([short, medium, long], dim=-1)
+
+                # For version 2.0
+                features = torch.cat([short, medium, long], dim=1)
 
                 h = self.mix(features)      # (B, 192, 90)
                 global_feat = self.pool(h) # (B, 192)
@@ -859,6 +866,7 @@ class ViTBlock(nn.Module):
         rope: bool = True,
         dropout: Optional[float] = None,
         checkpointing: bool = False,
+        per_frame_mod: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -874,12 +882,17 @@ class ViTBlock(nn.Module):
         # With cross-attn: 6 params (add cross-attn scale/shift)
         num_params = 6 if self.has_cross_attn else 4
 
+        # per_frame_mod: when True, mod is (B, L, D) per-token instead of (B, D) global
+        # "... (n C) -> n ... C"  keeps the token dim (no broadcast)
+        # "... (n C) -> n ... 1 C" adds a 1 dim that broadcasts across all tokens
+        rearrange_pattern = "... (n C) -> n ... C" if per_frame_mod else "... (n C) -> n ... 1 C"
+
         if mod_features > 0:
             self.ada_zero = nn.Sequential(
                 nn.Linear(mod_features, mod_features),
                 nn.SiLU(),
                 nn.Linear(mod_features, num_params * channels),
-                Rearrange("... (n C) -> n ... 1 C", n=num_params),
+                Rearrange(rearrange_pattern, n=num_params),
             )
 
             self.ada_zero[-2].weight.data.mul_(1e-2)
@@ -1002,7 +1015,8 @@ class ViT(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        t_out: int,
+        pred_frames: int,
+        cond_frames: int = 15,
         cond_channels: int = 0,
         mod_features: int = 256,
         hid_channels: int = 512,
@@ -1016,7 +1030,9 @@ class ViT(nn.Module):
         use_physics_embedding: bool = False,
         use_multiscale_temporal: bool = False,
         use_adaptive_temporal: bool = False,
+        use_per_frame_mod: bool = False,
         spherical_order: int = 4,
+        use_cond_img_in_adaln: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -1036,12 +1052,14 @@ class ViT(nn.Module):
 
         self.cond_channels = cond_channels
         self.channel_mapping_cond = channel_mapping_cond
-        self.t_out = t_out
+        self.pred_frames = pred_frames
         self.has_variance = out_channels > in_channels
         self.context_channels = context_channels
         self.use_physics_embedding = use_physics_embedding
         self.use_multiscale_temporal = use_multiscale_temporal
         self.use_adaptive_temporal = use_adaptive_temporal
+        self.use_per_frame_mod = use_per_frame_mod
+        self.use_cond_img_in_adaln = use_cond_img_in_adaln
 
         self.patch = Patchify(patch_size, channel_last=True)
         self.unpatch = Unpatchify(unpatch_size, channel_last=True)
@@ -1049,8 +1067,9 @@ class ViT(nn.Module):
         # +1 for temporal coordinate channel
         self.in_proj = nn.Linear(math.prod(patch_size) * (in_channels + cond_channels + 1 + 4), hid_channels) # 1 is for temporal index channel, 4 is for L1 cond channels
         self.out_proj = nn.Linear(hid_channels, math.prod(patch_size) * out_channels)
-        self.time_compressor = nn.Linear(10, t_out)
-        # self.time_compressor = nn.Conv1d(in_channels=1, out_channels=t_out, kernel_size=1)
+        # Learned temporal projection: maps all (cond+pred) frame outputs → pred_frames outputs
+        # More flexible than hard-slicing: learns a weighted combination over all time positions
+        self.time_proj = nn.Linear(cond_frames + pred_frames, pred_frames)
 
         self.positional_embedding = nn.Sequential(
             SineEncoding(hid_channels),
@@ -1065,9 +1084,19 @@ class ViT(nn.Module):
                 context_channels=context_channels,
                 spatial=spatial,
                 checkpointing=True,
+                per_frame_mod=use_per_frame_mod,
                 **kwargs,
             ) for _ in range(hid_blocks)
         ])
+
+        # Per-frame modulation: project each frame's L1 features to mod_features
+        # so that each frame gets its own ada-zero parameters
+        if use_per_frame_mod:
+            self.per_frame_proj = nn.Sequential(
+                nn.Linear(4, mod_features),
+                nn.SiLU(),
+                nn.Linear(mod_features, mod_features),
+            )
 
         self.timestep_embed = nn.Sequential(
             SineEncoding(mod_features),
@@ -1127,6 +1156,36 @@ class ViT(nn.Module):
         else:
             self.adaptive_temporal = None
 
+        # Conditioning image encoder for adaLN (optional)
+        # Small CNN applied independently to each past frame (shared weights),
+        # then global-avg-pooled and mean-reduced over the temporal axis → mod_features
+        if use_cond_img_in_adaln:
+            # Shared CNN: extracts a 64-dim feature vector from each frame independently
+            self.cond_img_conv_encoder = nn.Sequential(
+                # (B*T, 1, 64, 64)
+                nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),  # → (B*T, 32, 32, 32)
+                nn.SiLU(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # → (B*T, 64, 16, 16)
+                nn.SiLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1), # → (B*T, 64,  8,  8)
+                nn.SiLU(),
+                nn.AdaptiveAvgPool2d(1),  # → (B*T, 64, 1, 1)
+                nn.Flatten(),             # → (B*T, 64)
+            )
+            # Attention pooling over the T frame features → (B, 64)
+            self.cond_img_temporal_pool = AttnPool1D(64)
+            # Final projection to mod_features
+            self.cond_img_adaln_proj = nn.Sequential(
+                nn.Linear(64, mod_features),
+                nn.SiLU(),
+                nn.LayerNorm(mod_features),
+                nn.Linear(mod_features, mod_features),
+            )
+        else:
+            self.cond_img_conv_encoder = None
+            self.cond_img_temporal_pool = None
+            self.cond_img_adaln_proj = None
+
         self.spatial = spatial
         self.window_size = tuple(window_size) if isinstance(window_size, Sequence) else ((window_size,) * spatial if window_size else None)
 
@@ -1181,141 +1240,106 @@ class ViT(nn.Module):
         sigma: Tensor,
         mapping_cond: Optional[Tensor] = None,
         cond: Optional[Tensor] = None,
-        return_variance: bool = False,
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        c_noise = sigma.log() / 4
-        timestep_embed = self.timestep_embed(c_noise.unsqueeze(-1))
-        # Squeeze out the extra dimension from SineEncoding: (B, 1, D) -> (B, D)
-        timestep_embed = timestep_embed.squeeze(1)
-
-        # Store the number of prediction frames before concatenation
+    ) -> Tensor:
         num_pred_frames = input.shape[1]
         num_cond_frames = cond.shape[1] if cond is not None else 0
 
-        # embed()
+        # --- Timestep embedding ---
+        c_noise = sigma.log() / 4
+        timestep_embed = self.timestep_embed(c_noise.unsqueeze(-1)).squeeze(1)  # (B, D)
 
-        # Process mapping_cond for both global conditioning and cross-attention context
+        # --- Solar wind conditioning ---
         if mapping_cond is None:
             mapping_cond_embed = torch.zeros_like(timestep_embed)
             context = None
+        elif self.use_per_frame_mod:
+            per_frame_embed = self.per_frame_proj(mapping_cond)                        # (B, T, D)
+            global_embed = self.mapping_cond(mapping_cond.flatten(-2))                 # (B, D)
+            mapping_cond_embed = per_frame_embed + global_embed.unsqueeze(1)           # (B, T, D)
+            context = None
         else:
             if self.use_physics_embedding and self.physics_cond_module is not None:
-                # Use physics-informed conditioning module
-                # Returns: global_embed (batch, mod_features), context (batch, time, context_channels)
                 mapping_cond_embed, context = self.physics_cond_module(mapping_cond)
-
             elif self.use_multiscale_temporal and self.multiscale_temporal is not None:
-                # Multi-scale temporal convolution encoder
-                # Returns: (batch, mod_features)
-                mapping_cond_embed = self.multiscale_temporal(mapping_cond)
-                mapping_cond_embed = mapping_cond_embed.unsqueeze(1)  # (batch, 1, mod_features)
-
-                # Cross-attention context: project time series to context tokens
-                if self.context_proj is not None:
-                    # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
-                    context = self.context_proj(mapping_cond)
-                else:
-                    context = None
-
+                mapping_cond_embed = self.multiscale_temporal(mapping_cond).unsqueeze(1)
+                context = self.context_proj(mapping_cond) if self.context_proj is not None else None
             elif self.use_adaptive_temporal and self.adaptive_temporal is not None:
-                # Adaptive multi-scale temporal encoder with attention pooling
-                # Returns: (batch, mod_features)
-                mapping_cond_embed = self.adaptive_temporal(mapping_cond)
-                mapping_cond_embed = mapping_cond_embed.unsqueeze(1)  # (batch, 1, mod_features)
-
-                # Cross-attention context: project time series to context tokens
-                if self.context_proj is not None:
-                    # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
-                    context = self.context_proj(mapping_cond)
-                else:
-                    context = None
-
+                mapping_cond_embed = self.adaptive_temporal(mapping_cond).unsqueeze(1)
+                context = self.context_proj(mapping_cond) if self.context_proj is not None else None
             else:
-                # Original approach
-                # mapping_cond: (batch, total_frames, 4)
-                # Global conditioning: average across time for ada-zero modulation
-                # embed()
-                print('mapping_cond.shape:', mapping_cond.shape)
-                mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))  # (batch, total_frames, emb_features)
-                print('mapping_cond_embed.shape:', mapping_cond_embed.shape)
-                # Uncomment for classic
-                mapping_cond_embed = mapping_cond_embed.mean(dim=1, keepdim=True)  # (batch, 1, emb_features)
-                print('mapping_cond_embed.shape:', mapping_cond_embed.shape)
-                # Cross-attention context: project time series to context tokens
-                if self.context_proj is not None:
-                    # mapping_cond: (batch, total_frames, 4) -> (batch, total_frames, context_channels)
-                    context = self.context_proj(mapping_cond)
-                else:
-                    context = None
+                # Classic: flatten full solar wind window → MLP
+                mapping_cond_embed = self.mapping_cond(mapping_cond.flatten(-2))       # (B, D)
+                context = self.context_proj(mapping_cond) if self.context_proj is not None else None
 
-        # print('mapping_cond_embed.squeeze(1).shape:', mapping_cond_embed.squeeze(1).shape)
-        mapping_out = self.mapping(timestep_embed + mapping_cond_embed.squeeze(1))
+        if self.use_per_frame_mod and mapping_cond_embed.dim() == 3:
+            mapping_out = self.mapping(timestep_embed.unsqueeze(1) + mapping_cond_embed)  # (B, T, D)
+        else:
+            mapping_out = self.mapping(timestep_embed + mapping_cond_embed.squeeze(1))    # (B, D)
 
-        # No context mask needed - we attend to all frames in mapping_cond
         context_mask = None
 
-        if cond is not None:
-            # Concatenate in temporal order: [past conditioning, future prediction]
-            input = torch.cat([cond, input], dim=1)
+        # --- Past frame conditioning on adaLN ---
+        if self.use_cond_img_in_adaln and cond is not None and self.cond_img_conv_encoder is not None:
+            B_c, T_c, H_c, W_c = cond.shape
+            frame_feats = self.cond_img_conv_encoder(cond.reshape(B_c * T_c, 1, H_c, W_c))  # (B*T, 64)
+            frame_feats = frame_feats.reshape(B_c, 64, T_c)                                  # (B, 64, T)
+            pooled = self.cond_img_temporal_pool(frame_feats)                                # (B, 64)
+            mapping_out = mapping_out + self.cond_img_adaln_proj(pooled)                     # (B, D)
 
-        # Create temporal coordinates for each frame
-        # Conditioning frames: negative indices (past), Prediction frames: positive indices (future)
-        # E.g., 15 cond + 15 pred: [-15, -14, ..., -1, 0, 1, ..., 14]
+        # Per-frame mod: broadcast (B, T, D) to (B, T*Hp*Wp, D)
+        if self.use_per_frame_mod and mapping_out.dim() == 3:
+            tokens_per_frame = shape[1] * shape[2]
+            mapping_out = mapping_out.repeat_interleave(tokens_per_frame, dim=1)
+
+        # --- Build input tensor (B, 6, T, H, W): map + time coord + L1 per-pixel ---
+        if cond is not None:
+            input = torch.cat([cond, input], dim=1)  # (B, T_total, H, W)
+
         batch_size = input.shape[0]
         total_frames = input.shape[1]
 
+        # Temporal coordinates in [-1, 1], past negative, future positive
         temporal_positions = torch.arange(-num_cond_frames, num_pred_frames,
-                                         device=input.device, dtype=input.dtype)
-
-        # Normalize by max horizon (max absolute temporal distance)
-        # This gives range roughly [-1, 1] centered at present (t=0)
+                                          device=input.device, dtype=input.dtype)
         max_horizon = max(num_cond_frames, num_pred_frames)
         temporal_positions_normalized = temporal_positions / max_horizon
-
-        # Expand to batch dimension: (batch, num_frames)
         time_position = temporal_positions_normalized.unsqueeze(0).expand(batch_size, -1)
 
-        # Add temporal coordinate as explicit input channel
-        # Following solar project approach: use (B, C, T, H, W) format
-        time_coord = temporal_positions_normalized.view(1, -1, 1, 1).expand(batch_size, total_frames, input.shape[-2], input.shape[-1])
+        time_coord = temporal_positions_normalized.view(1, -1, 1, 1).expand(
+            batch_size, total_frames, input.shape[-2], input.shape[-1])
 
-        # Handle mapping_cond: if None, create zeros
         if mapping_cond is None:
             l1_cond = torch.zeros(batch_size, total_frames, 4, input.shape[-2], input.shape[-1],
-                                 device=input.device, dtype=input.dtype)
+                                  device=input.device, dtype=input.dtype)
         else:
-            l1_cond = mapping_cond.unsqueeze(-1).unsqueeze(-1)  # (batch, total_frames, 4, 1, 1)
-            l1_cond = l1_cond.expand(batch_size, total_frames, 4, input.shape[-2], input.shape[-1])
+            l1_cond = mapping_cond.unsqueeze(-1).unsqueeze(-1).expand(
+                batch_size, total_frames, 4, input.shape[-2], input.shape[-1])
 
-        # Rearrange to (B, C, T, H, W) format like solar project
-        input = input.unsqueeze(1)  # (B, 1, T, H, W)
-        time_coord = time_coord.unsqueeze(1)  # (B, 1, T, H, W)
-        l1_cond = l1_cond.permute(0, 2, 1, 3, 4)  # (B, T, 4, H, W) -> (B, 4, T, H, W)
+        input = torch.cat([
+            input.unsqueeze(1),                        # (B, 1, T, H, W)
+            time_coord.unsqueeze(1),                   # (B, 1, T, H, W)
+            l1_cond.permute(0, 2, 1, 3, 4),            # (B, 4, T, H, W)
+        ], dim=1)                                      # (B, 6, T, H, W)
 
-        # Concatenate along channel dimension (dim=1)
-        input = torch.cat([input, time_coord, l1_cond], dim=1)  # (B, 6, T, H, W)
-
-        input = self.patch(input)
-        input = self.in_proj(input)
+        # --- Transformer ---
+        input = self.in_proj(self.patch(input))
         shape = input.shape[-self.spatial - 1: -1]
 
         coo, mask = self.coo_and_mask(shape, time_position=time_position, spatial=self.spatial,
-                                       window_size=self.window_size, dtype=input.dtype, device=input.device)
+                                      window_size=self.window_size, dtype=input.dtype, device=input.device)
 
         x = skip = torch.flatten(input, -self.spatial - 1, -2)
         x = x + self.positional_embedding(coo)
 
         for block in self.blocks:
-            x = block(x, mapping_out.squeeze(1), coo=coo, mask=mask, skip=skip, context=context, context_mask=context_mask)
+            x = block(x, mapping_out.squeeze(1), coo=coo, mask=mask, skip=skip,
+                      context=context, context_mask=context_mask)
 
-        x = torch.unflatten(x, sizes=shape, dim=-2)
-        x = self.out_proj(x)
-        x = self.unpatch(x)
-
-        # Extract only the prediction frames (last num_pred_frames in temporal sequence)
-        # x is (B, C, total_frames, H, W) where frames are [conditioning, prediction]
-        # We only want the prediction frames: x[:, :, -num_pred_frames:, :, :]
-        x = x[:, :, -num_pred_frames:, :, :]
+        # --- Output: learned temporal projection T_total → pred_frames ---
+        x = self.unpatch(self.out_proj(torch.unflatten(x, sizes=shape, dim=-2)))
+        x = x.permute(0, 1, 3, 4, 2)   # (B, C, H, W, T_total)
+        x = self.time_proj(x)            # (B, C, H, W, pred_frames)
+        x = x.permute(0, 1, 4, 2, 3)   # (B, C, pred_frames, H, W)
 
         return x.squeeze(1)
         

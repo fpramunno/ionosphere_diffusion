@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
-#SBATCH --time=4:00:00
+#SBATCH --time=24:00:00
 #SBATCH -A sk035
 #SBATCH --output=/users/framunno/logs/out/out_l1_map_merge.log
 #SBATCH --error=/users/framunno/logs/err/err_l1_map_merge.log
@@ -65,7 +65,7 @@ echo "=========================================="
 
 if [ $EXIT_CODE -eq 0 ]; then
     echo "✓ SUCCESS: Matching completed successfully!"
-    echo "Output file: /users/framunno/data/ionosphere/l1_to_map_matched_even_minutes.csv"
+    echo "Output file: /users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv"
 else
     echo "✗ ERROR: Matching failed with exit code $EXIT_CODE"
     exit $EXIT_CODE

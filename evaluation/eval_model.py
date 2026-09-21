@@ -229,6 +229,10 @@ def main():
     cpcp_pred_values = []
     cpcp_gt_values = []
 
+    # CPCP percentage variation per sample: (gt - pred) / gt * 100
+    # Shape will be (num_files, num_frames, 20)
+    cpcp_pct_variation = []
+
     # Power spectrum metrics
     ps_log_mse = []
     ps_log_rel_l2 = []
@@ -253,6 +257,8 @@ def main():
         cpcp_pred_frames = []
         cpcp_gt_frames = []
 
+        cpcp_pct_var_frames = []
+
         ps_log_mse_frames = []
         ps_log_rel_l2_frames = []
         ps_rel_filt_frames = []
@@ -268,6 +274,7 @@ def main():
 
             cpcp_pred_samples = []
             cpcp_gt_samples = []
+            cpcp_pct_var_samples = []
 
             ps_log_mse_samples = []
             ps_log_rel_l2_samples = []
@@ -277,7 +284,8 @@ def main():
             gt_frame_renorm = revert_normalization(gt_frame)
             gt_ps = compute_isotropic_power(gt_frame[np.newaxis, :, :], boxlength=[64, 64], apply_window=True)[0][0]
 
-            for s in range(20):
+            num_samples = predictions.shape[0]
+            for s in range(num_samples):
                 pred_frame = predictions[s, t]
 
                 # Compute PSNR
@@ -301,6 +309,8 @@ def main():
                 cpcp_gt = compute_cpcp_value(gt_frame_renorm)
                 cpcp_pred_samples.append(cpcp_pred)
                 cpcp_gt_samples.append(cpcp_gt)
+                cpcp_pct_var = (cpcp_gt - cpcp_pred) / cpcp_gt * 100 if cpcp_gt != 0 else 0.0
+                cpcp_pct_var_samples.append(cpcp_pct_var)
 
                 # Compute improved power spectrum metrics
                 pred_ps = compute_isotropic_power(pred_frame[np.newaxis, :, :], boxlength=[64, 64], apply_window=True)[0][0]
@@ -319,6 +329,7 @@ def main():
 
             cpcp_pred_frames.extend(cpcp_pred_samples)
             cpcp_gt_frames.extend(cpcp_gt_samples)
+            cpcp_pct_var_frames.append(cpcp_pct_var_samples)
 
             ps_log_mse_frames.extend(ps_log_mse_samples)
             ps_log_rel_l2_frames.extend(ps_log_rel_l2_samples)
@@ -334,6 +345,7 @@ def main():
 
         cpcp_pred_values.append(cpcp_pred_frames)
         cpcp_gt_values.append(cpcp_gt_frames)
+        cpcp_pct_variation.append(cpcp_pct_var_frames)
 
         ps_log_mse.append(ps_log_mse_frames)
         ps_log_rel_l2.append(ps_log_rel_l2_frames)
@@ -372,6 +384,7 @@ def main():
         'CPCP_MeanBias': cpcp_mean_bias_list,
         'CPCP_MeanBiasPct': cpcp_mean_bias_pct_list,
         'CPCP_Correlation': cpcp_correlation_list,
+        'CPCP_PctVariation': [sum(frames, []) for frames in cpcp_pct_variation],
         'PS_LogMSE': ps_log_mse,
         'PS_LogRelL2': ps_log_rel_l2,
         'PS_RelErrorFiltered': ps_rel_error_filtered
@@ -381,6 +394,15 @@ def main():
     print(f"\nMetrics saved to {os.path.join(output_path_csv, name_csv)}")
     print(f"\nSummary statistics:")
     print(df.describe())
+
+    # Save CPCP percentage variation as numpy array: shape (num_files, num_frames, 20)
+    cpcp_pct_variation = np.array(cpcp_pct_variation)
+    cpcp_pct_var_path = os.path.join(output_path_csv, name_csv.replace('.csv', '_cpcp_pct_variation.npy'))
+    np.save(cpcp_pct_var_path, cpcp_pct_variation)
+    print(f"\nCPCP percentage variation saved to {cpcp_pct_var_path}")
+    print(f"  Shape: {cpcp_pct_variation.shape} (num_files, num_frames, num_samples)")
+    print(f"  Per-frame mean: {cpcp_pct_variation.mean(axis=(0, 2))}")
+    print(f"  Per-frame std:  {cpcp_pct_variation.std(axis=(0, 2))}")
 
 if __name__ == "__main__":
     main()

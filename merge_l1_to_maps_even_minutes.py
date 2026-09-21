@@ -25,13 +25,10 @@ from IPython import embed
 # CONFIGURATION
 # ============================================================================
 
-MAP_DIR = '/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/'
-# SOLAR_WIND_FILE = '/users/framunno/data/ionosphere/combined_f1m_m1m_2024.csv'
-SOLAR_WIND_FILE = '/users/framunno/data/ionosphere/combined_f1m_m1m_2024_interpolated.csv'
-OUTPUT_FILE = '/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_interpolated.csv'
-
-# Physics constants
-L1_EARTH_DISTANCE_KM = 1.5e6  # ~1.5 million km (L1 Lagrange point distance)
+MAP_DIR = '/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/'
+SOLAR_WIND_FILE = '/users/framunno/data/ionosphere/combined_f1m_m1m_2020_2025_interpolated.csv'
+DSCOVR_FILE = '/users/framunno/data/ionosphere/DSCOVR_ORBIT_PRE_2020_2025.csv'
+OUTPUT_FILE = '/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv'
 
 # Matching parameters
 MAX_MATCH_TOLERANCE_SECONDS = 60  # Accept matches within 5 minutes
@@ -62,16 +59,17 @@ def extract_datetime_from_filename(filename):
         return None
 
 
-def calculate_earth_arrival_time(l1_time, velocity_km_s):
+def calculate_earth_arrival_time(l1_time, velocity_km_s, x_gse_km):
     """
     Calculate when L1 solar wind measurement arrives at Earth.
 
     Args:
         l1_time: Time of L1 measurement
         velocity_km_s: Solar wind velocity (negative in GSM coordinates)
+        x_gse_km: Actual DSCOVR satellite distance along Sun-Earth line (X_GSE)
 
     Returns:
-        datetime of Earth arrival, or None if velocity is invalid
+        datetime of Earth arrival, or None if velocity or distance is invalid
     """
     velocity = abs(velocity_km_s)
 
@@ -79,8 +77,11 @@ def calculate_earth_arrival_time(l1_time, velocity_km_s):
     if velocity <= 0 or velocity == 99999 or velocity == -99999 or np.isnan(velocity):
         return None
 
-    # Calculate propagation time: distance / velocity
-    travel_time_seconds = L1_EARTH_DISTANCE_KM / velocity
+    if np.isnan(x_gse_km) or x_gse_km <= 0:
+        return None
+
+    # Calculate propagation time: actual distance / velocity
+    travel_time_seconds = x_gse_km / velocity
 
     return l1_time + timedelta(seconds=travel_time_seconds)
 
@@ -108,27 +109,31 @@ def main():
     print("=" * 80)
 
     # ========================================================================
-    # STEP 1: LOAD AND FILTER L1 DATA (EVEN MINUTES ONLY)
+    # STEP 1: LOAD L1 DATA AND JOIN WITH DSCOVR ORBIT
     # ========================================================================
     print("\n[1/4] Loading L1 solar wind data...")
     solar_wind_df = pd.read_csv(SOLAR_WIND_FILE)
     solar_wind_df['time'] = pd.to_datetime(solar_wind_df['time'])
-
-    # Remove timezone info to match timezone-naive map times
     solar_wind_df['time'] = solar_wind_df['time'].dt.tz_localize(None)
-
-    print(f"Total L1 records: {len(solar_wind_df):,}")
-
-    # # Filter for even minutes (00, 02, 04, ..., 58)
-    # # embed()
-    # print("Filtering for even minutes (00, 02, 04, ..., 58)...")
-    # solar_wind_df['minute'] = solar_wind_df['time'].dt.minute
-    # solar_wind_df = solar_wind_df[solar_wind_df['minute'] % 2 == 0].copy()
-    # solar_wind_df = solar_wind_df.drop('minute', axis=1)
     solar_wind_df = solar_wind_df.sort_values('time').reset_index(drop=True)
-
-    print(f"L1 records with even minutes: {len(solar_wind_df):,}")
+    print(f"Total L1 records: {len(solar_wind_df):,}")
     print(f"Time range: {solar_wind_df['time'].min()} to {solar_wind_df['time'].max()}")
+
+    print("\nLoading DSCOVR orbit data...")
+    dscovr_df = pd.read_csv(DSCOVR_FILE)
+    dscovr_df = dscovr_df.rename(columns={'EPOCH_yyyy-mm-ddThh:mm:ss.sssZ': 'time'})
+    dscovr_df['time'] = pd.to_datetime(dscovr_df['time']).dt.tz_localize(None)
+    dscovr_df = dscovr_df[['time', 'X_GSE_km']].sort_values('time').reset_index(drop=True)
+    print(f"Total DSCOVR records: {len(dscovr_df):,}")
+
+    # Merge on nearest minute
+    solar_wind_df = pd.merge_asof(
+        solar_wind_df, dscovr_df,
+        on='time', direction='nearest', tolerance=pd.Timedelta('1min')
+    )
+    missing_x = solar_wind_df['X_GSE_km'].isna().sum()
+    print(f"L1 rows with no DSCOVR match: {missing_x:,}")
+    print(f"L1 records after join: {len(solar_wind_df):,}")
 
     # ========================================================================
     # STEP 2: SCAN AND FILTER MAP FILES (EVEN MINUTES ONLY)
@@ -174,13 +179,14 @@ def main():
         row = solar_wind_df.iloc[idx]
         l1_time = row['time']
         velocity = row['proton_vx_gsm']
+        x_gse_km = row['X_GSE_km']
 
         # Check if all conditions are valid
         if not is_valid_condition_row(row):
             return None
 
-        # Calculate Earth arrival time
-        earth_arrival_time = calculate_earth_arrival_time(l1_time, velocity)
+        # Calculate Earth arrival time using actual DSCOVR distance
+        earth_arrival_time = calculate_earth_arrival_time(l1_time, velocity, x_gse_km)
 
         if earth_arrival_time is None:
             return None
@@ -225,11 +231,12 @@ def main():
 
             # Match old CSV format with timezone-aware times
             return {
-                'time': l1_time.tz_localize('UTC'),  # Add UTC timezone back
+                'time': l1_time.tz_localize('UTC'),
                 'proton_vx_gsm': row['proton_vx_gsm'],
                 'bx_gsm': row['bx_gsm'],
                 'by_gsm': row['by_gsm'],
                 'bz_gsm': row['bz_gsm'],
+                'x_gse_km': x_gse_km,
                 'speed_kms': speed_kms,
                 'delay_min': delay_min,
                 'earth_time': pd.Timestamp(earth_arrival_time).tz_localize('UTC'),

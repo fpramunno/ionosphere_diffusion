@@ -5,10 +5,10 @@
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=12:00:00
+#SBATCH --time=09:00:00
 #SBATCH -A sk035
-#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_generate_NOCOND_v3.log
-#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_generate_NOCOND_v3.log
+#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_generate_CLASSIC_NOMEAN_V4_interdata.log
+#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_generate_CLASSIC_NOMEAN_V4_interdata.log
 
 # =============================================================================
 # ✅ Environment setup

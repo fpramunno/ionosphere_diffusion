@@ -9,6 +9,7 @@ from . import augmentation, layers, models, utils
 
 from . import vit
 from . import modules
+from . import unet_simple
 
 # import augmentation, layers, models, utils
 
@@ -230,7 +231,7 @@ def make_model(config):
         model = vit.ViT(
             in_channels=config['in_channels'],
             out_channels=config['out_channels'],
-            t_out=config['t_out'],
+            pred_frames=config.get('pred_frames', config.get('t_out', 15)),
             cond_channels=config['cond_channels'] if config['masked'] else 0,
             mod_features=config['emb_features'],
             hid_channels=config['hid_channels'],
@@ -248,6 +249,8 @@ def make_model(config):
             spherical_order=config.get('spherical_order', 4),
             use_multiscale_temporal=config.get('use_multiscale_temporal', False),
             use_adaptive_temporal=config.get('use_adaptive_temporal', False),
+            use_cond_img_in_adaln=config.get('use_cond_img_in_adaln', False),
+            cond_frames=config.get('cond_frames', 15),
         )
     elif config['type'] == 'palette_unet':
         # Determine true image size from input_size
@@ -267,6 +270,17 @@ def make_model(config):
             num_res_blocks=config.get('num_res_blocks', 2),
             attention_resolutions=tuple(config.get('attention_resolutions', [16])),
             num_bottleneck_blocks=config.get('num_bottleneck_blocks', 3),
+        )
+    elif config['type'] == 'unet_simple':
+        model = unet_simple.UNetSimple(
+            in_channels=config.get('in_channels', 1),
+            out_channels=config.get('out_channels', 1),
+            cond_frames=config.get('cond_frames', 15),
+            pred_frames=config.get('pred_frames', 7),
+            base_channels=config.get('base_channels', 128),
+            channel_mults=tuple(config.get('channel_mults', [1, 2, 4, 4])),
+            num_res_blocks=config.get('num_res_blocks', 2),
+            dropout=config.get('dropout_rate', 0.0),
         )
     else:
         raise ValueError(f'unsupported model type {config["type"]}')

@@ -7,6 +7,7 @@ import threading
 import time
 import urllib
 import warnings
+import gdown
 
 from PIL import Image
 import safetensors
@@ -54,12 +55,17 @@ def n_params(module):
 
 
 def download_file(path, url, digest=None):
-    """Downloads a file if it does not exist, optionally checking its SHA-256 hash."""
+    """Downloads a file if it does not exist, optionally checking its SHA-256 hash.
+    Supports regular URLs and Google Drive share links."""
+    
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        with urllib.request.urlopen(url) as response, open(path, 'wb') as f:
-            shutil.copyfileobj(response, f)
+        if 'drive.google.com' in url:
+            gdown.download(url, str(path), quiet=False, fuzzy=True)
+        else:
+            with urllib.request.urlopen(url) as response, open(path, 'wb') as f:
+                shutil.copyfileobj(response, f)
     if digest is not None:
         file_digest = hashlib.sha256(open(path, 'rb').read()).hexdigest()
         if digest != file_digest:

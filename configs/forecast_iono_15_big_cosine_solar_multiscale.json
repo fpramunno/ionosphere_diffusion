@@ -6,7 +6,8 @@
         "patch_size": [1, 8, 8],
         "mapping_out": 1024,
         "out_channels": 1,
-        "t_out": 5,
+        "pred_frames": 7,
+        "cond_frames": 15,
         "depths": [2, 4, 4],
         "channels": [128, 256, 512],
         "self_attn_depths": [false, false, false],
@@ -33,9 +34,10 @@
         "window_size": null,
         "spatial": 3,
         "cond_channels": 0,
-        "channel_mapping_cond": 30,
+        "channel_mapping_cond": 22,
         "use_multiscale_temporal": true,
-        "use_physics_embedding": false
+        "use_physics_embedding": false,
+        "use_cond_img_in_adaln": false
     },
     "optimizer": {
         "type": "adamw",
