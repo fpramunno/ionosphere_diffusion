@@ -7,10 +7,10 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_unet_benchmark_v1_BS1.log
-#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_unet_benchmark_v1_BS1.log
+#SBATCH --output=./logs/out/out_unet_benchmark_v1_BS1.log
+#SBATCH --error=./logs/err/err_unet_benchmark_v1_BS1.log
 
-source /users/framunno/envs/ionosphere/bin/activate
+source ${IONO_VENV:-/path/to/venv}/bin/activate
 
 unset ACCELERATE_USE_FSDP
 unset ACCELERATE_FSDP_SHARDING_STRATEGY
@@ -40,18 +40,18 @@ echo "MASTER_ADDR=${MASTER_ADDR}, SLURM_NODELIST=${SLURM_NODELIST}"
 
 export SEQUENCE_LENGTH=22
 export PREDICT_STEPS=7
-export CSV_PATH="/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv"
+export CSV_PATH="${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/l1_to_map_matched_2020_2025.csv"
 export BATCH_SIZE=1
 export DIR_NAME="unet_benchmark_v1_BS1"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
 export WANDB_RUN_NAME="unet_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_benchmark_v1"
 
-mkdir -p /capstor/scratch/cscs/framunno/logs/out
-mkdir -p /capstor/scratch/cscs/framunno/logs/err
+mkdir -p ${IONO_DATA_ROOT:-/path/to/data_root}/logs/out
+mkdir -p ${IONO_DATA_ROOT:-/path/to/data_root}/logs/err
 
 accelerate launch \
-  --config_file /users/framunno/projects/ionosphere_diffusion/configs/accelerate_config_ddp.yaml \
-  /users/framunno/projects/ionosphere_diffusion/training_unet.py \
+  --config_file ${IONO_REPO:-/path/to/ionosphere_diffusion}/configs/accelerate_config_ddp.yaml \
+  ${IONO_REPO:-/path/to/ionosphere_diffusion}/training_unet.py \
   --sequence-length $SEQUENCE_LENGTH \
   --predict-steps $PREDICT_STEPS \
   --csv-path $CSV_PATH \

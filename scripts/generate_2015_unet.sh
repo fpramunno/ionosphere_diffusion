@@ -7,10 +7,10 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_generate_2015_unet.log
-#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_generate_2015_unet.log
+#SBATCH --output=./logs/out/out_generate_2015_unet.log
+#SBATCH --error=./logs/err/err_generate_2015_unet.log
 
-source /users/framunno/envs/ionosphere/bin/activate
+source ${IONO_VENV:-/path/to/venv}/bin/activate
 export PYTHONUNBUFFERED=1
 
 # =============================================================================
@@ -26,10 +26,10 @@ else
     )
 fi
 ROLLOUT_END="2015-03-19T00:00:00+00:00"
-NORM_CSV="/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv"
+NORM_CSV="${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/l1_to_map_matched_2020_2025.csv"
 
-mkdir -p /capstor/scratch/cscs/framunno/logs/out
-mkdir -p /capstor/scratch/cscs/framunno/logs/err
+mkdir -p ${IONO_DATA_ROOT:-/path/to/data_root}/logs/out
+mkdir -p ${IONO_DATA_ROOT:-/path/to/data_root}/logs/err
 
 # =============================================================================
 # Loop over PRED_START windows
@@ -48,15 +48,15 @@ for PRED_START in "${PRED_STARTS[@]}"; do
     echo ">>> Center time          : $CENTER"
     echo ">>> Time range filter    : $TIME_RANGE"
 
-    OUTPUT_DIR="/capstor/scratch/cscs/framunno/results_2015_UNET_AR50_pred${PRED_START_TAG}"
+    OUTPUT_DIR="${IONO_DATA_ROOT:-/path/to/data_root}/results_2015_UNET_AR50_pred${PRED_START_TAG}"
     mkdir -p $OUTPUT_DIR
     echo ">>> Running UNet → $OUTPUT_DIR"
 
-    python3 /users/framunno/projects/ionosphere_diffusion/generate_data_v4.py \
+    python3 ${IONO_REPO:-/path/to/ionosphere_diffusion}/generate_data_v4.py \
         --model-type unet \
-        --ckpt /capstor/scratch/cscs/framunno/models_results/models_unet_benchmark_v1_BS1/model_step_0200000.pth \
+        --ckpt ${IONO_DATA_ROOT:-/path/to/data_root}/models_results/models_unet_benchmark_v1_BS1/model_step_0200000.pth \
         --output-dir $OUTPUT_DIR \
-        --csv-path /users/framunno/data/ionosphere/l1_to_map_matched_2015_march_10_20_deduplicated.csv \
+        --csv-path ${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/l1_to_map_matched_2015_march_10_20_deduplicated.csv \
         --sequence-length 50 \
         --normalization-type absolute_max \
         --base-channels 256 \

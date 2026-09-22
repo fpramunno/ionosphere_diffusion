@@ -25,10 +25,10 @@ from IPython import embed
 # CONFIGURATION
 # ============================================================================
 
-MAP_DIR = '/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/'
-SOLAR_WIND_FILE = '/users/framunno/data/ionosphere/combined_f1m_m1m_2020_2025_interpolated.csv'
-DSCOVR_FILE = '/users/framunno/data/ionosphere/DSCOVR_ORBIT_PRE_2020_2025.csv'
-OUTPUT_FILE = '/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv'
+MAP_DIR = './data_root/ionosphere_data/all_maps/'
+SOLAR_WIND_FILE = './data/ionosphere/combined_f1m_m1m_2020_2025_interpolated.csv'
+DSCOVR_FILE = './data/ionosphere/DSCOVR_ORBIT_PRE_2020_2025.csv'
+OUTPUT_FILE = './data/ionosphere/l1_to_map_matched_2020_2025.csv'
 
 # Matching parameters
 MAX_MATCH_TOLERANCE_SECONDS = 60  # Accept matches within 5 minutes

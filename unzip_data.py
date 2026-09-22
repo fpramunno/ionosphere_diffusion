@@ -10,9 +10,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-ZIPS_DIR = Path("/capstor/scratch/cscs/framunno/ionosphere_data")
-SOURCE_2024 = Path("/users/framunno/data/ionosphere/ionosphere_data/pickled_maps")
-OUTPUT_DIR = Path("/capstor/scratch/cscs/framunno/ionosphere_data/all_maps")
+ZIPS_DIR = Path("./data_root/ionosphere_data")
+SOURCE_2024 = Path("./data/ionosphere/ionosphere_data/pickled_maps")
+OUTPUT_DIR = Path("./data_root/ionosphere_data/all_maps")
 
 
 def count_zip_files(zip_path: Path) -> int:

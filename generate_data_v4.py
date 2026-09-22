@@ -138,7 +138,7 @@ def main():
 
     # --- sequence / data ---
     p.add_argument('--csv-path', type=str,
-                   default='/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv')
+                   default='./data/ionosphere/l1_to_map_matched_2020_2025.csv')
     p.add_argument('--norm-csv', type=str, default=None,
                    metavar='PATH',
                    help='CSV used to compute cond_min/cond_max for L1 normalisation. '

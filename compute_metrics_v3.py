@@ -37,7 +37,7 @@ python compute_metrics_v3.py \\
         /capstor/.../results_diffusion_nocond_singlepass_step200k_dynhigh_acthigh \\
         /capstor/.../results_unet_singlepass_step200k_dynhigh_acthigh \\
     --labels classic nocond unet \\
-    --output-dir /users/framunno/res_iono/metrics_v3_singlepass_dynhigh_acthigh
+    --output-dir ./res_iono/metrics_v3_singlepass_dynhigh_acthigh
 """
 
 import argparse

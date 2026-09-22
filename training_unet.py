@@ -38,7 +38,7 @@ def main():
     p.add_argument('--sequence-length',     type=int,   default=22)
     p.add_argument('--predict-steps',       type=int,   default=7)
     p.add_argument('--csv-path',            type=str,   required=True)
-    p.add_argument('--saving-path',         type=str,   default='/capstor/scratch/cscs/framunno/models_results')
+    p.add_argument('--saving-path',         type=str,   default='./data_root/models_results')
     p.add_argument('--dir-name',            type=str,   default='unet_benchmark')
     p.add_argument('--normalization-type',  type=str,   default='absolute_max')
     p.add_argument('--base-channels',       type=int,   default=128)

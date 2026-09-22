@@ -7,10 +7,10 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/iopsstor/scratch/cscs/framunno/logs/out/out_generate_v4_unet_%j.log
-#SBATCH --error=/iopsstor/scratch/cscs/framunno/logs/err/err_generate_v4_unet_%j.log
+#SBATCH --output=./logs/out/out_generate_v4_unet_%j.log
+#SBATCH --error=./logs/err/err_generate_v4_unet_%j.log
 
-source /users/framunno/envs/ionosphere/bin/activate
+source ${IONO_VENV:-/path/to/venv}/bin/activate
 
 export PYTHONUNBUFFERED=1
 
@@ -22,7 +22,7 @@ export PYTHONUNBUFFERED=1
 export MODEL_TYPE="unet"
 
 # --- unet ---
-export CKPT_PATH="/capstor/scratch/cscs/framunno/models_results/models_unet_benchmark_v1_BS1/model_step_0200000.pth"
+export CKPT_PATH="${IONO_DATA_ROOT:-/path/to/data_root}/models_results/models_unet_benchmark_v1_BS1/model_step_0200000.pth"
 export BASE_CHANNELS=256
 export CHANNEL_MULTS="1 2 4 4"
 export NUM_RES_BLOCKS=8
@@ -52,14 +52,14 @@ else
 fi
 
 # --- data ---
-export CSV_PATH="/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv"
+export CSV_PATH="${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/l1_to_map_matched_2020_2025.csv"
 export NORMALIZATION_TYPE="absolute_max"
 if [ "$MODE_TAG" = "ar3" ]; then
-    export DYNAMICS_CACHE="--dynamics-cache /capstor/scratch/cscs/framunno/dynamics_scores_val_all_seq36.json"
+    export DYNAMICS_CACHE="--dynamics-cache ${IONO_DATA_ROOT:-/path/to/data_root}/dynamics_scores_val_all_seq36.json"
 elif [ "$MODE_TAG" = "ark50" ]; then
-    export DYNAMICS_CACHE="--dynamics-cache /capstor/scratch/cscs/framunno/dynamics_scores_val_all_seq365.json"
+    export DYNAMICS_CACHE="--dynamics-cache ${IONO_DATA_ROOT:-/path/to/data_root}/dynamics_scores_val_all_seq365.json"
 else
-    export DYNAMICS_CACHE="--dynamics-cache /capstor/scratch/cscs/framunno/dynamics_scores_val_all_seq50.json"
+    export DYNAMICS_CACHE="--dynamics-cache ${IONO_DATA_ROOT:-/path/to/data_root}/dynamics_scores_val_all_seq50.json"
 fi
 
 # --- output ---
@@ -70,21 +70,21 @@ else                                MODE="singlepass"
 fi
 if [ "$MODE" = "ark50" ]; then
     # capstor e' sopra la quota file (1M+ inode) -- ark50 salva su iopsstor, vuoto e senza limite di file
-    export OUTPUT_DIR="/iopsstor/scratch/cscs/framunno/results_unet_${MODE}_step200k_dyn${DYNAMICS}_act${ACTIVITY}"
+    export OUTPUT_DIR="${IONO_FAST_ROOT:-/path/to/fast_scratch_root}/results_unet_${MODE}_step200k_dyn${DYNAMICS}_act${ACTIVITY}"
 else
-    export OUTPUT_DIR="/capstor/scratch/cscs/framunno/results_unet_${MODE}_step200k_dyn${DYNAMICS}_act${ACTIVITY}"
+    export OUTPUT_DIR="${IONO_DATA_ROOT:-/path/to/data_root}/results_unet_${MODE}_step200k_dyn${DYNAMICS}_act${ACTIVITY}"
 fi
 
 # =============================================================================
 # Run
 # =============================================================================
-mkdir -p /iopsstor/scratch/cscs/framunno/logs/out
-mkdir -p /iopsstor/scratch/cscs/framunno/logs/err
+mkdir -p ${IONO_FAST_ROOT:-/path/to/fast_scratch_root}/logs/out
+mkdir -p ${IONO_FAST_ROOT:-/path/to/fast_scratch_root}/logs/err
 mkdir -p $OUTPUT_DIR
 
 echo ">>> dynamics=${DYNAMICS} activity=${ACTIVITY} → $OUTPUT_DIR"
 
-python3 /users/framunno/projects/ionosphere_diffusion/generate_data_v4.py \
+python3 ${IONO_REPO:-/path/to/ionosphere_diffusion}/generate_data_v4.py \
     --model-type $MODEL_TYPE \
     --ckpt $CKPT_PATH \
     --output-dir $OUTPUT_DIR \

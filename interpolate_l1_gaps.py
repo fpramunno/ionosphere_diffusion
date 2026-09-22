@@ -22,8 +22,8 @@ from tqdm import tqdm
 # CONFIGURATION
 # ============================================================================
 
-INPUT_FILE = '/users/framunno/data/ionosphere/combined_f1m_m1m_2024.csv'
-OUTPUT_FILE = '/users/framunno/data/ionosphere/combined_f1m_m1m_2024_interpolated.csv'
+INPUT_FILE = './data/ionosphere/combined_f1m_m1m_2024.csv'
+OUTPUT_FILE = './data/ionosphere/combined_f1m_m1m_2024_interpolated.csv'
 MAX_GAP_MINUTES = 10  # Maximum gap size to interpolate across
 
 # L1 condition columns to process

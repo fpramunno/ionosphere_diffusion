@@ -7,15 +7,15 @@ The output JSON maps str(center_idx) → float score (V/frame, raw physical unit
 Usage
 -----
 python precompute_dynamics_scores.py \
-    --csv-path /users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv \
-    --cache-path /capstor/scratch/cscs/framunno/dynamics_scores_val_seq50.json \
+    --csv-path ./data/ionosphere/l1_to_map_matched_2020_2025.csv \
+    --cache-path ./data_root/dynamics_scores_val_seq50.json \
     --split valid \
     --sequence-length 50 \
     --num-workers 16
 
 # Inspect which sequences pass a given threshold without running generation:
 python precompute_dynamics_scores.py \
-    --cache-path /capstor/scratch/cscs/framunno/dynamics_scores_val_seq50.json \
+    --cache-path ./data_root/dynamics_scores_val_seq50.json \
     --inspect --dynamics-filter 0.75
 """
 
@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-MAP_DIR = '/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/'
+MAP_DIR = './data_root/ionosphere_data/all_maps/'
 
 # ---------------------------------------------------------------------------
 # Per-worker globals — set once by the initializer, never re-pickled per task
@@ -75,9 +75,9 @@ def _worker_score(center_idx):
 def main():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--csv-path', type=str,
-                   default='/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv')
+                   default='./data/ionosphere/l1_to_map_matched_2020_2025.csv')
     p.add_argument('--cache-path', type=str,
-                   default='/capstor/scratch/cscs/framunno/dynamics_scores_val_seq50.json',
+                   default='./data_root/dynamics_scores_val_seq50.json',
                    help='where to save (or load) the scores JSON')
     p.add_argument('--split',            type=str, default='valid')
     p.add_argument('--sequence-length',  type=int, default=50)

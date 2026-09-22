@@ -546,8 +546,10 @@ class IonoSequenceDataset(Dataset):
         per_file_stats_path=None,  # Path to per-file normalization stats JSON
         only_complete_sequences=False,  # Only use sequences with no missing frames
         preprocess_config=None,  # Preprocessing config for ionosphere_preprocess normalization
-        seed=42
+        seed=42,
+        maps_dir=None,  # Directory containing the .npy map files; falls back to IONO_MAPS_DIR env var
     ):
+        self.maps_dir = maps_dir or os.environ.get('IONO_MAPS_DIR', './data/all_maps')
         self.csv_path = csv_path
         self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
@@ -728,7 +730,7 @@ class IonoSequenceDataset(Dataset):
                     file_idx = start_idx + i
                     if 0 <= file_idx < len(self.all_files):
                         file_path = self.all_files[file_idx]
-                        data = np.load('/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/' + file_path, allow_pickle=True)
+                        data = np.load(os.path.join(self.maps_dir, file_path), allow_pickle=True)
                         sample_data.append(data[0])
             except Exception as e:
                 print(f"Warning: Could not load sequence {seq_idx}: {e}")
@@ -845,7 +847,7 @@ class IonoSequenceDataset(Dataset):
             if frame_exists:
                 # Load the actual frame
                 file_path = self.all_files[file_idx]
-                data = np.load('/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/' + file_path, allow_pickle=True)
+                data = np.load(os.path.join(self.maps_dir, file_path), allow_pickle=True)
 
                 # Apply Cartesian transformation if enabled
                 data_map = data[0].astype(np.float32)
@@ -1064,9 +1066,11 @@ class IonoSequenceIterableDataset(IterableDataset):
         dynamics_filter_quantile=None,  # e.g. 0.75 keeps top 25% most dynamic sequences
         dynamics_filter_mode='high',    # 'high': keep top (1-Q)%; 'low': keep bottom Q%
         dynamics_cache_path=None,       # path to pre-computed scores JSON (speeds up init)
+        maps_dir=None,  # Directory containing the .npy map files; falls back to IONO_MAPS_DIR env var
     ):
         super().__init__()
 
+        self.maps_dir = maps_dir or os.environ.get('IONO_MAPS_DIR', './data/all_maps')
         self.csv_path = csv_path
         self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
@@ -1470,7 +1474,7 @@ class IonoSequenceIterableDataset(IterableDataset):
                     file_path = self.all_files[file_idx]
                     try:
                         data = np.load(
-                            '/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/' + file_path,
+                            os.path.join(self.maps_dir, file_path),
                             allow_pickle=True
                         )
                         data_map = data[0].astype(np.float32)
@@ -1571,7 +1575,7 @@ class IonoSequenceIterableDataset(IterableDataset):
 
             if frame_exists:
                 file_path = self.all_files[file_idx]
-                data = np.load('/capstor/scratch/cscs/framunno/ionosphere_data/all_maps/' + file_path, allow_pickle=True) # TODO: change the path to remove the hardcoding and make it more general
+                data = np.load(os.path.join(self.maps_dir, file_path), allow_pickle=True)
 
                 data_map = data[0].astype(np.float32)
                 if self.cartesian_transform:

@@ -3,7 +3,7 @@
 # PRED_START window for both diffusion (CLASSIC+NOCOND) and UNet.
 # Usage: bash launch_2015_all.sh [diffusion|unet|all]  (default: all)
 
-TIMESTAMPS_JSON="/users/framunno/data/ionosphere/storm_phase_timestamps_2015.json"
+TIMESTAMPS_JSON="${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/storm_phase_timestamps_2015.json"
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODEL="${1:-all}"
 

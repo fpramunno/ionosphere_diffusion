@@ -7,7 +7,7 @@ import gdown
 from pathlib import Path
 from tqdm import tqdm
 
-OUTPUT_DIR = Path("/capstor/scratch/cscs/framunno/ionosphere_data")
+OUTPUT_DIR = Path("./data_root/ionosphere_data")
 
 GDRIVE_LINKS = [
     "https://drive.google.com/file/d/1ZxWdT0s2xEb2vI6pQV7H6vcTPpNrcZ7b/view?usp=drive_link",

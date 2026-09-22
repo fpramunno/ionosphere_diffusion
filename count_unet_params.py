@@ -1,7 +1,7 @@
 """Quick script to explore UNetSimple parameter counts across configs."""
 
 import sys
-sys.path.insert(0, '/users/framunno/projects/ionosphere_diffusion')
+sys.path.insert(0, '.')
 
 from src.unet_simple import UNetSimple
 

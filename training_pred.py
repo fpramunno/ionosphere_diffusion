@@ -63,9 +63,9 @@ def main():
                 help='compile the model')
     p.add_argument('--config', type=str, required=True,
                 help='the configuration file')
-    p.add_argument('--data-path', type=str, default="/users/framunno/data/ionosphere/ionosphere_data/pickled_maps",
+    p.add_argument('--data-path', type=str, default="./data/ionosphere/ionosphere_data/pickled_maps",
                 help='the path of the dataset')
-    p.add_argument('--saving-path', type=str, default="/capstor/scratch/cscs/framunno/models_results", 
+    p.add_argument('--saving-path', type=str, default="./data_root/models_results", 
                 help='the path where to save the model')
     p.add_argument('--dir-name', type=str, default='cond_forecasting_cfg_oneframe_nonorm',
                 help='the directory name to use')  # <---- Added this line
@@ -110,9 +110,9 @@ def main():
                 help='the total length of the sequence (conditioning + prediction)')
     p.add_argument('--predict-steps', type=int, default=1,
                 help='number of future steps to predict')
-    p.add_argument('--csv-path', type=str, default="/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_interpolated_deduplicated.csv",
+    p.add_argument('--csv-path', type=str, default="./data/ionosphere/l1_to_map_matched_even_minutes_test_v3_interpolated_deduplicated.csv",
                 help='path to the main CSV file with metrics')
-    p.add_argument('--transform-cond-csv', type=str, default="/users/framunno/data/ionosphere/params.csv",
+    p.add_argument('--transform-cond-csv', type=str, default="./data/ionosphere/params.csv",
                 help='path to the transform condition CSV file')
     p.add_argument('--normalization-type', type=str, default="absolute_max",
                 choices=["absolute_max", "mean_sigma_tanh", "ionosphere_preprocess"],

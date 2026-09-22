@@ -22,9 +22,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIGURATION
 # ============================================================================
 
-MAP_DIR     = '/capstor/scratch/cscs/framunno/ionosphere_data/event_maps/2015_march_10_20/'
-L1_FILE     = '/users/framunno/data/ionosphere/combined_ACE_1min_gsm_2015.csv'
-OUTPUT_FILE = '/users/framunno/data/ionosphere/l1_to_map_matched_2015_march_10_20.csv'
+MAP_DIR     = './data_root/ionosphere_data/event_maps/2015_march_10_20/'
+L1_FILE     = './data/ionosphere/combined_ACE_1min_gsm_2015.csv'
+OUTPUT_FILE = './data/ionosphere/l1_to_map_matched_2015_march_10_20.csv'
 
 MAX_MATCH_TOLERANCE_S = 60
 N_WORKERS             = 8

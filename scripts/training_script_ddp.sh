@@ -7,13 +7,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_ViT_15step_ddp_NOCOND_v1_BS1_resume.log
-#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_ViT_15step_ddp_NOCOND_v1_BS1_resume.log
+#SBATCH --output=./logs/out/out_ViT_15step_ddp_NOCOND_v1_BS1_resume.log
+#SBATCH --error=./logs/err/err_ViT_15step_ddp_NOCOND_v1_BS1_resume.log
 
 # =============================================================================
 # ✅ Environment setup
 # =============================================================================
-source /users/framunno/envs/ionosphere/bin/activate
+source ${IONO_VENV:-/path/to/venv}/bin/activate
 
 # -----------------------------------------------------------------------------
 # 🚨 Clean all stale FSDP variables (switching to DDP)
@@ -59,8 +59,8 @@ echo "Using DDP (not FSDP)"
 # =============================================================================
 export SEQUENCE_LENGTH=22
 export PREDICT_STEPS=7
-export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar_classic.json"
-export CSV_PATH="/users/framunno/data/ionosphere/l1_to_map_matched_2020_2025.csv"
+export CONFIG_PATH="${IONO_REPO:-/path/to/ionosphere_diffusion}/configs/forecast_iono_15_big_cosine_solar_classic.json"
+export CSV_PATH="${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/l1_to_map_matched_2020_2025.csv"
 export BATCH_SIZE=1
 export DIR_NAME="ViT_forecast_cond15_pred7_absolute_max_ddp_NOCOND_v1_BS1"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
@@ -69,15 +69,15 @@ export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STE
 export NORM_TYPE="absolute_max"
 export PREPROCESS_SCALING="log10"
 
-mkdir -p /users/framunno/logs/out
-mkdir -p /users/framunno/logs/err
+mkdir -p ${IONO_HOME_ROOT:-/path/to/home_root}/logs/out
+mkdir -p ${IONO_HOME_ROOT:-/path/to/home_root}/logs/err
 
 # =============================================================================
 # ✅ Run (Single-node multi-GPU with accelerate DDP)
 # =============================================================================
 accelerate launch \
-  --config_file /users/framunno/projects/ionosphere_diffusion/configs/accelerate_config_ddp.yaml \
-  /users/framunno/projects/ionosphere_diffusion/training_pred.py \
+  --config_file ${IONO_REPO:-/path/to/ionosphere_diffusion}/configs/accelerate_config_ddp.yaml \
+  ${IONO_REPO:-/path/to/ionosphere_diffusion}/training_pred.py \
   --config $CONFIG_PATH \
   --sequence-length $SEQUENCE_LENGTH \
   --predict-steps $PREDICT_STEPS \
