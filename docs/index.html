@@ -53,6 +53,27 @@
     .regime-pane { display: none; }
     .regime-pane.is-shown { display: block; }
 
+    /* Simple slider (used in Results / Extended rollout) */
+    .slider { position: relative; }
+    .slider-track { position: relative; min-height: 120px; }
+    .slider-slide { display: none; }
+    .slider-slide.is-active { display: block; }
+    .slider-arrow {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      background: rgba(255,255,255,0.9); border: 1px solid #e3e3e3; border-radius: 50%;
+      width: 2.4rem; height: 2.4rem; cursor: pointer; font-size: 1rem; color: #363636;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+    }
+    .slider-arrow:hover { background: #fff; }
+    .slider-prev { left: 0.6rem; }
+    .slider-next { right: 0.6rem; }
+    .slider-dots { text-align: center; margin-top: 0.75rem; }
+    .slider-dot {
+      display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+      background: #ddd; margin: 0 4px; cursor: pointer;
+    }
+    .slider-dot.is-active { background: #363636; }
+
     /* Lightbox */
     #lightbox {
       display: none; position: fixed; inset: 0; z-index: 200;
@@ -185,12 +206,20 @@
     </div>
 
     <div class="regime-pane" data-regime-pane="ark50">
-      <div class="storm-grid mb-3">
-        <div class="result-figure">
-          <img class="zoomable" src="assets/img/ark50_bar_metrics_overall.png" alt="AR50 metrics overall comparison">
+      <div class="slider mb-3" id="ark50-slider">
+        <div class="slider-track">
+          <div class="slider-slide is-active">
+            <img class="zoomable" src="assets/img/ark50_bar_metrics_overall.png" alt="AR50 metrics overall comparison">
+          </div>
+          <div class="slider-slide">
+            <img class="zoomable" src="assets/img/ark50_degradation_by_ar_step.png" alt="AR50 degradation by autoregressive step">
+          </div>
         </div>
-        <div class="result-figure">
-          <img class="zoomable" src="assets/img/ark50_degradation_by_ar_step.png" alt="AR50 degradation by autoregressive step">
+        <button class="slider-arrow slider-prev" aria-label="Previous slide">&#10094;</button>
+        <button class="slider-arrow slider-next" aria-label="Next slide">&#10095;</button>
+        <div class="slider-dots">
+          <span class="slider-dot is-active" data-idx="0"></span>
+          <span class="slider-dot" data-idx="1"></span>
         </div>
       </div>
       <p class="result-caption has-text-centered">As the rollout lengthens, U-Net's regression-to-the-mean bias compounds while the diffusion models keep regenerating plausible high-frequency detail &mdash; the crossover in relative advantage central to this paper's findings.</p>
@@ -285,6 +314,21 @@
       });
       document.getElementById('model-caption').textContent = modelCaptions[model];
     });
+  });
+
+  // Generic slider (prev/next arrows + dots), works for any .slider container
+  document.querySelectorAll('.slider').forEach(slider => {
+    const slides = slider.querySelectorAll('.slider-slide');
+    const dots = slider.querySelectorAll('.slider-dot');
+    let current = 0;
+    function show(idx) {
+      current = (idx + slides.length) % slides.length;
+      slides.forEach((s, i) => s.classList.toggle('is-active', i === current));
+      dots.forEach((d, i) => d.classList.toggle('is-active', i === current));
+    }
+    slider.querySelector('.slider-prev')?.addEventListener('click', () => show(current - 1));
+    slider.querySelector('.slider-next')?.addEventListener('click', () => show(current + 1));
+    dots.forEach(dot => dot.addEventListener('click', () => show(parseInt(dot.dataset.idx, 10))));
   });
 
   // Results: single-pass / AR50 toggle
