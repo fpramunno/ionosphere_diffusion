@@ -71,30 +71,46 @@ ACE solar wind/IMF measurements for the March 2015 case study (NASA), as
 described in the paper's Data section. Both DSCOVR and ACE sit at the L1
 Lagrangian point.
 
-`download_data.py` fetches everything from Google Drive in two groups:
+`download_data.py` fetches everything currently on Google Drive in two
+groups — note this is **already-combined, multi-year data**, not raw
+per-year downloads:
 - `MAP_ARCHIVE_LINKS` → `IONO_DATA_ROOT/ionosphere_data` (map `.zip` archives)
-- `L1_DATA_LINKS` → `./data/ionosphere` (L1/orbit CSVs, including the
-  already-paired, ready-to-train `l1_to_map_matched_*.csv`)
+- `L1_DATA_LINKS` → `./data/ionosphere`: DSCOVR orbit (2020-2025, already
+  combined), DSCOVR solar wind/IMF (2020-2025, already combined **and**
+  interpolated), ACE 2015 (single file), and the already-paired,
+  already-deduplicated matched CSV ready for `--csv-path`.
 
 gdown preserves each file's original Drive filename — check the downloaded
 filenames against what `merge_l1_to_maps_even_minutes.py` and
 `merge_l1_to_maps_2015_event.py` expect (their `SOLAR_WIND_FILE`/
 `DSCOVR_FILE`/`L1_FILE`/`OUTPUT_FILE` constants) and rename/edit as needed.
 
-**Quick path** (just want to train/reproduce): `download_data.py` already
-includes a ready-to-use, already-paired-and-deduplicated matched CSV — unzip
-the maps (step 2 below) and point `--csv-path` at that file. No merging
-needed.
+Three levels, from least to most work — **only the first two are actually
+reproducible from what's on Drive**; `interpolate_l1_gaps.py` and
+`combine_l1_years.py` exist in the repo for methodology transparency (they
+show how the combined file was originally built from raw per-year NOAA/NASA
+downloads) but their raw per-year inputs aren't distributed here.
 
-**From-scratch path** (reproducing the pairing itself, or extending to new
-years): steps 2-8 below.
+**A. Quick path** (just want to train/reproduce the paper): unzip the maps
+(step 1 below), point `--csv-path` at the downloaded matched CSV. No merging.
+
+**B. Reproduce the pairing** (verify/inspect the L1-to-map matching itself):
+unzip the maps, then run steps 4 and 6 below directly on the downloaded
+already-combined DSCOVR/ACE files (skip steps 2-3, their inputs aren't
+available here).
+
+**C. True from-scratch** (extend to new years, or rebuild the combined files
+yourself): fetch raw per-year DSCOVR/ACE data from NOAA/NASA SPDF yourself,
+then all of steps 1-7.
 
 1. `unzip_data.py` — parallel unzip of the map archives into `IONO_MAPS_DIR`.
-2. `interpolate_l1_gaps.py` — linearly interpolate short gaps in each raw
-   per-year L1 CSV (`--help` for max-gap-duration options). Run once per year.
-3. `combine_l1_years.py` — concatenate the per-year interpolated CSVs into a
-   single multi-year file (`--inputs year1.csv year2.csv ... --output
-   combined.csv`).
+2. `interpolate_l1_gaps.py` *(level C only — needs raw per-year data not on
+   Drive)* — linearly interpolate short gaps in each raw per-year L1 CSV
+   (`--help` for max-gap-duration options). Run once per year.
+3. `combine_l1_years.py` *(level C only)* — concatenate the per-year
+   interpolated CSVs into a single multi-year file (`--inputs year1.csv
+   year2.csv ... --output combined.csv`) — this is what produces the
+   already-combined file levels A/B download directly.
 4. `merge_l1_to_maps_even_minutes.py` — the actual pairing step: for each L1
    measurement (~1 min cadence), computes when it physically arrives at Earth
    (propagation delay, using the real DSCOVR/ACE position — not a fixed L1
@@ -111,7 +127,7 @@ years): steps 2-8 below.
 6. `deduplicate_matched_pairs.py` — collapses step 4/5's output to one row
    per unique map (keeps the closest-matching L1 measurement per map). This
    deduplicated CSV is what every training/generation script consumes via
-   `--csv-path` — this is the file the quick path above downloads directly.
+   `--csv-path` — this is the file level A downloads directly.
 7. `precompute_dynamics_scores.py` — optional but recommended before
    generation: caches a per-sequence "dynamics score" (mean frame-to-frame
    change) so `--dynamics-filter`/`--activity-filter` don't recompute it from
