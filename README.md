@@ -85,33 +85,15 @@ filenames against what `merge_l1_to_maps_even_minutes.py` and
 `merge_l1_to_maps_2015_event.py` expect (their `SOLAR_WIND_FILE`/
 `DSCOVR_FILE`/`L1_FILE`/`OUTPUT_FILE` constants) and rename/edit as needed.
 
-Three levels, from least to most work — **only the first two are actually
-reproducible from what's on Drive**; `interpolate_l1_gaps.py` and
-`combine_l1_years.py` exist in the repo for methodology transparency (they
-show how the combined file was originally built from raw per-year NOAA/NASA
-downloads) but their raw per-year inputs aren't distributed here.
-
 **A. Quick path** (just want to train/reproduce the paper): unzip the maps
 (step 1 below), point `--csv-path` at the downloaded matched CSV. No merging.
 
 **B. Reproduce the pairing** (verify/inspect the L1-to-map matching itself):
-unzip the maps, then run steps 4 and 6 below directly on the downloaded
-already-combined DSCOVR/ACE files (skip steps 2-3, their inputs aren't
-available here).
-
-**C. True from-scratch** (extend to new years, or rebuild the combined files
-yourself): fetch raw per-year DSCOVR/ACE data from NOAA/NASA SPDF yourself,
-then all of steps 1-7.
+unzip the maps, then run steps 2 and 4 below directly on the downloaded
+already-combined DSCOVR/ACE files.
 
 1. `unzip_data.py` — parallel unzip of the map archives into `IONO_MAPS_DIR`.
-2. `interpolate_l1_gaps.py` *(level C only — needs raw per-year data not on
-   Drive)* — linearly interpolate short gaps in each raw per-year L1 CSV
-   (`--help` for max-gap-duration options). Run once per year.
-3. `combine_l1_years.py` *(level C only)* — concatenate the per-year
-   interpolated CSVs into a single multi-year file (`--inputs year1.csv
-   year2.csv ... --output combined.csv`) — this is what produces the
-   already-combined file levels A/B download directly.
-4. `merge_l1_to_maps_even_minutes.py` — the actual pairing step: for each L1
+2. `merge_l1_to_maps_even_minutes.py` — the actual pairing step: for each L1
    measurement (~1 min cadence), computes when it physically arrives at Earth
    (propagation delay, using the real DSCOVR/ACE position — not a fixed L1
    distance) and matches it to the nearest ionosphere map (~2 min cadence) in
@@ -119,16 +101,16 @@ then all of steps 1-7.
    the top of the script to point at your paths. Because maps are coarser
    than L1, several L1 rows legitimately match the same map, so the raw
    output has duplicate map filenames.
-5. `merge_l1_to_maps_2015_event.py` — same pairing logic, restricted to the
+3. `merge_l1_to_maps_2015_event.py` — same pairing logic, restricted to the
    March 2015 St. Patrick's Day storm window used for the out-of-distribution
    case study (edit `L1_FILE`/`OUTPUT_FILE` at the top). Uses ACE, whose
    position is already a column in the raw file (no separate orbit file
    needed for this one).
-6. `deduplicate_matched_pairs.py` — collapses step 4/5's output to one row
+4. `deduplicate_matched_pairs.py` — collapses step 2/3's output to one row
    per unique map (keeps the closest-matching L1 measurement per map). This
    deduplicated CSV is what every training/generation script consumes via
    `--csv-path` — this is the file level A downloads directly.
-7. `precompute_dynamics_scores.py` — optional but recommended before
+5. `precompute_dynamics_scores.py` — optional but recommended before
    generation: caches a per-sequence "dynamics score" (mean frame-to-frame
    change) so `--dynamics-filter`/`--activity-filter` don't recompute it from
    scratch at dataset init.
