@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polar Cap Potential Patterns Forecasting with Deep Learning</title>
+  <meta name="description" content="Diffusion-based deep learning forecasts of Southern Hemisphere ionospheric convection from L1 solar wind data.">
+
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bulma/0.9.4/css/bulma.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.1/css/all.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;500;700&display=swap">
+
+  <style>
+    body { font-family: 'Noto Sans', sans-serif; }
+    .title, .subtitle, .navbar-item, h1, h2, h3 { font-family: 'Google Sans', sans-serif; }
+    .hero-body { padding-top: 3rem; padding-bottom: 2rem; }
+    .publication-links .button { margin: 0.25rem; }
+    .result-grid img, .result-figure img { width: 100%; height: auto; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+    .result-caption { font-size: 0.9rem; color: #555; margin-top: 0.5rem; }
+    section.section { padding-top: 2.5rem; padding-bottom: 2.5rem; }
+    .storm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+    video { width: 100%; border-radius: 6px; box-shadow: 0 2px 14px rgba(0,0,0,0.15); }
+    .bibtex-box { background: #f5f5f5; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.85rem; }
+    footer.footer { padding: 2rem 1.5rem; }
+  </style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop has-text-centered">
+      <h1 class="title is-2">Polar Cap Potential Patterns Forecasting in the Southern Hemisphere with Deep Learning Techniques</h1>
+      <div class="is-size-5 publication-authors">
+        <span>F. P. Ramunno<sup>1</sup></span>,
+        <span>S. Mestici<sup>2</sup></span>,
+        <span>I. Coco<sup>3</sup></span>,
+        <span>M.-T. Walach<sup>4</sup></span>
+      </div>
+      <div class="is-size-6 has-text-grey">
+        <span><sup>1</sup>University of Applied Sciences and Arts Northwestern Switzerland</span> &middot;
+        <span><sup>2</sup>Università Roma "La Sapienza"</span> &middot;
+        <span><sup>3</sup>Istituto Nazionale di Geofisica e Vulcanologia</span> &middot;
+        <span><sup>4</sup>School of Physics and Astronomy, Lancaster University</span>
+      </div>
+
+      <div class="publication-links mt-4">
+        <a class="button is-rounded is-dark" href="#">
+          <span class="icon"><i class="fas fa-file-pdf"></i></span><span>Paper</span>
+        </a>
+        <a class="button is-rounded is-dark" href="https://github.com/fpramunno/ionosphere_diffusion">
+          <span class="icon"><i class="fab fa-github"></i></span><span>Code</span>
+        </a>
+        <a class="button is-rounded is-dark" href="#bibtex">
+          <span class="icon"><i class="fas fa-quote-right"></i></span><span>BibTeX</span>
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <video autoplay loop muted playsinline>
+      <source src="assets/video/storm2015_classic_rollout.mp4" type="video/mp4">
+    </video>
+    <p class="result-caption has-text-centered">CLASSIC's forecast of the March 2015 St. Patrick's Day storm — an intense, out-of-distribution event from a different solar cycle, entirely unseen during training.</p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-4">Abstract</h2>
+    <div class="content">
+      <p>
+        Space weather disturbances driven by the solar wind can degrade satellite navigation, disrupt radio
+        communications, and threaten power infrastructure, making accurate forecasting of the high-latitude
+        ionosphere's response a critical operational need. Existing approaches, empirical climatological models
+        and physics-based magnetohydrodynamic simulations, either smooth out the ionosphere's time-dependent,
+        non-linear response or are too computationally expensive for real-time use, while prior machine learning
+        efforts have mostly targeted scalar indices rather than the full spatial structure of ionospheric
+        convection. Here we train and compare three deep learning architectures, a probabilistic diffusion model
+        conditioned on multi-variate solar wind and interplanetary magnetic field measurements at the L1
+        Lagrangian point, an unconditioned diffusion ablation, and a deterministic U-Net baseline, to forecast
+        Southern Hemisphere high-latitude electric potential maps derived from SuperDARN radar observations.
+        Using five years (2020&ndash;2025) of SuperDARN data synchronised with DSCOVR L1 measurements, we evaluate
+        the models under a single-pass regime, an extended autoregressive rollout of up to 350 frames, and an
+        out-of-distribution case study on the intense March 2015 St. Patrick's Day storm, unseen during training.
+        We find that the relative advantage of the deterministic and probabilistic approaches is not fixed: the
+        deterministic model is competitive over short horizons and calm conditions, while the diffusion model's
+        advantage grows and eventually dominates as the forecast horizon lengthens and the event becomes more
+        dynamic, evidence that probabilistic, sample-based generative models are the more promising direction for
+        operational, long-horizon space weather forecasting.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-4">Method</h2>
+    <div class="result-figure mb-5">
+      <img src="assets/img/methodology_training_strategy.png" alt="Training strategy: L1 solar wind/IMF drivers and observed ionospheric potential maps condition the model, which forecasts the following frames.">
+      <p class="result-caption has-text-centered">Observed L1 drivers (SWV, B<sub>x</sub>, B<sub>y</sub>, B<sub>z</sub>) and past potential maps condition the model to forecast the following frames.</p>
+    </div>
+    <div class="result-figure">
+      <img src="assets/img/methodology_ar_schematic.png" alt="Autoregressive rollout schematic">
+      <p class="result-caption has-text-centered">Extended-horizon evaluation slides the conditioning window forward autoregressively, feeding predicted frames back as input for up to 350 steps.</p>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-4">Results</h2>
+
+    <h3 class="title is-5">Single-pass evaluation</h3>
+    <div class="result-figure mb-5">
+      <img src="assets/img/singlepass_bar_metrics_overall.png" alt="Single-pass metrics overall comparison">
+      <p class="result-caption has-text-centered">Under the training-matched single-pass regime, the deterministic U-Net is competitive with, and at times preferable to, the diffusion models.</p>
+    </div>
+
+    <h3 class="title is-5">Extended autoregressive rollout (K=50)</h3>
+    <div class="storm-grid mb-3">
+      <div class="result-figure">
+        <img src="assets/img/ark50_bar_metrics_overall.png" alt="AR50 metrics overall comparison">
+      </div>
+      <div class="result-figure">
+        <img src="assets/img/ark50_degradation_by_ar_step.png" alt="AR50 degradation by autoregressive step">
+      </div>
+    </div>
+    <p class="result-caption has-text-centered">As the rollout lengthens, U-Net's regression-to-the-mean bias compounds while the diffusion models keep regenerating plausible high-frequency detail — the crossover in relative advantage central to this paper's findings.</p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-4">Out-of-distribution case study: the March 2015 storm</h2>
+    <p class="content">
+      A single intense storm from Solar Cycle 24, observed by ACE rather than DSCOVR, evaluated over the
+      longest tested horizon &mdash; deliberately extreme along multiple axes relative to the training distribution.
+    </p>
+    <div class="storm-grid mb-4">
+      <div class="result-figure">
+        <img src="assets/img/storm2015_model_classic.png" alt="CLASSIC model forecast of the 2015 storm">
+        <p class="result-caption has-text-centered">CLASSIC</p>
+      </div>
+      <div class="result-figure">
+        <img src="assets/img/storm2015_model_nocond.png" alt="NOCOND model forecast of the 2015 storm">
+        <p class="result-caption has-text-centered">NOCOND &mdash; blind to the L1 driver, stays pinned at pre-storm amplitude</p>
+      </div>
+      <div class="result-figure">
+        <img src="assets/img/storm2015_model_unet.png" alt="U-Net model forecast of the 2015 storm">
+        <p class="result-caption has-text-centered">U-Net &mdash; reacts at onset, then collapses to an over-smoothed trajectory</p>
+      </div>
+    </div>
+    <div class="result-figure mb-5">
+      <img src="assets/img/storm2015_frames_grid_peaks.png" alt="Storm 2015 frames at peak intensity">
+      <p class="result-caption has-text-centered">Predicted vs. ground-truth potential maps at the storm's peak intensity.</p>
+    </div>
+    <div class="result-figure">
+      <img src="assets/img/storm2015_bar_metrics_overall.png" alt="Storm 2015 overall metrics">
+    </div>
+  </div>
+</section>
+
+<section class="section" id="bibtex">
+  <div class="container is-max-desktop">
+    <h2 class="title is-4">BibTeX</h2>
+    <pre class="bibtex-box"><code>@article{ramunno2026ionosphere,
+  title   = {Polar Cap Potential Patterns Forecasting in the Southern Hemisphere with Deep Learning Techniques},
+  author  = {Ramunno, F. P. and Mestici, S. and Coco, I. and Walach, M.-T.},
+  journal = {Space Weather},
+  year    = {2026},
+  note    = {Preprint}
+}</code></pre>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container is-max-desktop has-text-centered">
+    <p class="is-size-7 has-text-grey">
+      Page template adapted from the academic project page convention used across the diffusion/NeRF literature.
+      Code and data: <a href="https://github.com/fpramunno/ionosphere_diffusion">github.com/fpramunno/ionosphere_diffusion</a>.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
