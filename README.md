@@ -65,19 +65,34 @@ must be edited to your own account/partition.
 
 ### 1. Data preparation and L1-to-map pairing
 
-1. `download_data.py` — fetch the raw ionosphere map archives.
-2. `unzip_data.py` — parallel unzip into `IONO_MAPS_DIR`.
-3. `interpolate_l1_gaps.py` — linearly interpolate short gaps in the raw L1
-   solar wind / IMF CSV (`--help` for max-gap-duration options).
-4. `merge_l1_to_maps_even_minutes.py` — the actual pairing step: for each L1
-   measurement, computes when it physically arrives at Earth (propagation
-   delay), and matches it to the nearest ionosphere map in time. Produces the
-   `l1_to_map_matched_*.csv` consumed by every training/generation script via
-   `--csv-path`.
-5. `merge_l1_to_maps_2015_event.py` — same pairing logic, restricted to the
+1. `download_data.py` — fetch the raw data from Google Drive: ionosphere map
+   archives (`.zip`) and the per-year raw L1 solar wind / IMF CSVs. The
+   script downloads everything into `IONO_DATA_ROOT/ionosphere_data`; sort
+   the map archives from the L1 CSVs by hand afterward (Drive filenames are
+   preserved on download) — the map `.zip` files stay there for step 2, and
+   the L1 CSVs should be moved to wherever you pass as `--data-path`/`input`
+   in steps 3-5 below (the original pipeline used `data/ionosphere/`).
+2. `unzip_data.py` — parallel unzip of the map archives into `IONO_MAPS_DIR`.
+3. `interpolate_l1_gaps.py` — linearly interpolate short gaps in each raw
+   per-year L1 CSV (`--help` for max-gap-duration options). Run once per year.
+4. `combine_l1_years.py` — concatenate the per-year interpolated CSVs into a
+   single multi-year file (`--inputs year1.csv year2.csv ... --output
+   combined.csv`).
+5. `merge_l1_to_maps_even_minutes.py` — the actual pairing step: for each L1
+   measurement (~1 min cadence), computes when it physically arrives at Earth
+   (propagation delay) and matches it to the nearest ionosphere map (~2 min
+   cadence) in time. Edit the `SOLAR_WIND_FILE`/`DSCOVR_FILE`/`OUTPUT_FILE`
+   constants at the top of the script to point at your paths. Because maps
+   are coarser than L1, several L1 rows legitimately match the same map, so
+   the raw output has duplicate map filenames.
+6. `merge_l1_to_maps_2015_event.py` — same pairing logic, restricted to the
    March 2015 St. Patrick's Day storm window used for the out-of-distribution
-   case study.
-6. `precompute_dynamics_scores.py` — optional but recommended before
+   case study (edit `L1_FILE`/`OUTPUT_FILE` at the top).
+7. `deduplicate_matched_pairs.py` — collapses step 5/6's output to one row
+   per unique map (keeps the closest-matching L1 measurement per map). This
+   deduplicated CSV is what every training/generation script consumes via
+   `--csv-path`.
+8. `precompute_dynamics_scores.py` — optional but recommended before
    generation: caches a per-sequence "dynamics score" (mean frame-to-frame
    change) so `--dynamics-filter`/`--activity-filter` don't recompute it from
    scratch at dataset init.

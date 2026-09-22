@@ -1,9 +1,8 @@
 """
-Fast parallel unzip of ionosphere data + copy of 2024 files.
+Fast parallel unzip of ionosphere map archives.
 Uses multiprocessing so each task runs in its own process with a live progress bar.
 """
 
-import shutil
 import subprocess
 from multiprocessing import Pool
 from pathlib import Path
@@ -11,7 +10,6 @@ from pathlib import Path
 from tqdm import tqdm
 
 ZIPS_DIR = Path("./data_root/ionosphere_data")
-SOURCE_2024 = Path("./data/ionosphere/ionosphere_data/pickled_maps")
 OUTPUT_DIR = Path("./data_root/ionosphere_data/all_maps")
 
 
@@ -40,34 +38,18 @@ def unzip_file(args):
     return zip_path.stem, total
 
 
-def copy_2024(args):
-    source, output_dir, position = args
-    source, output_dir = Path(source), Path(output_dir)
-    files = sorted(source.glob("map_2024_*"))
-
-    with tqdm(total=len(files), desc="2024 copy", position=position, leave=True, unit="file") as pbar:
-        for f in files:
-            shutil.copy2(f, output_dir / f.name)
-            pbar.update(1)
-    return len(files)
-
-
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     zip_files = sorted(ZIPS_DIR.glob("*.zip"))
-    print(f"Found {len(zip_files)} zip files + 2024 directory to copy")
+    print(f"Found {len(zip_files)} zip files")
     print(f"Output: {OUTPUT_DIR}\n")
 
     unzip_args = [(str(z), str(OUTPUT_DIR), i) for i, z in enumerate(zip_files)]
-    copy_args = (str(SOURCE_2024), str(OUTPUT_DIR), len(zip_files))
 
-    with Pool(processes=len(zip_files) + 1) as pool:
+    with Pool(processes=max(len(zip_files), 1)) as pool:
         unzip_results = [pool.apply_async(unzip_file, (a,)) for a in unzip_args]
-        copy_result = pool.apply_async(copy_2024, (copy_args,))
-
         for r in unzip_results:
             r.get()
-        copy_result.get()
 
     print(f"\nDone. Total .npy files: {len(list(OUTPUT_DIR.glob('*.npy')))}")
