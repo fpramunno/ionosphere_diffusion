@@ -12,36 +12,94 @@
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;500;700&display=swap">
 
   <style>
-    body { font-family: 'Noto Sans', sans-serif; }
+    html { scroll-behavior: smooth; }
+    body { font-family: 'Noto Sans', sans-serif; background: #f0f2f5; }
     .title, .subtitle, .navbar-item, h1, h2, h3 { font-family: 'Google Sans', sans-serif; }
     .hero-body { padding-top: 3rem; padding-bottom: 2rem; }
     .publication-links .button { margin: 0.25rem; }
-    .result-grid img, .result-figure img { width: 100%; height: auto; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
-    .result-caption { font-size: 0.9rem; color: #555; margin-top: 0.5rem; }
-    section.section { padding-top: 2.5rem; padding-bottom: 2.5rem; }
-    .storm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+
+    /* Sticky poster nav */
+    .poster-nav {
+      position: sticky; top: 0; z-index: 50;
+      background: #ffffffee; backdrop-filter: blur(6px);
+      border-bottom: 1px solid #e3e3e3;
+    }
+    .poster-nav .tabs { margin-bottom: 0; }
+
+    /* Poster panels */
+    .panel-section { padding: 2.5rem 1.5rem; scroll-margin-top: 3.2rem; }
+    .panel-card {
+      background: #fff; border-radius: 10px; padding: 2rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 6px 20px rgba(0,0,0,0.05);
+      max-width: 960px; margin: 0 auto;
+    }
+
+    .result-figure img, .zoomable { cursor: zoom-in; width: 100%; height: auto; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); transition: transform .15s; }
+    .result-figure img:hover, .zoomable:hover { transform: scale(1.01); }
+    .result-caption { font-size: 0.88rem; color: #555; margin-top: 0.5rem; }
+    .storm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+
     video { width: 100%; border-radius: 6px; box-shadow: 0 2px 14px rgba(0,0,0,0.15); }
     .bibtex-box { background: #f5f5f5; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.85rem; }
     footer.footer { padding: 2rem 1.5rem; }
+
+    /* Model comparator (interactive toggle) */
+    .comparator-toggle .button.is-active { background: #363636; color: #fff; }
+    .comparator-figure { position: relative; }
+    .comparator-figure img { display: none; }
+    .comparator-figure img.is-shown { display: block; }
+
+    /* Regime toggle for Results */
+    .regime-pane { display: none; }
+    .regime-pane.is-shown { display: block; }
+
+    /* Lightbox */
+    #lightbox {
+      display: none; position: fixed; inset: 0; z-index: 200;
+      background: rgba(10,10,10,0.92); align-items: center; justify-content: center;
+      cursor: zoom-out; padding: 2rem;
+    }
+    #lightbox.is-active { display: flex; }
+    #lightbox img { max-width: 95vw; max-height: 90vh; border-radius: 6px; }
   </style>
 </head>
 <body>
+
+<nav class="poster-nav">
+  <div class="container is-max-desktop">
+    <div class="tabs is-centered is-boxed">
+      <ul>
+        <li><a href="#abstract">Abstract</a></li>
+        <li><a href="#method">Method</a></li>
+        <li><a href="#results">Results</a></li>
+        <li><a href="#ood">2015 Storm Case</a></li>
+        <li><a href="#bibtex">BibTeX</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
 
 <section class="hero">
   <div class="hero-body">
     <div class="container is-max-desktop has-text-centered">
       <h1 class="title is-2">Polar Cap Potential Patterns Forecasting in the Southern Hemisphere with Deep Learning Techniques</h1>
       <div class="is-size-5 publication-authors">
-        <span>F. P. Ramunno<sup>1</sup></span>,
-        <span>S. Mestici<sup>2</sup></span>,
-        <span>I. Coco<sup>3</sup></span>,
-        <span>M.-T. Walach<sup>4</sup></span>
+        <span>F. P. Ramunno<sup>1,2</sup></span>,
+        <span>S. Mestici<sup>3</sup></span>,
+        <span>I. Coco<sup>4</sup></span>,
+        <span>M.-T. Walach<sup>5</sup></span>,
+        <span>S. Massetti<sup>6</sup></span>,
+        <span>M. F. Marcucci<sup>6</sup></span>,
+        <span>B. Panos<sup>1</sup></span>,
+        <span>A. Csillaghy<sup>1</sup></span>
       </div>
-      <div class="is-size-6 has-text-grey">
-        <span><sup>1</sup>University of Applied Sciences and Arts Northwestern Switzerland</span> &middot;
-        <span><sup>2</sup>Università Roma "La Sapienza"</span> &middot;
-        <span><sup>3</sup>Istituto Nazionale di Geofisica e Vulcanologia</span> &middot;
-        <span><sup>4</sup>School of Physics and Astronomy, Lancaster University</span>
+      <div class="is-size-7 has-text-grey mt-2">
+        <sup>1</sup>University of Applied Sciences and Arts Northwestern Switzerland &middot;
+        <sup>2</sup>Department of Computer Science, University of Geneva &middot;
+        <sup>3</sup>Università Roma "La Sapienza" &middot;
+        <sup>4</sup>Istituto Nazionale di Geofisica e Vulcanologia &middot;
+        <sup>5</sup>School of Physics and Astronomy, Lancaster University &middot;
+        <sup>6</sup>INAF &ndash; Institute for Space Astrophysics and Planetology
       </div>
 
       <div class="publication-links mt-4">
@@ -59,17 +117,15 @@
   </div>
 </section>
 
-<section class="section">
-  <div class="container is-max-desktop">
-    <video autoplay loop muted playsinline>
-      <source src="assets/video/storm2015_classic_rollout.mp4" type="video/mp4">
-    </video>
-    <p class="result-caption has-text-centered">CLASSIC's forecast of the March 2015 St. Patrick's Day storm — an intense, out-of-distribution event from a different solar cycle, entirely unseen during training.</p>
-  </div>
-</section>
+<div class="container is-max-desktop">
+  <video autoplay loop muted playsinline class="zoomable-video">
+    <source src="assets/video/storm2015_classic_rollout.mp4" type="video/mp4">
+  </video>
+  <p class="result-caption has-text-centered">CLASSIC's forecast of the March 2015 St. Patrick's Day storm — an intense, out-of-distribution event from a different solar cycle, entirely unseen during training.</p>
+</div>
 
-<section class="section">
-  <div class="container is-max-desktop">
+<section class="panel-section" id="abstract">
+  <div class="panel-card">
     <h2 class="title is-4">Abstract</h2>
     <div class="content">
       <p>
@@ -96,80 +152,92 @@
   </div>
 </section>
 
-<section class="section">
-  <div class="container is-max-desktop">
+<section class="panel-section" id="method">
+  <div class="panel-card">
     <h2 class="title is-4">Method</h2>
     <div class="result-figure mb-5">
-      <img src="assets/img/methodology_training_strategy.png" alt="Training strategy: L1 solar wind/IMF drivers and observed ionospheric potential maps condition the model, which forecasts the following frames.">
+      <img class="zoomable" src="assets/img/methodology_training_strategy.png" alt="Training strategy: L1 solar wind/IMF drivers and observed ionospheric potential maps condition the model, which forecasts the following frames.">
       <p class="result-caption has-text-centered">Observed L1 drivers (SWV, B<sub>x</sub>, B<sub>y</sub>, B<sub>z</sub>) and past potential maps condition the model to forecast the following frames.</p>
     </div>
     <div class="result-figure">
-      <img src="assets/img/methodology_ar_schematic.png" alt="Autoregressive rollout schematic">
+      <img class="zoomable" src="assets/img/methodology_ar_schematic.png" alt="Autoregressive rollout schematic">
       <p class="result-caption has-text-centered">Extended-horizon evaluation slides the conditioning window forward autoregressively, feeding predicted frames back as input for up to 350 steps.</p>
     </div>
   </div>
 </section>
 
-<section class="section">
-  <div class="container is-max-desktop">
+<section class="panel-section" id="results">
+  <div class="panel-card">
     <h2 class="title is-4">Results</h2>
 
-    <h3 class="title is-5">Single-pass evaluation</h3>
-    <div class="result-figure mb-5">
-      <img src="assets/img/singlepass_bar_metrics_overall.png" alt="Single-pass metrics overall comparison">
+    <div class="tabs is-toggle is-small comparator-toggle" id="regime-toggle">
+      <ul>
+        <li class="is-active" data-regime="singlepass"><a>Single-pass</a></li>
+        <li data-regime="ark50"><a>Extended rollout (K=50)</a></li>
+      </ul>
+    </div>
+
+    <div class="regime-pane is-shown" data-regime-pane="singlepass">
+      <div class="result-figure">
+        <img class="zoomable" src="assets/img/singlepass_bar_metrics_overall.png" alt="Single-pass metrics overall comparison">
+      </div>
       <p class="result-caption has-text-centered">Under the training-matched single-pass regime, the deterministic U-Net is competitive with, and at times preferable to, the diffusion models.</p>
     </div>
 
-    <h3 class="title is-5">Extended autoregressive rollout (K=50)</h3>
-    <div class="storm-grid mb-3">
-      <div class="result-figure">
-        <img src="assets/img/ark50_bar_metrics_overall.png" alt="AR50 metrics overall comparison">
+    <div class="regime-pane" data-regime-pane="ark50">
+      <div class="storm-grid mb-3">
+        <div class="result-figure">
+          <img class="zoomable" src="assets/img/ark50_bar_metrics_overall.png" alt="AR50 metrics overall comparison">
+        </div>
+        <div class="result-figure">
+          <img class="zoomable" src="assets/img/ark50_degradation_by_ar_step.png" alt="AR50 degradation by autoregressive step">
+        </div>
       </div>
-      <div class="result-figure">
-        <img src="assets/img/ark50_degradation_by_ar_step.png" alt="AR50 degradation by autoregressive step">
-      </div>
+      <p class="result-caption has-text-centered">As the rollout lengthens, U-Net's regression-to-the-mean bias compounds while the diffusion models keep regenerating plausible high-frequency detail &mdash; the crossover in relative advantage central to this paper's findings.</p>
     </div>
-    <p class="result-caption has-text-centered">As the rollout lengthens, U-Net's regression-to-the-mean bias compounds while the diffusion models keep regenerating plausible high-frequency detail — the crossover in relative advantage central to this paper's findings.</p>
   </div>
 </section>
 
-<section class="section">
-  <div class="container is-max-desktop">
+<section class="panel-section" id="ood">
+  <div class="panel-card">
     <h2 class="title is-4">Out-of-distribution case study: the March 2015 storm</h2>
     <p class="content">
       A single intense storm from Solar Cycle 24, observed by ACE rather than DSCOVR, evaluated over the
       longest tested horizon &mdash; deliberately extreme along multiple axes relative to the training distribution.
     </p>
-    <div class="storm-grid mb-4">
-      <div class="result-figure">
-        <img src="assets/img/storm2015_model_classic.png" alt="CLASSIC model forecast of the 2015 storm">
-        <p class="result-caption has-text-centered">CLASSIC</p>
-      </div>
-      <div class="result-figure">
-        <img src="assets/img/storm2015_model_nocond.png" alt="NOCOND model forecast of the 2015 storm">
-        <p class="result-caption has-text-centered">NOCOND &mdash; blind to the L1 driver, stays pinned at pre-storm amplitude</p>
-      </div>
-      <div class="result-figure">
-        <img src="assets/img/storm2015_model_unet.png" alt="U-Net model forecast of the 2015 storm">
-        <p class="result-caption has-text-centered">U-Net &mdash; reacts at onset, then collapses to an over-smoothed trajectory</p>
-      </div>
+
+    <div class="tabs is-toggle is-small comparator-toggle" id="model-toggle">
+      <ul>
+        <li class="is-active" data-model="classic"><a>CLASSIC</a></li>
+        <li data-model="nocond"><a>NOCOND</a></li>
+        <li data-model="unet"><a>U-Net</a></li>
+      </ul>
     </div>
-    <div class="result-figure mb-5">
-      <img src="assets/img/storm2015_frames_grid_peaks.png" alt="Storm 2015 frames at peak intensity">
+    <div class="comparator-figure mb-2">
+      <img class="is-shown zoomable" data-model-img="classic" src="assets/img/storm2015_model_classic.png" alt="CLASSIC model forecast of the 2015 storm">
+      <img class="zoomable" data-model-img="nocond" src="assets/img/storm2015_model_nocond.png" alt="NOCOND model forecast of the 2015 storm">
+      <img class="zoomable" data-model-img="unet" src="assets/img/storm2015_model_unet.png" alt="U-Net model forecast of the 2015 storm">
+    </div>
+    <p class="result-caption has-text-centered" id="model-caption">
+      CLASSIC tracks the storm's onset and amplitude across the full rollout.
+    </p>
+
+    <div class="result-figure mt-5 mb-5">
+      <img class="zoomable" src="assets/img/storm2015_frames_grid_peaks.png" alt="Storm 2015 frames at peak intensity">
       <p class="result-caption has-text-centered">Predicted vs. ground-truth potential maps at the storm's peak intensity.</p>
     </div>
     <div class="result-figure">
-      <img src="assets/img/storm2015_bar_metrics_overall.png" alt="Storm 2015 overall metrics">
+      <img class="zoomable" src="assets/img/storm2015_bar_metrics_overall.png" alt="Storm 2015 overall metrics">
     </div>
   </div>
 </section>
 
-<section class="section" id="bibtex">
-  <div class="container is-max-desktop">
+<section class="panel-section" id="bibtex">
+  <div class="panel-card">
     <h2 class="title is-4">BibTeX</h2>
     <pre class="bibtex-box"><code>@article{ramunno2026ionosphere,
   title   = {Polar Cap Potential Patterns Forecasting in the Southern Hemisphere with Deep Learning Techniques},
-  author  = {Ramunno, F. P. and Mestici, S. and Coco, I. and Walach, M.-T.},
+  author  = {Ramunno, F. P. and Mestici, S. and Coco, I. and Walach, M.-T. and Massetti, S. and Marcucci, M. F. and Panos, B. and Csillaghy, A.},
   journal = {Space Weather},
   year    = {2026},
   note    = {Preprint}
@@ -180,11 +248,58 @@
 <footer class="footer">
   <div class="container is-max-desktop has-text-centered">
     <p class="is-size-7 has-text-grey">
-      Page template adapted from the academic project page convention used across the diffusion/NeRF literature.
       Code and data: <a href="https://github.com/fpramunno/ionosphere_diffusion">github.com/fpramunno/ionosphere_diffusion</a>.
     </p>
   </div>
 </footer>
+
+<div id="lightbox"><img id="lightbox-img" src="" alt=""></div>
+
+<script>
+  // Lightbox: click any zoomable image to enlarge
+  const lightbox = document.getElementById('lightbox');
+  const lightboxImg = document.getElementById('lightbox-img');
+  document.querySelectorAll('img.zoomable').forEach(img => {
+    img.addEventListener('click', () => {
+      lightboxImg.src = img.src;
+      lightboxImg.alt = img.alt;
+      lightbox.classList.add('is-active');
+    });
+  });
+  lightbox.addEventListener('click', () => lightbox.classList.remove('is-active'));
+
+  // OOD case study: CLASSIC / NOCOND / U-Net toggle
+  const modelCaptions = {
+    classic: "CLASSIC tracks the storm's onset and amplitude across the full rollout.",
+    nocond: "NOCOND, blind to the L1 driver by construction, stays pinned at pre-storm amplitude for the entire rollout.",
+    unet: "U-Net reacts at storm onset, then its deterministic regression collapses toward an over-smoothed trajectory."
+  };
+  const modelToggle = document.getElementById('model-toggle');
+  modelToggle.querySelectorAll('li').forEach(li => {
+    li.addEventListener('click', () => {
+      modelToggle.querySelectorAll('li').forEach(x => x.classList.remove('is-active'));
+      li.classList.add('is-active');
+      const model = li.dataset.model;
+      document.querySelectorAll('[data-model-img]').forEach(img => {
+        img.classList.toggle('is-shown', img.dataset.modelImg === model);
+      });
+      document.getElementById('model-caption').textContent = modelCaptions[model];
+    });
+  });
+
+  // Results: single-pass / AR50 toggle
+  const regimeToggle = document.getElementById('regime-toggle');
+  regimeToggle.querySelectorAll('li').forEach(li => {
+    li.addEventListener('click', () => {
+      regimeToggle.querySelectorAll('li').forEach(x => x.classList.remove('is-active'));
+      li.classList.add('is-active');
+      const regime = li.dataset.regime;
+      document.querySelectorAll('[data-regime-pane]').forEach(pane => {
+        pane.classList.toggle('is-shown', pane.dataset.regimePane === regime);
+      });
+    });
+  });
+</script>
 
 </body>
 </html>
