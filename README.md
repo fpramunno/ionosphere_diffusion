@@ -6,6 +6,8 @@ Hemisphere with Deep Learning Techniques"*: a ViT-based diffusion model
 UNet baseline, forecasting high-latitude ionospheric convection from L1 solar
 wind / IMF measurements, trained on SuperDARN-derived electric potential maps.
 
+![Training strategy: L1 solar wind/IMF drivers and observed ionospheric potential maps condition the model, which forecasts the following frames](docs/media/methodology_training_strategy.png)
+
 ## Repository layout
 
 ```
