@@ -94,6 +94,7 @@
         <li><a href="#method">Method</a></li>
         <li><a href="#results">Results</a></li>
         <li><a href="#ood">2015 Storm Case</a></li>
+        <li><a href="#contributions">Contributions</a></li>
         <li><a href="#bibtex">BibTeX</a></li>
       </ul>
     </div>
@@ -257,6 +258,33 @@
     </div>
     <div class="result-figure">
       <img class="zoomable" src="assets/img/storm2015_bar_metrics_overall.png" alt="Storm 2015 overall metrics">
+    </div>
+  </div>
+</section>
+
+<section class="panel-section" id="contributions">
+  <div class="panel-card">
+    <h2 class="title is-4">Contributions &amp; Limitations</h2>
+
+    <h3 class="title is-6">What's new here</h3>
+    <div class="content">
+      <ul>
+        <li><strong>Open, paired dataset</strong>: five years (2020&ndash;2025) of Southern Hemisphere SuperDARN electric potential maps, already time-matched to DSCOVR L1 solar wind/IMF measurements and deduplicated (one L1 sample per map), released with the code &mdash; no need to rebuild the L1-to-map pairing pipeline from scratch. See the <a href="https://github.com/fpramunno/ionosphere_diffusion">code repository</a>.</li>
+        <li><strong>Probabilistic method</strong>: a diffusion-based generative model conditioned on multi-variate L1 solar wind/IMF drivers, producing an ensemble of physically plausible convection maps per forecast &mdash; unlike prior SuperDARN deep learning models, which are all deterministic point estimators with no notion of forecast uncertainty.</li>
+        <li><strong>Evaluation pushed to the limit on two axes</strong>: (i) horizon &mdash; from a single-pass regime matching the training setup to an extended autoregressive rollout of up to 350 predicted frames; (ii) distribution shift &mdash; a fully out-of-distribution case study on the intense March 2015 storm, which is out-of-distribution in <em>two independent ways</em> at once: it belongs to Solar Cycle 24 rather than the Solar Cycle 25 interval the models were trained on, <strong>and</strong> its L1 driver comes from ACE rather than DSCOVR, the instrument used throughout training &mdash; so the model must generalise across both a different storm regime and a different measuring instrument simultaneously.</li>
+        <li><strong>Multi-metric evaluation</strong> (SSIM, NRMSE, a power-spectrum-based metric, and LPIPS) designed to expose, rather than be misled by, SSIM's known bias toward smoothed, deterministic outputs.</li>
+        <li>Conditioning restricted throughout to genuinely upstream L1 measurements, never to indices derived from the ionospheric/auroral response itself &mdash; preserving the task's actual forecast character rather than reducing it to a same-time regression between correlated observables.</li>
+      </ul>
+    </div>
+
+    <h3 class="title is-6">Limitations &amp; future work</h3>
+    <div class="content">
+      <ul>
+        <li>The model forecasts the ionosphere's response <em>given</em> an observed L1 solar wind/IMF driver &mdash; it does not forecast the driver itself. Every horizon reported here is still conditioned on the true, measured L1 timeseries, so this is not yet a fully autonomous forecast.</li>
+        <li>Closing that gap needs an upstream model that predicts L1 conditions directly from solar-disk observations, removing the dependence on a real-time L1 measurement and enabling a genuine end-to-end Sun-to-Earth pipeline. That is the natural next step, not something attempted here.</li>
+        <li>The out-of-distribution evaluation is a single intense storm; while deliberately chosen to be extreme along multiple axes (different solar cycle, different L1 instrument, longest tested horizon), one event cannot establish how these findings generalise across the full space of possible storms.</li>
+        <li>This study covers the Southern Hemisphere only; extending to the Northern Hemisphere would further test how broadly the results hold.</li>
+      </ul>
     </div>
   </div>
 </section>
