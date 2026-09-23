@@ -331,7 +331,7 @@ class IonoDataset(Dataset): # type: ignore
             else:
                 # Use original absolute max normalization
                 data_tensor = torch.clamp(data_tensor, -80000, 80000)
-                data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  # normalize to [0, 1]
+                data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1  # normalize to [-1, 1]
 
         condition_tensor = torch.tensor([data[1], data[2], data[3], data[4]], dtype=torch.float32)
 
@@ -422,7 +422,7 @@ def get_data_objects(
     # sampler
     if distributed:
         sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, seed=0
+            dataset, num_replicas=world_size, rank=rank, seed=0, drop_last=True
         )
     else:
         sampler = RandomSamplerSeed(dataset)
@@ -546,8 +546,10 @@ class IonoSequenceDataset(Dataset):
         per_file_stats_path=None,  # Path to per-file normalization stats JSON
         only_complete_sequences=False,  # Only use sequences with no missing frames
         preprocess_config=None,  # Preprocessing config for ionosphere_preprocess normalization
-        seed=42
+        seed=42,
+        maps_dir=None,  # Directory containing the .npy map files; falls back to IONO_MAPS_DIR env var
     ):
+        self.maps_dir = maps_dir or os.environ.get('IONO_MAPS_DIR', './data/all_maps')
         self.csv_path = csv_path
         self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
@@ -628,7 +630,7 @@ class IonoSequenceDataset(Dataset):
             self.cond_max = df_cond_clean.max().values.astype(np.float32)  # max ignores NaN
         df['timestamp'] = df['filename'].apply(extract_timestamp)
         df = df.dropna(subset=['timestamp'])
-        df = df.sort_values('timestamp').reset_index(drop=True)
+        df = df.drop_duplicates(subset='filename').sort_values('timestamp').reset_index(drop=True)
         self.all_files = df['filename'].tolist()
         self.all_timestamps = df['timestamp'].tolist()
 
@@ -647,21 +649,50 @@ class IonoSequenceDataset(Dataset):
             else:
                 i += 1  # Try next window
 
-        # Split sequences by month (based on center timestamp)
-        train_seqs, val_seqs, test_seqs = [], [], []
+        # Chronological split with 15-day buffer zones between adjacent regions
+        TRAIN_REGIONS = [
+            (pd.Timestamp('2021-01-16'), pd.Timestamp('2024-09-23')),
+            (pd.Timestamp('2024-11-08'), pd.Timestamp('2024-12-31')),
+            (pd.Timestamp('2025-08-01'), pd.Timestamp('2025-09-30')),
+        ]
+        VAL_REGIONS = [
+            (pd.Timestamp('2020-01-01'), pd.Timestamp('2020-12-16')),
+            (pd.Timestamp('2024-10-01'), pd.Timestamp('2024-10-31')),
+            (pd.Timestamp('2025-01-16'), pd.Timestamp('2025-07-16')),
+            (pd.Timestamp('2025-10-16'), pd.Timestamp('2025-12-31')),
+        ]
+        EVAL_REGIONS = [
+            (pd.Timestamp('2015-01-01'), pd.Timestamp('2015-12-31')),
+        ]
+
+        def _get_split(ts):
+            for start, end in TRAIN_REGIONS:
+                if start <= ts <= end:
+                    return 'train'
+            for start, end in VAL_REGIONS:
+                if start <= ts <= end:
+                    return 'valid'
+            for start, end in EVAL_REGIONS:
+                if start <= ts <= end:
+                    return 'eval'
+            return 'buffer'
+
+        train_seqs, val_seqs, eval_seqs = [], [], []
         for center_idx in self.sequences:
-            month = self.all_timestamps[center_idx].month
-            if 1 <= month <= 8:
+            label = _get_split(self.all_timestamps[center_idx])
+            if label == 'train':
                 train_seqs.append(center_idx)
-            elif 9 <= month <= 10:
+            elif label == 'valid':
                 val_seqs.append(center_idx)
-            elif 11 <= month <= 12:
-                test_seqs.append(center_idx)
+            elif label == 'eval':
+                eval_seqs.append(center_idx)
+            # buffer sequences are discarded
 
         split_seqs = {
             'train': train_seqs,
             'valid': val_seqs,
-            'test': test_seqs,
+            'test':  val_seqs,  # no separate test set
+            'eval':  eval_seqs,  # isolated evaluation periods (e.g. 2015 storm)
         }[self.split]
         self.sequences = split_seqs
 
@@ -699,7 +730,7 @@ class IonoSequenceDataset(Dataset):
                     file_idx = start_idx + i
                     if 0 <= file_idx < len(self.all_files):
                         file_path = self.all_files[file_idx]
-                        data = np.load('/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/' + file_path, allow_pickle=True)
+                        data = np.load(os.path.join(self.maps_dir, file_path), allow_pickle=True)
                         sample_data.append(data[0])
             except Exception as e:
                 print(f"Warning: Could not load sequence {seq_idx}: {e}")
@@ -816,7 +847,7 @@ class IonoSequenceDataset(Dataset):
             if frame_exists:
                 # Load the actual frame
                 file_path = self.all_files[file_idx]
-                data = np.load('/users/framunno/data/ionosphere/ionosphere_data/pickled_maps/' + file_path, allow_pickle=True)
+                data = np.load(os.path.join(self.maps_dir, file_path), allow_pickle=True)
 
                 # Apply Cartesian transformation if enabled
                 data_map = data[0].astype(np.float32)
@@ -850,7 +881,7 @@ class IonoSequenceDataset(Dataset):
                         # data_tensor = torch.clamp(data_tensor, -55000, 55000) / 55000.0
 
                         data_tensor = torch.clamp(data_tensor, -80000, 80000)
-                        data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  # normalize to [0, 1]
+                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1  # normalize to [-1, 1]
 
                 if self.use_l1_conditions:
                     # Use cached conditions dictionary for O(1) lookup
@@ -967,7 +998,7 @@ def get_sequence_data_objects(
     )
     if distributed:
         sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, seed=0
+            dataset, num_replicas=world_size, rank=rank, seed=0, drop_last=True
         )
     else:
         sampler = RandomSamplerSeed(dataset)
@@ -1032,9 +1063,14 @@ class IonoSequenceIterableDataset(IterableDataset):
         activity_filter=None,  # NEW: 'high', 'low', 'moderate', or None
         epsilon_high_quantile=0.75,  # NEW: threshold for high activity (75th percentile)
         epsilon_low_quantile=0.25,   # NEW: threshold for low activity (25th percentile)
+        dynamics_filter_quantile=None,  # e.g. 0.75 keeps top 25% most dynamic sequences
+        dynamics_filter_mode='high',    # 'high': keep top (1-Q)%; 'low': keep bottom Q%
+        dynamics_cache_path=None,       # path to pre-computed scores JSON (speeds up init)
+        maps_dir=None,  # Directory containing the .npy map files; falls back to IONO_MAPS_DIR env var
     ):
         super().__init__()
 
+        self.maps_dir = maps_dir or os.environ.get('IONO_MAPS_DIR', './data/all_maps')
         self.csv_path = csv_path
         self.transform_cond_csv = transform_cond_csv
         self.sequence_length = sequence_length
@@ -1063,6 +1099,9 @@ class IonoSequenceIterableDataset(IterableDataset):
         self.activity_filter = activity_filter
         self.epsilon_high_quantile = epsilon_high_quantile
         self.epsilon_low_quantile = epsilon_low_quantile
+        self.dynamics_filter_quantile = dynamics_filter_quantile
+        self.dynamics_filter_mode = dynamics_filter_mode
+        self.dynamics_cache_path = dynamics_cache_path
 
         # Load global stats if provided
         self.global_mean = None
@@ -1111,10 +1150,11 @@ class IonoSequenceIterableDataset(IterableDataset):
             self.cond_min = df_cond_clean.min().values.astype(np.float32)
             self.cond_max = df_cond_clean.max().values.astype(np.float32)
 
-        # Build file and timestamp lists
+        # Build file and timestamp lists — deduplicate by map filename so each
+        # ionosphere map appears exactly once in the sequence index
         df['timestamp'] = df['filename'].apply(extract_timestamp)
         df = df.dropna(subset=['timestamp'])
-        df = df.sort_values('timestamp').reset_index(drop=True)
+        df = df.drop_duplicates(subset='filename').sort_values('timestamp').reset_index(drop=True)
         self.all_files = df['filename'].tolist()
         self.all_timestamps = df['timestamp'].tolist()
 
@@ -1130,21 +1170,64 @@ class IonoSequenceIterableDataset(IterableDataset):
             else:
                 i += 1
 
-        # Split by month
-        train_seqs, val_seqs, test_seqs = [], [], []
-        for center_idx in self.sequences:
-            month = self.all_timestamps[center_idx].month
-            if 1 <= month <= 8:
-                train_seqs.append(center_idx)
-            elif 9 <= month <= 10:
-                val_seqs.append(center_idx)
-            elif 11 <= month <= 12:
-                test_seqs.append(center_idx)
+        # Chronological split with 15-day buffer zones between adjacent regions
+        TRAIN_REGIONS = [
+            (pd.Timestamp('2021-01-16'), pd.Timestamp('2024-09-23')),
+            (pd.Timestamp('2024-11-08'), pd.Timestamp('2024-12-31')),
+            (pd.Timestamp('2025-08-01'), pd.Timestamp('2025-09-30')),
+        ]
+        VAL_REGIONS = [
+            (pd.Timestamp('2020-01-01'), pd.Timestamp('2020-12-16')),
+            (pd.Timestamp('2024-10-01'), pd.Timestamp('2024-10-31')),
+            (pd.Timestamp('2025-01-16'), pd.Timestamp('2025-07-16')),
+            (pd.Timestamp('2025-10-16'), pd.Timestamp('2025-12-31')),
+        ]
+        EVAL_REGIONS = [
+            (pd.Timestamp('2015-01-01'), pd.Timestamp('2015-12-31')),
+        ]
 
-        split_seqs = {'train': train_seqs, 'valid': val_seqs, 'test': test_seqs}[self.split]
+        def _get_split(ts):
+            for start, end in TRAIN_REGIONS:
+                if start <= ts <= end:
+                    return 'train'
+            for start, end in VAL_REGIONS:
+                if start <= ts <= end:
+                    return 'valid'
+            for start, end in EVAL_REGIONS:
+                if start <= ts <= end:
+                    return 'eval'
+            return 'buffer'
+
+        train_seqs, val_seqs, eval_seqs = [], [], []
+        for center_idx in self.sequences:
+            label = _get_split(self.all_timestamps[center_idx])
+            if label == 'train':
+                train_seqs.append(center_idx)
+            elif label == 'valid':
+                val_seqs.append(center_idx)
+            elif label == 'eval':
+                eval_seqs.append(center_idx)
+
+        split_seqs = {
+            'train': train_seqs,
+            'valid': val_seqs,
+            'test':  val_seqs,
+            'eval':  eval_seqs,
+        }[self.split]
         self.sequences = split_seqs
 
-        # Filter complete sequences if requested
+        # Compute epsilon thresholds before any map-based filtering
+        # (uses only L1 conditions cache, does not need map files)
+        self.epsilon_low_threshold = None
+        self.epsilon_high_threshold = None
+        if self.use_l1_conditions:
+            self._compute_epsilon_thresholds()
+
+        # Filter by activity if requested
+        if self.activity_filter is not None and self.use_l1_conditions:
+            self.sequences = self._filter_by_activity()
+
+        # Filter complete sequences if requested (requires map files to be accessible)
         if self.only_complete_sequences:
             original_count = len(self.sequences)
             self.sequences = self._filter_complete_sequences()
@@ -1152,15 +1235,9 @@ class IonoSequenceIterableDataset(IterableDataset):
             print(f"Filtered sequences for {self.split}: {original_count} -> {filtered_count} "
                   f"({filtered_count/original_count*100:.1f}% complete)")
 
-        # Filter by activity if requested
-        if self.activity_filter is not None and self.use_l1_conditions:
-            self.sequences = self._filter_by_activity()
-
-        # Always compute epsilon thresholds for classification (even if not filtering)
-        self.epsilon_low_threshold = None
-        self.epsilon_high_threshold = None
-        if self.use_l1_conditions:
-            self._compute_epsilon_thresholds()
+        # Filter by frame-to-frame dynamics if requested (apply last, after other filters)
+        if self.dynamics_filter_quantile is not None:
+            self.sequences = self._filter_by_dynamics()
 
         print(f"IonoSequenceIterableDataset [{split}]: {len(self.sequences)} sequences")
         print(f"  GPU rank: {dp_rank}/{dp_world_size}, Shuffle: {shuffle}")
@@ -1204,22 +1281,31 @@ class IonoSequenceIterableDataset(IterableDataset):
         print(f"COMPUTING EPSILON THRESHOLDS FOR {self.split.upper()} SPLIT")
         print(f"{'='*80}")
 
-        # Calculate epsilon for all center frames in this split
+        # Calculate max epsilon over all frames in each sequence window
         epsilon_values = []
         for center_idx in self.sequences:
-            file_path = self.all_files[center_idx]
-            filename = os.path.basename(file_path)
-
-            if filename in self.filename_to_conditions:
-                cond = self.filename_to_conditions[filename]
-                epsilon = self.calculate_epsilon_parameter(
-                    vwind_kms=cond[3],
-                    by=cond[1],
-                    bz=cond[2]
-                )
-                epsilon_values.append(epsilon)
+            start_idx = center_idx - self.sequence_length // 2
+            end_idx   = center_idx + self.sequence_length // 2
+            window_eps = []
+            for idx in range(max(0, start_idx), min(len(self.all_files), end_idx + 1)):
+                filename = os.path.basename(self.all_files[idx])
+                if filename in self.filename_to_conditions:
+                    cond = self.filename_to_conditions[filename]
+                    eps = self.calculate_epsilon_parameter(
+                        vwind_kms=cond[3],
+                        by=cond[1],
+                        bz=cond[2]
+                    )
+                    window_eps.append(eps)
+            if window_eps:
+                epsilon_values.append(max(window_eps))
 
         epsilon_vals = np.array(epsilon_values)
+        if len(epsilon_vals) == 0:
+            print("WARNING: no epsilon values computed (sequences list empty), thresholds set to 0.")
+            self.epsilon_low_threshold = 0.0
+            self.epsilon_high_threshold = 0.0
+            return
         self.epsilon_low_threshold = np.quantile(epsilon_vals, self.epsilon_low_quantile)
         self.epsilon_high_threshold = np.quantile(epsilon_vals, self.epsilon_high_quantile)
 
@@ -1244,21 +1330,24 @@ class IonoSequenceIterableDataset(IterableDataset):
         print(f"FILTERING BY {self.activity_filter.upper()} ACTIVITY")
         print(f"{'='*80}")
 
-        # Calculate epsilon for all center frames
+        # Calculate max epsilon over all frames in each sequence window
         epsilon_values = []
         for center_idx in self.sequences:
-            file_path = self.all_files[center_idx]
-            filename = os.path.basename(file_path)
-
-            if filename in self.filename_to_conditions:
-                cond = self.filename_to_conditions[filename]
-                # cond = [bx, by, bz, vx]
-                epsilon = self.calculate_epsilon_parameter(
-                    vwind_kms=cond[3],  # proton_vx_gsm
-                    by=cond[1],         # by_gsm
-                    bz=cond[2]          # bz_gsm
-                )
-                epsilon_values.append((center_idx, epsilon))
+            start_idx = center_idx - self.sequence_length // 2
+            end_idx   = center_idx + self.sequence_length // 2
+            window_eps = []
+            for idx in range(max(0, start_idx), min(len(self.all_files), end_idx + 1)):
+                filename = os.path.basename(self.all_files[idx])
+                if filename in self.filename_to_conditions:
+                    cond = self.filename_to_conditions[filename]
+                    eps = self.calculate_epsilon_parameter(
+                        vwind_kms=cond[3],
+                        by=cond[1],
+                        bz=cond[2]
+                    )
+                    window_eps.append(eps)
+            if window_eps:
+                epsilon_values.append((center_idx, max(window_eps)))
 
         # Calculate thresholds using quantiles
         epsilon_vals = np.array([e for _, e in epsilon_values])
@@ -1312,6 +1401,98 @@ class IonoSequenceIterableDataset(IterableDataset):
 
         return filtered_sequences
 
+    def _filter_by_dynamics(self):
+        """Keep sequences by frame-to-frame pixel change.
+
+        mode='high': keep top (1-Q)% most dynamic (score >= threshold).
+        mode='low':  keep bottom Q% least dynamic  (score <= threshold).
+
+        If dynamics_cache_path is set and the file exists, scores are loaded from it instead
+        of being recomputed. If the file does not exist, scores are computed and saved there
+        for future runs. The cache is a JSON dict mapping str(center_idx) → float score.
+        """
+        import json
+        from tqdm import tqdm as _tqdm
+
+        mode = self.dynamics_filter_mode
+        Q = self.dynamics_filter_quantile
+        if mode == 'low':
+            pct = Q * 100
+            label = f"bottom {pct:.0f}% least dynamic sequences"
+        else:
+            pct = (1 - Q) * 100
+            label = f"top {pct:.0f}% most dynamic sequences"
+        print(f"\n{'='*80}")
+        print(f"DYNAMICS FILTER — keeping {label}")
+        print(f"{'='*80}")
+
+        # ---- load or compute scores ----
+        if self.dynamics_cache_path and os.path.exists(self.dynamics_cache_path):
+            print(f"Loading dynamics scores from cache: {self.dynamics_cache_path}")
+            with open(self.dynamics_cache_path, 'r') as f:
+                raw = json.load(f)
+            cached_scores = {int(k): float(v) for k, v in raw.items()}
+            scores = [(idx, cached_scores[idx]) for idx in self.sequences if idx in cached_scores]
+            missing = [idx for idx in self.sequences if idx not in cached_scores]
+            if missing:
+                print(f"  {len(missing)} sequences not in cache — scoring them now…")
+                scores += self._compute_dynamics_scores(missing)
+        else:
+            scores = self._compute_dynamics_scores(self.sequences)
+            if self.dynamics_cache_path:
+                os.makedirs(os.path.dirname(os.path.abspath(self.dynamics_cache_path)), exist_ok=True)
+                with open(self.dynamics_cache_path, 'w') as f:
+                    json.dump({str(idx): score for idx, score in scores}, f)
+                print(f"Saved dynamics scores to: {self.dynamics_cache_path}")
+
+        nonzero_vals = np.array([s for _, s in scores if s > 0.0])
+        if len(nonzero_vals) == 0:
+            print("No complete sequences found — returning empty.")
+            return []
+        threshold = np.quantile(nonzero_vals, Q)
+        if mode == 'low':
+            filtered = [idx for idx, s in scores if s > 0.0 and s <= threshold]
+        else:
+            filtered = [idx for idx, s in scores if s > 0.0 and s >= threshold]
+
+        print(f"Complete sequences: {len(nonzero_vals)} / {len(scores)}")
+        print(f"Threshold (p{Q*100:.0f} of complete): {threshold:.1f} V/frame")
+        print(f"Filtered: {len(self.sequences)} → {len(filtered)} sequences")
+        print(f"{'='*80}\n")
+        return filtered
+
+    def _compute_dynamics_scores(self, center_indices):
+        """Score each sequence by mean absolute frame-to-frame pixel change (V/frame)."""
+        from tqdm import tqdm as _tqdm
+        scores = []
+        for center_idx in _tqdm(center_indices, desc='Dynamics scoring'):
+            start_idx = center_idx - self.sequence_length // 2
+            frames = []
+            for frame_offset in range(self.sequence_length):
+                file_idx = start_idx + frame_offset
+                if 0 <= file_idx < len(self.all_files):
+                    file_path = self.all_files[file_idx]
+                    try:
+                        data = np.load(
+                            os.path.join(self.maps_dir, file_path),
+                            allow_pickle=True
+                        )
+                        data_map = data[0].astype(np.float32)
+                        if self.cartesian_transform:
+                            data_map = latlon_to_cartesian_grid(data_map, output_size=self.output_size)
+                        frames.append(data_map)
+                    except Exception:
+                        pass
+
+            if len(frames) < 2:
+                scores.append((center_idx, 0.0))
+                continue
+
+            arr = np.stack(frames)
+            score = float(np.abs(np.diff(arr, axis=0)).mean())
+            scores.append((center_idx, score))
+        return scores
+
     def _filter_complete_sequences(self):
         """Filter out sequences with missing frames."""
         complete = []
@@ -1341,12 +1522,24 @@ class IonoSequenceIterableDataset(IterableDataset):
         return complete
 
     def _shard_sequences_global(self):
-        """Shard sequences across GPU ranks."""
+        """Shard sequences across GPU ranks with equal distribution.
+
+        Ensures all GPUs get the same number of sequences to prevent DDP hangs.
+        Extra sequences are dropped to ensure even division.
+        """
         sequences = self.sequences.copy()
         if self.shuffle:
             rng = random.Random(self.seed + self._epoch)
             rng.shuffle(sequences)
-        # Each GPU rank gets every Nth sequence
+
+        # Ensure equal distribution across ranks to prevent DDP deadlocks
+        # Drop extra sequences that don't divide evenly
+        total_seqs = len(sequences)
+        seqs_per_rank = total_seqs // self.dp_world_size
+        usable_seqs = seqs_per_rank * self.dp_world_size
+        sequences = sequences[:usable_seqs]
+
+        # Each GPU rank gets every Nth sequence (now guaranteed equal)
         return sequences[self.dp_rank::self.dp_world_size]
 
     def _shard_sequences_worker(self, sequences):
@@ -1382,7 +1575,7 @@ class IonoSequenceIterableDataset(IterableDataset):
 
             if frame_exists:
                 file_path = self.all_files[file_idx]
-                data = np.load('/mnt/nas05/data01/francesco/sdo_img2img/sde_mag2mag_v2/progetto_simone/data/pickled_maps/' + file_path, allow_pickle=True) # TODO: change the path to remove the hardcoding and make it more general
+                data = np.load(os.path.join(self.maps_dir, file_path), allow_pickle=True)
 
                 data_map = data[0].astype(np.float32)
                 if self.cartesian_transform:
@@ -1395,7 +1588,8 @@ class IonoSequenceIterableDataset(IterableDataset):
                         data_tensor = get_ionosphere_transform(data_tensor, config=self.preprocess_config)
                     else:
                         data_tensor = torch.clamp(data_tensor, -80000, 80000)
-                        data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))  # normalize to [0, 1]
+                        data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1  # normalize to [-1, 1]
+                    
 
                 if self.use_l1_conditions:
                     filename = os.path.basename(file_path)
@@ -1639,7 +1833,7 @@ class IonoRAEDataset(Dataset):
         if self.normalization == 'minmax':
             # Clamp to [-80000, 80000] and normalize to [0, 1]
             data_tensor = torch.clamp(data_tensor, -80000, 80000)
-            data_tensor = (data_tensor - (-80000)) / (80000 - (-80000))
+            data_tensor = 2 * (data_tensor - (-80000)) / (80000 - (-80000)) - 1  # map to [-1, 1]
         elif self.normalization == 'per_file_tanh' and self.stats_dict is not None:
             # Use per-file mean/std normalization with tanh
             filename = file_path.name
@@ -1675,7 +1869,10 @@ class IonoRAEDataset(Dataset):
         """
         if self.normalization == 'minmax':
             # Reverse [0, 1] -> original: x = norm * (max - min) + min
+            # Reverse [-1, 1] -> original: x = ((norm + 1) / 2) * (max - min) + min
+            normalized_tensor = (normalized_tensor + 1) / 2  # map back to [0, 1]
             return normalized_tensor * (80000 - (-80000)) + (-80000)
+            # return normalized_tensor * (80000 - (-80000)) + (-80000)
         elif self.normalization == 'per_file_tanh':
             if filename is None:
                 raise ValueError("filename must be provided for per_file_tanh denormalization")
@@ -1791,6 +1988,9 @@ def get_sequence_data_objects_iterable(
     activity_filter=None,  # NEW: 'high', 'low', 'moderate', or None
     epsilon_high_quantile=0.75,  # NEW: threshold for high activity
     epsilon_low_quantile=0.25,   # NEW: threshold for low activity
+    dynamics_filter_quantile=None,  # e.g. 0.75 keeps top 25% most dynamic sequences
+    dynamics_filter_mode='high',    # 'high': keep top (1-Q)%; 'low': keep bottom Q%
+    dynamics_cache_path=None,       # path to pre-computed scores JSON
 ):
     """
     Create IterableDataset version with proper multi-GPU and multi-worker sharding.
@@ -1840,6 +2040,9 @@ def get_sequence_data_objects_iterable(
         activity_filter=activity_filter,
         epsilon_high_quantile=epsilon_high_quantile,
         epsilon_low_quantile=epsilon_low_quantile,
+        dynamics_filter_quantile=dynamics_filter_quantile,
+        dynamics_filter_mode=dynamics_filter_mode,
+        dynamics_cache_path=dynamics_cache_path,
     )
 
     # Build dataloader kwargs with optimizations

@@ -7,13 +7,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH -A sk035
-#SBATCH --output=/capstor/scratch/cscs/framunno/logs/out/out_ViT_15step_ddp_bs1_multiscale_emb_v3_interpolated_deduplicated.log
-#SBATCH --error=/capstor/scratch/cscs/framunno/logs/err/err_ViT_15step_ddp_bs1_multiscale_emb_v3_interpolated_deduplicated.log
+#SBATCH --output=./logs/out/out_ViT_15step_ddp_NOCOND_v1_BS1_resume.log
+#SBATCH --error=./logs/err/err_ViT_15step_ddp_NOCOND_v1_BS1_resume.log
 
 # =============================================================================
 # ✅ Environment setup
 # =============================================================================
-source /users/framunno/envs/ionosphere/bin/activate
+source ${IONO_VENV:-/path/to/venv}/bin/activate
 
 # -----------------------------------------------------------------------------
 # 🚨 Clean all stale FSDP variables (switching to DDP)
@@ -36,14 +36,12 @@ unset ACCELERATE_FSDP_TRANSFORMER_CLS_TO_WRAP
 # -----------------------------------------------------------------------------
 export TE_DISABLE_FLASH_ATTN_VERSION_CHECK=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=ALL
+export NCCL_DEBUG=WARN
 export NCCL_SOCKET_IFNAME=hsn
-export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1800
+export TORCH_NCCL_TRACE_BUFFER_SIZE=10485760
 export PYTHONUNBUFFERED=1
-
-export CUDA_LAUNCH_BLOCKING=1
 
 # Multi-node coordination
 export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n 1)
@@ -59,27 +57,27 @@ echo "Using DDP (not FSDP)"
 # =============================================================================
 # ✅ Configurations (export for use in srun subshell)
 # =============================================================================
-export SEQUENCE_LENGTH=30
-export PREDICT_STEPS=15
-export CONFIG_PATH="/users/framunno/projects/ionosphere_diffusion/configs/forecast_iono_15_big_cosine_solar_multiscale.json"
-export CSV_PATH="/users/framunno/data/ionosphere/l1_to_map_matched_even_minutes_test_v3_interpolated_deduplicated.csv"
-export BATCH_SIZE=20
-export DIR_NAME="ViT_forecast_15frames_absolute_max_ddp_bs1_multiscale_emb_v3_interpolated_deduplicated"
+export SEQUENCE_LENGTH=22
+export PREDICT_STEPS=7
+export CONFIG_PATH="${IONO_REPO:-/path/to/ionosphere_diffusion}/configs/forecast_iono_15_big_cosine_solar_classic.json"
+export CSV_PATH="${IONO_HOME_ROOT:-/path/to/home_root}/data/ionosphere/l1_to_map_matched_2020_2025.csv"
+export BATCH_SIZE=1
+export DIR_NAME="ViT_forecast_cond15_pred7_absolute_max_ddp_NOCOND_v1_BS1"
 CONDITIONING_LENGTH=$((SEQUENCE_LENGTH - PREDICT_STEPS))
-export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_allSET_multiscale_emb_v3_interpolated_deduplicated"
+export WANDB_RUN_NAME="ViT_forecast_cond${CONDITIONING_LENGTH}_pred${PREDICT_STEPS}_bs${BATCH_SIZE}_absolute_max_ddp_NOCOND_v1"
 
 export NORM_TYPE="absolute_max"
 export PREPROCESS_SCALING="log10"
 
-mkdir -p /users/framunno/logs/out
-mkdir -p /users/framunno/logs/err
+mkdir -p ${IONO_HOME_ROOT:-/path/to/home_root}/logs/out
+mkdir -p ${IONO_HOME_ROOT:-/path/to/home_root}/logs/err
 
 # =============================================================================
 # ✅ Run (Single-node multi-GPU with accelerate DDP)
 # =============================================================================
 accelerate launch \
-  --config_file /users/framunno/projects/ionosphere_diffusion/configs/accelerate_config_ddp.yaml \
-  /users/framunno/projects/ionosphere_diffusion/training_pred.py \
+  --config_file ${IONO_REPO:-/path/to/ionosphere_diffusion}/configs/accelerate_config_ddp.yaml \
+  ${IONO_REPO:-/path/to/ionosphere_diffusion}/training_pred.py \
   --config $CONFIG_PATH \
   --sequence-length $SEQUENCE_LENGTH \
   --predict-steps $PREDICT_STEPS \
@@ -87,8 +85,9 @@ accelerate launch \
   --batch-size $BATCH_SIZE \
   --dir-name $DIR_NAME \
   --wandb-runname $WANDB_RUN_NAME \
-  --max-epochs 101 \
-  --evaluate-every 5 \
+  --max-steps 200000 \
+  --evaluate-every 5000 \
+  --save-every 10000 \
   --normalization-type $NORM_TYPE \
   --mixed-precision bf16 \
   --use-wandb \
@@ -96,5 +95,7 @@ accelerate launch \
   --only-complete-sequences \
   --cartesian-transform \
   --num-workers 8 \
-  --use-iterable-dataset 
-  # --no-mapping-cond
+  --use-iterable-dataset \
+  --val-steps 1000 \
+  --no-mapping-cond \
+  --wandb-runid "98hcyngr"
