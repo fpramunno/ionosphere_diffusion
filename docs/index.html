@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Electric Potential Patterns Forecasting with Deep Learning</title>
   <meta name="description" content="Diffusion-based deep learning forecasts of Southern Hemisphere ionospheric convection from L1 solar wind data.">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='42' fill='none' stroke='%231b9aaa' stroke-width='10'/%3E%3Ccircle cx='50' cy='50' r='18' fill='%231b9aaa'/%3E%3C/svg%3E">
 
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bulma/0.9.4/css/bulma.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.1/css/all.min.css">
@@ -12,11 +13,15 @@
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;500;700&display=swap">
 
   <style>
+    :root { --accent: #1b9aaa; --accent-dark: #157a86; }
     html { scroll-behavior: smooth; }
     body { font-family: 'Noto Sans', sans-serif; background: #f0f2f5; }
     .title, .subtitle, .navbar-item, h1, h2, h3 { font-family: 'Google Sans', sans-serif; }
     .hero-body { padding-top: 3rem; padding-bottom: 2rem; }
     .publication-links .button { margin: 0.25rem; }
+    .publication-links .button:hover { border-color: var(--accent); color: var(--accent); }
+    a { color: var(--accent-dark); }
+    a:hover { color: var(--accent); }
 
     /* Sticky poster nav */
     .poster-nav {
@@ -25,6 +30,10 @@
       border-bottom: 1px solid #e3e3e3;
     }
     .poster-nav .tabs { margin-bottom: 0; }
+    .poster-nav .tabs a { color: #4a4a4a; border-bottom-color: transparent; }
+    .poster-nav .tabs li.is-active a {
+      color: var(--accent-dark); border-color: var(--accent); background: #fff;
+    }
 
     /* Poster panels */
     .panel-section { padding: 2.5rem 1.5rem; scroll-margin-top: 3.2rem; }
@@ -33,6 +42,7 @@
       box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 6px 20px rgba(0,0,0,0.05);
       max-width: 960px; margin: 0 auto;
     }
+    .panel-card h2.title { border-left: 4px solid var(--accent); padding-left: 0.75rem; }
 
     .result-figure img, .zoomable { cursor: zoom-in; width: 100%; height: auto; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); transition: transform .15s; }
     .result-figure img:hover, .zoomable:hover { transform: scale(1.01); }
@@ -41,10 +51,12 @@
 
     video { width: 100%; border-radius: 6px; box-shadow: 0 2px 14px rgba(0,0,0,0.15); }
     .bibtex-box { background: #f5f5f5; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.85rem; }
+    .bibtex-box-wrapper { position: relative; }
+    .bibtex-box-wrapper .button { position: absolute; top: 0.6rem; right: 0.6rem; }
     footer.footer { padding: 2rem 1.5rem; }
 
     /* Model comparator (interactive toggle) */
-    .comparator-toggle .button.is-active { background: #363636; color: #fff; }
+    .comparator-toggle .button.is-active { background: var(--accent); color: #fff; border-color: var(--accent); }
     .comparator-figure { position: relative; }
     .comparator-figure img { display: none; }
     .comparator-figure img.is-shown { display: block; }
@@ -72,7 +84,7 @@
       display: inline-block; width: 9px; height: 9px; border-radius: 50%;
       background: #ddd; margin: 0 4px; cursor: pointer;
     }
-    .slider-dot.is-active { background: #363636; }
+    .slider-dot.is-active { background: var(--accent); }
 
     /* Lightbox */
     #lightbox {
@@ -293,13 +305,18 @@
 <section class="panel-section" id="bibtex">
   <div class="panel-card">
     <h2 class="title is-4">BibTeX</h2>
-    <pre class="bibtex-box"><code>@article{ramunno2026ionosphere,
+    <div class="bibtex-box-wrapper">
+      <button class="button is-small is-rounded" id="copy-bibtex">
+        <span class="icon"><i class="fas fa-copy"></i></span><span>Copy</span>
+      </button>
+      <pre class="bibtex-box"><code id="bibtex-code">@article{ramunno2026ionosphere,
   title   = {Electric Potential Patterns Forecasting in the Southern Hemisphere with Deep Learning Techniques},
   author  = {Ramunno, F. P. and Mestici, S. and Coco, I. and Walach, M.-T. and Massetti, S. and Marcucci, M. F. and Panos, B. and Csillaghy, A.},
   journal = {Space Weather},
   year    = {2026},
   note    = {Preprint}
 }</code></pre>
+    </div>
   </div>
 </section>
 
@@ -358,6 +375,35 @@
     slider.querySelector('.slider-prev')?.addEventListener('click', () => show(current - 1));
     slider.querySelector('.slider-next')?.addEventListener('click', () => show(current + 1));
     dots.forEach(dot => dot.addEventListener('click', () => show(parseInt(dot.dataset.idx, 10))));
+  });
+
+  // Scrollspy: highlight the current section's nav tab while scrolling
+  const navTabs = document.querySelectorAll('.poster-nav .tabs a');
+  const navSections = Array.from(navTabs)
+    .map(a => document.querySelector(a.getAttribute('href')))
+    .filter(Boolean);
+  function updateScrollspy() {
+    const navHeight = document.querySelector('.poster-nav').offsetHeight;
+    const scrollPos = window.scrollY + navHeight + 16;
+    let activeSection = navSections[0];
+    navSections.forEach(sec => { if (sec.offsetTop <= scrollPos) activeSection = sec; });
+    navTabs.forEach(a => {
+      a.parentElement.classList.toggle('is-active', a.getAttribute('href') === '#' + activeSection.id);
+    });
+  }
+  window.addEventListener('scroll', updateScrollspy, { passive: true });
+  window.addEventListener('resize', updateScrollspy);
+  updateScrollspy();
+
+  // Copy BibTeX to clipboard
+  const copyBtn = document.getElementById('copy-bibtex');
+  copyBtn.addEventListener('click', () => {
+    navigator.clipboard.writeText(document.getElementById('bibtex-code').textContent).then(() => {
+      const label = copyBtn.querySelector('span:last-child');
+      const original = label.textContent;
+      label.textContent = 'Copied!';
+      setTimeout(() => { label.textContent = original; }, 1500);
+    });
   });
 
   // Results: single-pass / AR50 toggle
